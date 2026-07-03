@@ -6,7 +6,7 @@ Operational digest for working in this repo. The design doc is the source of tru
 
 AlphaZero replication on a **single consumer GPU (RTX 4060 Ti 16 GB)**, built as a **game-agnostic engine** with thin per-game adapters behind a stable `Game` interface. Proof-of-concept game: **Blokus Duo** (14×14, 2-player). The goal is to demonstrate the core learning dynamic — network-guided MCTS bootstrapping from random to strong play — not a superhuman engine. The binding constraint is **self-play throughput**, not network size.
 
-- **Design doc:** `docs/blokus-duo-az-design-v0_4.md` — v0.4, decision-complete, decisions **D1–D12 pinned**. If code needs to contradict it, update the doc first, then the code.
+- **Design doc:** `metadocs/blokus-duo-az-design-v0_5.md` — v0.5, milestone plan re-scoped; decisions **D1–D12 pinned** (unchanged). If code needs to contradict it, update the doc first, then the code.
 - **Current phase:** implementation, starting at **M0**. Deliberation is finished; do not silently reopen settled decisions — flag explicitly if one looks wrong.
 
 ## Scope (asserted in code, not just prose)
@@ -53,18 +53,22 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 - **D11** PUCT `c(s) = 1.25 + log((ΣN + 19653)/19652)` (≈1.25 at v1 budgets); unvisited Q = 0. FPU *reduction* is the first M6 lever — caveat: standard FPU negates parent Q assuming alternation; here it must route through the player-aware perspective map.
 - **D12** fast-search (64-sim) positions are **dropped entirely** (KataGo convention) — no value-only storage; every stored sample carries sparse π + z + aux.
 
-## Milestones
+## Milestones (design doc §12; v0.5 re-scope)
 
-**M0** Game ABC + TTT + Connect 4 (solved-position value tests) + **synthetic pass-game fixture** (TTT/C4 strictly alternate; the consecutive-mover backup needs its own test) →
-**M1** Blokus: oracle, then bitboards; full test battery →
-**M1.5** Othello: zero `core/` diffs; explicit-pass convention; **pass-regain** (non-monotone) test; consecutive-mover backup on a real game; D4 group via `symmetry_group` →
-**M2** encoding + sparse policy loss + overfit-one-batch + pipeline decode test →
-**M2.5** micro-Blokus end-to-end →
-**M3** self-play baseline (actor + replay + learner, one GPU; version pinning; D10/D12 live) →
-**M4** frozen-ladder eval: 8 rungs anchored at random=0; paired/mirrored games; primary criterion = 95% paired-bootstrap CI on Δ(mean Elo, final vs. first third of checkpoints) > 0; Mann–Kendall secondary; monotonicity not required →
-**M5** batched inference + PCR at the D6 schedule →
-**M6** ordered levers, each gated on a *profiled* plateau: (1) FPU reduction, (2) 8-fold augmentation (judge by rung-7 Elo), (3) value-only fast-position storage iff value-limited, (4) global-pooling path, (5) KataGo aux bundle →
+**M0** Game ABC + TTT + Connect 4 (solved-position values) + **core PUCT MCTS engine** (sparse, player-aware; uniform-prior flag for ladder rung 6 — no leaf-evaluator abstraction) + **synthetic pass-game fixture** + **MCTS-vs-minimax oracle** (+ subtree-reuse/virtual-loss test) + **envelope-rejection negative test** + test-runner/CI entrypoint →
+**M1** Blokus: oracle, then bitboards; full battery + **value_targets golden** (z=sign incl. sign(0)=0, aux=/109, |diff|≤109) + fixture-gen + orientation-hash serialize (write-side). M1 owns action encode/decode + the (g,a)→a′ table →
+**M1.5** Othello (parallel with M1; depends only on the M0 interface): zero `core/` diffs; explicit-pass; **pass-regain** (non-monotone) test; consecutive-mover backup; D4 group + pass-id fixed-point; carries its own Othello encoding →
+**M1.6** (NEW) network-free ladder rungs 1–3 + paired/mirrored game runner + anchored-Elo scaffolding — absolute-strength anchor for M2.5/M3 (rung 4 → M3) →
+**M2** encoding (state planes; symmetry maps) + **D5 network build + train step** + sparse policy loss + overfit-one-batch + pipeline decode test →
+**M2.5** micro-Blokus (reduced config — **undefined, pin doc-first**) + config-parameterized correctness net + **falsifiable exit test** + **early throughput go/no-go** →
+**M3** self-play baseline (functional/correctness; **fixed 128 sims**, not PCR): storage schema (D12 drop-policy → M5), D10, rung 4, **observability** (net-eval + GPU-hour + throughput counters), actor–learner IPC, replay schema, **checkpoint schema + orientation-hash validate-on-load**, seeding, second zero-`core/`-diff Othello re-check through the full stack →
+**M4** eval harness (network rungs 5–8; §1 protocol; per-checkpoint CIs) — **live/concurrent with the run**; **define the 'profiled plateau' rule**; assert hash before rung-8; bootstrap seed →
+**M5** batched inference + PCR at the D6 schedule + **D12 drop-policy** + **numeric throughput target** + virtual-loss correctness →
+**M5.5** (NEW) production run to K checkpoints + compute the §1 Δ verdict (M6 levers interleave on plateaus) →
+**M6** ordered levers, each gated on the M4-defined plateau: (1) FPU reduction, (2) 8-fold augmentation (rung-7 Elo), (3) value-only fast-position storage iff value-limited, (4) global-pooling, (5) KataGo aux bundle →
 **M7** (future) N-player engine for 4p Blokus: vector value head, max-n/paranoid backup, tournament eval.
+
+Unpinned scalars flagged doc-first: aux loss weight λ_aux (M2/§7), weight-publish interval / checkpoint count K (M3/§6.2), mirrored pairs per (checkpoint,rung) cell (M4/§9).
 
 ## Test battery highlights (M1)
 
@@ -73,6 +77,7 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 - **Symmetry joint-permutation golden:** every g × every in-bounds action (≈55k checks): decode → transform cells → re-encode → match the precomputed `(g,a)→a′` table; table closed + bijective. Named failure mode: `g(anchor) ≠ anchor(g(cells))`.
 - **Perft(2)-by-opening:** oracle reply counts for all 828 openings frozen as a hash; counts must be constant on Klein-4 orbits; totals give perft(2).
 - Monomino-last scoring cases; blocked-stays-blocked (Blokus adapter property, not a core assumption); forced-pass + scoring-flag normalization.
+- **value_targets golden (D1):** `z = sign(score_diff)` incl. `sign(0)=0` (draws ≠ losses; §4 has `z=0`), `aux = score_diff/109`, and the `|score_diff| ≤ 109` range assertion — the thin score→z→aux mapping that produces every training target.
 
 ## Working principles
 
