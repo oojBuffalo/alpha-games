@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "alpha-games"
 version = "0.0.0"
@@ -8,6 +12,11 @@ dependencies = []
 [project.optional-dependencies]
 # Dev-only. core/ is pure-stdlib at M0; NumPy/torch arrive with encoding/training (M2).
 dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+# Engine + adapters only; excludes metadocs/ and tests/ from the installed package
+# (tests still run from source via pytest's pythonpath setting below).
+include = ["core*", "games*"]
 
 [tool.pytest.ini_options]
 # Run from the repo root; core/ and games/ are importable as top-level packages
