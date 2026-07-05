@@ -30,6 +30,10 @@ class Connect4(_Game):
     """
 
     def __init__(self, rows: int = 6, cols: int = 7, connect: int = 4):
+        if rows <= 0 or cols <= 0:
+            raise ValueError(f"rows and cols must be positive (got {rows}x{cols})")
+        if connect <= 0:
+            raise ValueError(f"connect length must be positive (got {connect})")
         if connect > max(rows, cols):
             raise ValueError("connect length exceeds both board dimensions")
         self.rows = rows

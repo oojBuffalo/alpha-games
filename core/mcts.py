@@ -147,7 +147,10 @@ class MCTS:
         if self.root is None:
             raise ValueError("no root set")
         if not self.root.is_expanded:
-            # Nothing was searched; just move the root forward.
+            # Nothing was searched; move the root forward — but validate legality first,
+            # since an unexpanded root has no edge list to reject the action for us.
+            if action not in self.game.legal_moves(self.root.state):
+                raise ValueError(f"action {action} is not legal at the current root")
             self.root = self._make_node(self.game.apply(self.root.state, action))
             return
         try:
@@ -178,10 +181,13 @@ class MCTS:
         node = node or self.root
         if node is None or not node.actions:
             raise ValueError("no expanded node to choose from")
-        best_i, best_n = 0, node.N[0]
+        best_i = 0
         for i in range(1, len(node.actions)):
-            if node.N[i] > best_n:
-                best_i, best_n = i, node.N[i]
+            # Most visits wins; ties go to the lowest action id (not adapter/index order).
+            if node.N[i] > node.N[best_i] or (
+                node.N[i] == node.N[best_i] and node.actions[i] < node.actions[best_i]
+            ):
+                best_i = i
         return node.actions[best_i]
 
     def select_action(self, temperature: float, rng, node: _Node | None = None) -> Action:
