@@ -29,7 +29,7 @@ from games.blokus_duo.actions import (
 )
 from games.blokus_duo.oracle import OracleEngine
 from games.blokus_duo.pieces import orientation_table_hash
-from games.blokus_duo.symmetry import GROUP_NAMES, build_action_maps
+from games.blokus_duo.symmetry import GROUP_NAMES, build_action_maps, state_transform
 
 FIXTURE = Path(__file__).parent / "fixtures" / "blokus" / "symmetry_table.json"
 
@@ -130,8 +130,10 @@ def test_equivariant_move_gen_on_random_states(fixture_table):
 
 
 def test_adapter_symmetry_group_shape():
-    # [F6] first slot: state-level transform callable (M2 rebinds the plane
-    # side); second slot: full 17,836 permutation with identity filler on
+    # [F6, revised per PR #2 review] first slot: core documents it as a
+    # *plane* transform, which only exists once M2 lands encode_state — until
+    # then it must raise rather than advertise the engine-state representation;
+    # second slot: full 17,836 permutation with identity filler on
     # off-support ids.
     game = BlokusDuo()
     group = game.symmetry_group
@@ -139,20 +141,22 @@ def test_adapter_symmetry_group_shape():
     maps = build_action_maps()
     in_bounds = set(IN_BOUNDS_ACTIONS)
     s0 = game.initial_state()
-    for name, (state_t, perm) in zip(GROUP_NAMES, group, strict=True):
-        assert state_t(s0) == s0  # empty boards are fixed points of every g
+    for name, (plane_t, perm) in zip(GROUP_NAMES, group, strict=True):
+        with pytest.raises(NotImplementedError, match="M2"):
+            plane_t(s0)
         assert len(perm) == NUM_ACTIONS
         for a in IN_BOUNDS_ACTIONS:
             assert perm[a] == maps[name][a]
         assert all(perm[a] == a for a in range(NUM_ACTIONS) if a not in in_bounds)
 
 
-def test_adapter_state_transform_handles_bitboard_states():
-    from games.blokus_duo.bitboard import BitboardEngine, cells_to_bb
+def test_state_transform_utility_handles_bitboard_states():
+    # state_transform is a module-level utility over engine-state tuples (what
+    # the equivariance tests use) — deliberately NOT the adapter's plane slot.
+    from games.blokus_duo.bitboard import cells_to_bb
 
-    game = BlokusDuo(BitboardEngine())
-    state_t, _ = game.symmetry_group[1]  # rot180
-    s = (cells_to_bb([(0, 0)]), cells_to_bb([(13, 13)]), *game.initial_state()[2:])
-    t = state_t(s)
+    t180 = state_transform("rot180")
+    s = (cells_to_bb([(0, 0)]), cells_to_bb([(13, 13)]), *BlokusDuo().initial_state()[2:])
+    t = t180(s)
     assert t[0] == cells_to_bb([(13, 13)])  # rot180 of (0,0)
     assert t[1] == cells_to_bb([(0, 0)])

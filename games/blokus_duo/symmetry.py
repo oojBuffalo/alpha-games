@@ -8,10 +8,14 @@ by construction and so immune to the doc's named failure mode
 ``g(anchor) != anchor(g(cells))`` (naive anchor transport is wrong for most
 ids under 180°).
 
-[F6]: the adapter's ``symmetry_group`` elements carry a *state-level* transform
-in the first slot (what the M1 equivariance test exercises; M2 rebinds the
-plane-tensor side) and the full 17,836-length permutation in the second, with
-off-support ids mapped to themselves (documented never-legal filler).
+[F6, revised per PR #2 review]: the adapter's ``symmetry_group`` elements carry
+a *raising sentinel* in the first slot — core documents that slot as a plane
+transform, which cannot exist before M2's ``encode_state``, so advertising an
+engine-state transform there would hand generic augmentation the wrong
+representation. M2 replaces the sentinel with the real plane transform. The
+second slot is the full 17,836-length permutation, with off-support ids mapped
+to themselves (documented never-legal filler). :func:`state_transform` stays a
+module-level utility over engine-state tuples for the M1 equivariance tests.
 """
 
 from __future__ import annotations
@@ -92,13 +96,34 @@ def full_permutation(name: str) -> tuple[int, ...]:
     return tuple(perm)
 
 
-def state_transform(name: str) -> Callable:
-    """Return a state-level transform for group element ``name`` [F6].
+def plane_transform_placeholder(state):
+    """Raising sentinel for the plane-transform slot of ``symmetry_group``.
 
-    Works on the shared engine state tuple with occupancies as either
-    frozensets of cells (oracle) or 196-bit ints (bitboard); inventories,
-    flags, and ``to_play`` are invariant under board symmetry (no player
-    relabeling). M2 rebinds this slot to the plane-tensor transform.
+    Core documents the first ``SymmetryElement`` slot as a state-*plane*
+    transform; the plane encoding does not exist until M2's ``encode_state``,
+    so until then the slot fails loudly instead of advertising a transform
+    over the wrong representation (PR #2 review).
+
+    Args:
+        state: Ignored.
+
+    Raises:
+        NotImplementedError: Always — the plane transform lands with M2.
+    """
+    raise NotImplementedError(
+        "plane-side symmetry transform lands with M2 encode_state; for "
+        "engine-state tuples use games.blokus_duo.symmetry.state_transform"
+    )
+
+
+def state_transform(name: str) -> Callable:
+    """Return an engine-state-level transform for group element ``name`` [F6].
+
+    Module utility (used by the M1 equivariance tests), deliberately *not*
+    exposed through the adapter's ``symmetry_group``. Works on the shared
+    engine state tuple with occupancies as either frozensets of cells
+    (oracle) or 196-bit ints (bitboard); inventories, flags, and ``to_play``
+    are invariant under board symmetry (no player relabeling).
 
     Args:
         name: Group element name from :data:`GROUP_NAMES`.
