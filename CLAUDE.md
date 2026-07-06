@@ -89,9 +89,14 @@ Unpinned scalars flagged doc-first: aux loss weight λ_aux (M2/§7), weight-publ
 
 ## Environment & commands
 
-Python; single machine, one GPU (RTX 4060 Ti 16 GB — fits D5 comfortably; benchmark batch 128/256/512).
+Python 3.11+ (dev on 3.12). `core/` is **pure-stdlib through M0**; NumPy/torch arrive with encoding/training (M2). Single machine, one GPU (RTX 4060 Ti 16 GB — fits D5 comfortably; benchmark batch 128/256/512).
 
-*(Fill in as tooling lands: test runner invocation, lint/format, training entrypoints, eval harness.)*
+- **Setup (dev):** `python3 -m pip install -e ".[dev]"` (pytest + ruff). Optional — `pyproject` sets `pythonpath = ["."]`, so the battery also runs against a bare interpreter with pytest/ruff available.
+- **Tests:** `python3 -m pytest` from the repo root (full battery). Fast subset: `python3 -m pytest -m "not slow"` (the `slow` marker tags high-sim search sweeps).
+- **Lint / format:** `python3 -m ruff check .` · `python3 -m ruff format .` (check-only: add `--check`).
+- **CI:** `.github/workflows/ci.yml` runs lint + format-check + full battery on push/PR.
+
+*(Fill in as tooling lands: training entrypoints, eval harness.)*
 
 ## References
 
