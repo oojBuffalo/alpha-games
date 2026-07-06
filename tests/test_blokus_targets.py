@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from games.blokus_duo.targets import value_targets, value_target_spec
+from games.blokus_duo.targets import value_target_spec, value_targets
 
 
 def test_z_is_sign_of_score_diff():

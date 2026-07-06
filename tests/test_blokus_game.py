@@ -99,3 +99,41 @@ def test_tracer_tiny_mcts_search():
     assert a in set(OPENING_ACTIONS[(4, 4)]) | set(OPENING_ACTIONS[(9, 9)])
     mcts.advance(a)
     assert mcts.root is not None
+
+
+def test_mcts_smoke_with_subtree_advance():
+    # Search / advance / search again on the (fast) bitboard-backed adapter:
+    # subtree reuse must keep returning legal actions down the tree.
+    from games.blokus_duo.bitboard import BitboardEngine
+
+    game = BlokusDuo(BitboardEngine())
+    mcts = MCTS(game)
+    state = game.initial_state()
+    mcts.run(16, state)
+    for _ in range(3):
+        a = mcts.best_action()
+        assert a in set(game.legal_moves(state))
+        state = game.apply(state, a)
+        mcts.advance(a)
+        mcts.run(16)
+
+
+def test_blocked_stays_blocked_on_random_playouts():
+    # Blokus blocking is monotone (§4) — an adapter-level property, never a
+    # core assumption: once a player has no legal placement, they never
+    # regain one for the rest of the game.
+    from games.blokus_duo.bitboard import BitboardEngine
+
+    engine = BitboardEngine()
+    game = BlokusDuo(engine)
+    rng = random.Random(17)
+    for _ in range(6):
+        s = game.initial_state()
+        blocked = {0: False, 1: False}
+        while not game.is_terminal(s):
+            for p in (0, 1):
+                has_moves = bool(engine.legal_actions(s, p))
+                if blocked[p]:
+                    assert not has_moves, f"player {p} regained a move"
+                blocked[p] = not has_moves
+            s = game.apply(s, rng.choice(list(game.legal_moves(s))))

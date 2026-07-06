@@ -63,9 +63,7 @@ def _build_tables():
     for a in IN_BOUNDS_ACTIONS:
         cells = action_cells(a)
         piece = ORIENTATION_PIECE[decode(a)[2]]
-        per_piece[piece].append(
-            (a, cells_to_bb(cells), _halo(cells, _ORTH), _halo(cells, _DIAG))
-        )
+        per_piece[piece].append((a, cells_to_bb(cells), _halo(cells, _ORTH), _halo(cells, _DIAG)))
     return tuple(tuple(rows) for rows in per_piece)
 
 
@@ -100,7 +98,7 @@ class BitboardEngine:
         out = []
         if own == 0:
             targets = 0
-            for sq, bit in _START_BITS.items():
+            for bit in _START_BITS.values():
                 if opp & bit == 0:
                     targets |= bit
             for piece in state[2 + player]:

@@ -103,9 +103,7 @@ class OracleEngine:
                             if not any(sq in cells for sq in targets):
                                 continue
                         else:
-                            if any(
-                                (r + dr, c + dc) in own for r, c in cells for dr, dc in _ORTH
-                            ):
+                            if any((r + dr, c + dc) in own for r, c in cells for dr, dc in _ORTH):
                                 continue
                             if not any(
                                 (r + dr, c + dc) in own for r, c in cells for dr, dc in _DIAG

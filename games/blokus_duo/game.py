@@ -56,9 +56,7 @@ class BlokusDuo(Game):
         # Klein four-group (§8, D9): first slot is the state-level transform
         # (M2 rebinds the plane-tensor side), second the full 17,836-length
         # head permutation with identity filler on off-support ids [F6].
-        return tuple(
-            (state_transform(g), full_permutation(g)) for g in GROUP_NAMES
-        )
+        return tuple((state_transform(g), full_permutation(g)) for g in GROUP_NAMES)
 
     @property
     def value_targets(self) -> ValueTargetSpec:

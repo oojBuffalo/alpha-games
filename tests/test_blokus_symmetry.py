@@ -29,7 +29,7 @@ from games.blokus_duo.actions import (
 )
 from games.blokus_duo.oracle import OracleEngine
 from games.blokus_duo.pieces import orientation_table_hash
-from games.blokus_duo.symmetry import GROUP_NAMES, build_action_maps, full_permutation
+from games.blokus_duo.symmetry import GROUP_NAMES, build_action_maps
 
 FIXTURE = Path(__file__).parent / "fixtures" / "blokus" / "symmetry_table.json"
 
@@ -50,9 +50,7 @@ def fixture_table():
     assert data["conventions"]["start_squares"] == [[4, 4], [9, 9]]
     actions = data["actions"]
     assert actions == list(IN_BOUNDS_ACTIONS)
-    return {
-        g: dict(zip(actions, data["maps"][g], strict=True)) for g in GROUP_NAMES
-    }
+    return {g: dict(zip(actions, data["maps"][g], strict=True)) for g in GROUP_NAMES}
 
 
 def test_group_is_the_start_square_stabilizer():

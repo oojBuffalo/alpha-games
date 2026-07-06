@@ -70,9 +70,7 @@ def build_action_maps() -> dict[str, dict[int, int]]:
     Returns:
         Per group element, a dict from in-bounds action id to its image.
     """
-    return {
-        g: {a: transform_action(g, a) for a in IN_BOUNDS_ACTIONS} for g in GROUP_NAMES
-    }
+    return {g: {a: transform_action(g, a) for a in IN_BOUNDS_ACTIONS} for g in GROUP_NAMES}
 
 
 @cache

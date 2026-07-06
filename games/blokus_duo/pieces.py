@@ -56,10 +56,7 @@ def _cells_from_art(art: str) -> frozenset[tuple[int, int]]:
         The occupied cells as a frozenset of ``(row, col)`` tuples.
     """
     return frozenset(
-        (r, c)
-        for r, row in enumerate(art.split("\n"))
-        for c, ch in enumerate(row)
-        if ch == "X"
+        (r, c) for r, row in enumerate(art.split("\n")) for c, ch in enumerate(row) if ch == "X"
     )
 
 
@@ -159,8 +156,6 @@ def orientation_table_hash() -> str:
     Returns:
         Hex sha256 digest of the canonical serialization.
     """
-    payload = [
-        [[list(cell) for cell in orient] for orient in orients] for orients in ORIENTATIONS
-    ]
+    payload = [[[list(cell) for cell in orient] for orient in orients] for orients in ORIENTATIONS]
     blob = json.dumps(payload, separators=(",", ":")).encode("ascii")
     return hashlib.sha256(blob).hexdigest()
