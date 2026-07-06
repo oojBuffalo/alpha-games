@@ -73,6 +73,32 @@ def action_cells(action: int) -> Cells:
     return tuple(sorted((r + dr, c + dc) for dr, dc in ORIENTATION_CELLS[o]))
 
 
+# Orientation lookup for encode_cells: origin-normalized sorted cells -> global id.
+_ORIENTATION_ID: dict[Cells, int] = {cells: o for o, cells in enumerate(ORIENTATION_CELLS)}
+
+
+def encode_cells(cells) -> int:
+    """Encode absolute placement cells as a flat action id (``encode_action``).
+
+    The anchor is the bounding-box top-left of the absolute cells (D2), which
+    coincides with translating the origin-normalized orientation.
+
+    Args:
+        cells: Iterable of absolute ``(row, col)`` tuples of one placement.
+
+    Returns:
+        The flat action id.
+
+    Raises:
+        KeyError: If the cells are not a translate of any fixed orientation.
+    """
+    pts = sorted(cells)
+    mr = min(r for r, _ in pts)
+    mc = min(c for _, c in pts)
+    norm = tuple((r - mr, c - mc) for r, c in pts)
+    return encode(mr, mc, _ORIENTATION_ID[norm])
+
+
 def _enumerate_in_bounds() -> tuple[int, ...]:
     out = []
     for o, (h, w) in enumerate(ORIENTATION_BBOX):

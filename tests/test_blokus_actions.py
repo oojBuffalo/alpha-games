@@ -16,6 +16,7 @@ from games.blokus_duo.actions import (
     action_cells,
     decode,
     encode,
+    encode_cells,
 )
 from games.blokus_duo.pieces import ORIENTATION_CELLS, ORIENTATION_PIECE
 
@@ -62,6 +63,13 @@ def test_action_cells_match_orientation_and_stay_on_board():
         assert all(0 <= rr < 14 and 0 <= cc < 14 for rr, cc in cells)
         # cells are the orientation translated by the anchor
         assert tuple(sorted((rr - r, cc - c) for rr, cc in cells)) == ORIENTATION_CELLS[o]
+
+
+def test_encode_cells_roundtrip():
+    # encode_cells is the adapter-facing encode_action surface shared by both
+    # engines; it must invert action_cells on every in-bounds id.
+    for a in IN_BOUNDS_ACTIONS:
+        assert encode_cells(action_cells(a)) == a
 
 
 # --- [F3] literal hand-derived encodings -----------------------------------------
