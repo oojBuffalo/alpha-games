@@ -18,7 +18,7 @@ from typing import Any
 
 from core.game import Action, Game, PlayerId, State, SymmetryElement, ValueTargetSpec
 from games.blokus_duo.actions import BOARD_SIZE, NUM_ORIENTATIONS, action_cells, encode_cells
-from games.blokus_duo.oracle import OracleEngine
+from games.blokus_duo.bitboard import BitboardEngine
 from games.blokus_duo.symmetry import GROUP_NAMES, full_permutation, state_transform
 from games.blokus_duo.targets import value_target_spec, value_targets
 
@@ -31,11 +31,12 @@ class BlokusDuo(Game):
     Args:
         engine: Rules engine providing ``initial_state`` / ``legal_actions`` /
             ``place`` / ``scores`` over the shared state tuple. Defaults to the
-            cell-grid oracle; the bitboard engine drops in unchanged.
+            production bitboard engine (~9x faster search); reference tests
+            inject the cell-grid oracle explicitly.
     """
 
     def __init__(self, engine=None):
-        self._engine = engine if engine is not None else OracleEngine()
+        self._engine = engine if engine is not None else BitboardEngine()
 
     # --- declared capabilities ---------------------------------------------------
 

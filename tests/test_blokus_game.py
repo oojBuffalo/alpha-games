@@ -12,10 +12,22 @@ import random
 from core.mcts import MCTS
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.actions import OPENING_ACTIONS, encode
+from games.blokus_duo.oracle import OracleEngine
 from tests.test_blokus_oracle import make_state
 
 GAME = BlokusDuo()
+# make_state builds oracle-style states (frozenset occupancies), so tests that
+# start from crafted positions must inject the oracle engine explicitly.
+ORACLE_GAME = BlokusDuo(OracleEngine())
 MONO = 0
+
+
+def test_default_engine_is_bitboard():
+    # PR #2 review: the no-arg adapter is the production (fast) configuration,
+    # so it must be bitboard-backed — occupancies are 196-bit ints, not
+    # frozensets. Reference tests opt into the oracle explicitly.
+    s0 = BlokusDuo().initial_state()
+    assert isinstance(s0[0], int) and isinstance(s0[1], int)
 
 
 def test_capabilities_and_targets():
@@ -40,16 +52,16 @@ def test_forced_pass_skips_blocked_opponent():
     # Opponent (P1) has an empty inventory — no legal actions ever. After P0
     # places, the move must come straight back to P0 (consecutive mover).
     s = make_state(occ0=[(0, 0)], inv0=[MONO, 1], inv1=[])
-    s1 = GAME.apply(s, encode(1, 1, 0))
-    assert not GAME.is_terminal(s1)
-    assert GAME.current_player(s1) == 0
+    s1 = ORACLE_GAME.apply(s, encode(1, 1, 0))
+    assert not ORACLE_GAME.is_terminal(s1)
+    assert ORACLE_GAME.current_player(s1) == 0
 
 
 def test_termination_when_neither_player_can_move():
     # P0 places their last piece; P1 has nothing: no mover remains.
     s = make_state(occ0=[(0, 0)], inv0=[MONO], inv1=[])
-    s1 = GAME.apply(s, encode(1, 1, 0))
-    assert GAME.is_terminal(s1)
+    s1 = ORACLE_GAME.apply(s, encode(1, 1, 0))
+    assert ORACLE_GAME.is_terminal(s1)
 
 
 def test_terminal_utility_signs_and_draw():
@@ -57,15 +69,15 @@ def test_terminal_utility_signs_and_draw():
     # P1's only diagonal off (13,13) is (12,12), pre-blocked by P0. (P1 must
     # already be on the board — an empty P1 board would reopen the opening rule.)
     s = make_state(occ0=[(0, 0), (12, 12)], occ1=[(13, 13)], inv0=[MONO], inv1=[MONO])
-    s1 = GAME.apply(s, encode(1, 1, 0))
-    assert GAME.is_terminal(s1)
-    assert GAME.terminal_utility(s1, 0) == 1.0
-    assert GAME.terminal_utility(s1, 1) == -1.0
+    s1 = ORACLE_GAME.apply(s, encode(1, 1, 0))
+    assert ORACLE_GAME.is_terminal(s1)
+    assert ORACLE_GAME.terminal_utility(s1, 0) == 1.0
+    assert ORACLE_GAME.terminal_utility(s1, 1) == -1.0
     # Symmetric crafted terminal: equal scores are a draw (z = 0), not a loss.
     draw = make_state(occ0=[(0, 0)], occ1=[(13, 13)], inv0=[MONO], inv1=[MONO], to_play=0)
     draw = tuple(list(draw[:7]) + [True])
-    assert GAME.terminal_utility(draw, 0) == 0.0
-    assert GAME.terminal_utility(draw, 1) == 0.0
+    assert ORACLE_GAME.terminal_utility(draw, 0) == 0.0
+    assert ORACLE_GAME.terminal_utility(draw, 1) == 0.0
 
 
 def test_encode_decode_action_surface():

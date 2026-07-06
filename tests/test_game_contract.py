@@ -12,6 +12,7 @@ import pytest
 
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.bitboard import BitboardEngine
+from games.blokus_duo.oracle import OracleEngine
 from games.connect4 import Connect4
 from games.tictactoe import TicTacToe
 from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
@@ -25,7 +26,7 @@ GAMES = [
     (Connect4(3, 3, 3), 60),
     (consecutive_win_game(), 60),
     (consecutive_trap_game(), 60),
-    (BlokusDuo(), 5),
+    (BlokusDuo(OracleEngine()), 5),
     (BlokusDuo(BitboardEngine()), 20),
 ]
 GAME_IDS = [
