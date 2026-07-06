@@ -19,6 +19,7 @@ from typing import Any
 from core.game import Action, Game, PlayerId, State, SymmetryElement, ValueTargetSpec
 from games.blokus_duo.actions import BOARD_SIZE, NUM_ORIENTATIONS, action_cells, encode_cells
 from games.blokus_duo.oracle import OracleEngine
+from games.blokus_duo.symmetry import GROUP_NAMES, full_permutation, state_transform
 from games.blokus_duo.targets import value_target_spec, value_targets
 
 _TO_PLAY, _TERMINAL = 6, 7
@@ -52,9 +53,12 @@ class BlokusDuo(Game):
 
     @property
     def symmetry_group(self) -> Sequence[SymmetryElement]:
-        # Klein four-group lands with the (g,a)->a' table (M1 slice 8); until
-        # then the adapter declares identity only.
-        return ()
+        # Klein four-group (§8, D9): first slot is the state-level transform
+        # (M2 rebinds the plane-tensor side), second the full 17,836-length
+        # head permutation with identity filler on off-support ids [F6].
+        return tuple(
+            (state_transform(g), full_permutation(g)) for g in GROUP_NAMES
+        )
 
     @property
     def value_targets(self) -> ValueTargetSpec:

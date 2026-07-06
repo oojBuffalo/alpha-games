@@ -21,6 +21,16 @@ NUM_ACTIONS = BOARD_SIZE * BOARD_SIZE * NUM_ORIENTATIONS  # 17,836
 # Start squares, 0-indexed (§5.1; the doc's (5,5)/(10,10) is 1-indexed display).
 START_SQUARES: tuple[tuple[int, int], ...] = ((4, 4), (9, 9))
 
+# Embedded in every generated fixture alongside the orientation hash [F3]: the
+# hash covers the orientation table, not the flatten/anchor conventions.
+FIXTURE_CONVENTIONS = {
+    "axis_order": "(r,c) 0-indexed row-major",
+    "flatten": "(r*14+c)*91+o",
+    "anchor": "bbox-top-left",
+    "board_size": BOARD_SIZE,
+    "start_squares": [list(sq) for sq in START_SQUARES],
+}
+
 
 def encode(r: int, c: int, o: int) -> int:
     """Encode an anchor cell and orientation id as a flat action id.
