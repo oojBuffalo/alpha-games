@@ -12,7 +12,15 @@ from __future__ import annotations
 
 from collections import Counter
 
-from games.blokus_duo.pieces import BASE_PIECES, PIECE_NAMES
+from games.blokus_duo.pieces import (
+    BASE_PIECES,
+    ORIENTATION_CELLS,
+    ORIENTATION_PIECE,
+    ORIENTATIONS,
+    PIECE_NAMES,
+    build_orientation_table,
+    orientation_table_hash,
+)
 
 # --- independent D4 canonicalization (deliberately not imported from pieces) ---
 
@@ -85,3 +93,42 @@ def test_growth_enumeration_matches_hand_defined_set():
     hand_defined = {_canon(p) for p in BASE_PIECES}
     assert len(hand_defined) == 21  # no two drawings are D4-images of each other
     assert hand_defined == enumerated
+
+
+# --- orientation table (§5.1 convention pins) -----------------------------------
+
+
+def test_orientation_counts_per_order():
+    per_order = Counter()
+    for piece, orients in zip(BASE_PIECES, ORIENTATIONS, strict=True):
+        per_order[len(piece)] += len(orients)
+    assert per_order == {1: 1, 2: 2, 3: 6, 4: 19, 5: 63}
+    assert len(ORIENTATION_CELLS) == 91
+
+
+def test_orientation_ids_follow_traversal_order():
+    # Global ids 0-90: piece-major, lex-sorted within each piece; the first
+    # orientation of each piece is its canonical form.
+    flat = [o for orients in ORIENTATIONS for o in orients]
+    assert list(ORIENTATION_CELLS) == flat
+    expected_piece = [i for i, orients in enumerate(ORIENTATIONS) for _ in orients]
+    assert list(ORIENTATION_PIECE) == expected_piece
+    for piece, orients in zip(BASE_PIECES, ORIENTATIONS, strict=True):
+        assert list(orients) == sorted(orients)
+        assert orients[0] == piece
+        assert len(set(orients)) == len(orients)
+
+
+def test_orientation_table_rebuild_is_deterministic():
+    assert build_orientation_table() == ORIENTATIONS
+    assert build_orientation_table() == build_orientation_table()
+
+
+def test_orientation_table_hash_is_stable():
+    # Frozen after independent verification of the table's counts and order;
+    # any change to piece data, orientation assignment, or serialization is a
+    # breaking change to every fixture and replay dataset keyed on this digest.
+    assert (
+        orientation_table_hash()
+        == "4408e7d7b56b3533685ce92e88fd1bc9453ba405f4afacfa96e431974446cb35"
+    )

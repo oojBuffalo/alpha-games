@@ -14,6 +14,9 @@ M2 inventory-plane order (D3).
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 Cells = tuple[tuple[int, int], ...]
 
 # Hand drawings ('X' = cell), named per the common Blokus convention. The
@@ -120,3 +123,44 @@ def _build_pieces() -> tuple[tuple[Cells, ...], tuple[str, ...]]:
 
 # Ordered by (size, canonical form) — §5.1; PIECE_NAMES is parallel.
 BASE_PIECES, PIECE_NAMES = _build_pieces()
+
+
+def build_orientation_table() -> tuple[tuple[Cells, ...], ...]:
+    """Build the per-piece orientation table (§5.1 convention pins).
+
+    Deterministic by construction: orientations come from :func:`d4_orientations`
+    (deduped, lexicographically sorted) over :data:`BASE_PIECES` — never
+    set-iteration order.
+
+    Returns:
+        Per piece (in ``BASE_PIECES`` order), the tuple of its distinct fixed
+        orientations, each an origin-normalized sorted cell tuple.
+    """
+    return tuple(tuple(d4_orientations(p)) for p in BASE_PIECES)
+
+
+ORIENTATIONS = build_orientation_table()
+# Global orientation ids 0-90: piece-major traversal order (§5.1).
+ORIENTATION_CELLS: tuple[Cells, ...] = tuple(o for orients in ORIENTATIONS for o in orients)
+ORIENTATION_PIECE: tuple[int, ...] = tuple(
+    i for i, orients in enumerate(ORIENTATIONS) for _ in orients
+)
+
+
+def orientation_table_hash() -> str:
+    """Return the sha256 digest of the orientation table (§5.1).
+
+    The serialization is canonical JSON nested per piece — the per-piece
+    boundaries are part of the hashed structure, so a piece↔orientation
+    regrouping cannot collide with the same flat orientation list. This digest
+    is serialized into every fixture, checkpoint, and replay dataset
+    (write-side M1, validate-on-load M3).
+
+    Returns:
+        Hex sha256 digest of the canonical serialization.
+    """
+    payload = [
+        [[list(cell) for cell in orient] for orient in orients] for orients in ORIENTATIONS
+    ]
+    blob = json.dumps(payload, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(blob).hexdigest()
