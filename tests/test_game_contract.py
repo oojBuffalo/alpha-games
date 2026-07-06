@@ -11,6 +11,7 @@ import random
 import pytest
 
 from games.blokus_duo import BlokusDuo
+from games.blokus_duo.bitboard import BitboardEngine
 from games.connect4 import Connect4
 from games.tictactoe import TicTacToe
 from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
@@ -25,8 +26,18 @@ GAMES = [
     (consecutive_win_game(), 60),
     (consecutive_trap_game(), 60),
     (BlokusDuo(), 5),
+    (BlokusDuo(BitboardEngine()), 20),
 ]
-GAME_IDS = ["ttt", "c4-6x7", "c4-4x4x3", "c4-3x3x3", "pass-win", "pass-trap", "blokus-oracle"]
+GAME_IDS = [
+    "ttt",
+    "c4-6x7",
+    "c4-4x4x3",
+    "c4-3x3x3",
+    "pass-win",
+    "pass-trap",
+    "blokus-oracle",
+    "blokus-bitboard",
+]
 
 
 def random_playout(game, rng):
