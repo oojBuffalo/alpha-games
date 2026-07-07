@@ -8,8 +8,10 @@ identical choices (the pair runner drives determinism from per-pair seeds).
 
 from __future__ import annotations
 
-from core import RandomAgent
+from core import MobilityAgent, RandomAgent
+from games.connect4 import Connect4
 from games.tictactoe import TicTacToe
+from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
 
 GAME = TicTacToe()
 
@@ -50,3 +52,52 @@ def test_random_agent_is_uniform_over_legal_moves():
 
 def test_agent_has_a_name():
     assert RandomAgent(seed=0).name == "random"
+    assert MobilityAgent(seed=0).name == "mobility"
+
+
+# --- rung 3: 1-ply mobility greedy (§12 M1.6 pin) ------------------------------
+
+
+def test_mobility_agent_takes_an_immediate_win():
+    # A terminal win has absolute priority over any mobility score.
+    s = GAME.from_grid(["XX.", "OO.", "..."], to_play=0)
+    for seed in range(5):
+        assert MobilityAgent(seed=seed).select_action(GAME, s) == 2
+
+
+def test_mobility_agent_prefers_win_over_loss_at_terminals():
+    g = consecutive_trap_game()
+    m = g.initial_state()
+    m = g.apply(m, 0)  # forced into the consecutive node: 0 wins, 1 loses
+    for seed in range(5):
+        assert MobilityAgent(seed=seed).select_action(g, m) == 0
+
+
+def test_mobility_agent_prefers_blocking_the_opponent():
+    # consecutive_win_game root: action 0 leads to a node where the *mover*
+    # moves again (opponent skipped, mobility +2); action 1 hands the opponent
+    # two replies (mobility -2). The pinned rule must pick action 0.
+    g = consecutive_win_game()
+    for seed in range(5):
+        assert MobilityAgent(seed=seed).select_action(g, g.initial_state()) == 0
+
+
+def test_mobility_agent_minimizes_opponent_replies_on_connect4():
+    # Column 0 holds five discs: completing it leaves the opponent 6 replies,
+    # anything else leaves 7 — the pinned rule must fill the column.
+    c4 = Connect4()
+    s = c4.from_moves([0, 0, 0, 0, 0])
+    reply_counts = {a: len(c4.legal_moves(c4.apply(s, a))) for a in c4.legal_moves(s)}
+    assert sorted(set(reply_counts.values())) == [6, 7]
+    for seed in range(5):
+        assert MobilityAgent(seed=seed).select_action(c4, s) == 0
+
+
+def test_mobility_agent_breaks_ties_by_seed_deterministically():
+    # Every TTT opening leaves the opponent exactly 8 replies: a full tie.
+    s0 = GAME.initial_state()
+    picks = {MobilityAgent(seed=s).select_action(GAME, s0) for s in range(30)}
+    assert len(picks) > 1  # ties are randomized...
+    a = MobilityAgent(seed=4).select_action(GAME, s0)
+    b = MobilityAgent(seed=4).select_action(GAME, s0)
+    assert a == b  # ...but reproducible per seed

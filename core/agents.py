@@ -49,3 +49,40 @@ class RandomAgent(Agent):
 
     def select_action(self, game: Game, state: State) -> Action:
         return self._rng.choice(list(game.legal_moves(state)))
+
+
+class MobilityAgent(Agent):
+    """Ladder rung 3: 1-ply mobility greedy over successors (§12 M1.6 pin).
+
+    Scores are ``(tier, mobility)`` compared lexicographically: a terminal win
+    is a higher tier than any nonterminal successor and a terminal loss a lower
+    one; nonterminal successors score ``-|legal(s')|`` when the opponent moves
+    next and ``+|legal(s')|`` when the mover moves again (opponent skipped —
+    only observable through ``current_player``). A terminal draw sits in the
+    nonterminal tier at mobility 0. Ties break uniform-random, seeded.
+
+    Args:
+        seed: Seed for the tie-breaking RNG stream.
+    """
+
+    def __init__(self, seed: int):
+        self._rng = random.Random(seed)
+
+    @property
+    def name(self) -> str:
+        return "mobility"
+
+    def select_action(self, game: Game, state: State) -> Action:
+        mover = game.current_player(state)
+        moves = list(game.legal_moves(state))
+        scores = []
+        for a in moves:
+            nxt = game.apply(state, a)
+            if game.is_terminal(nxt):
+                u = game.terminal_utility(nxt, mover)
+                scores.append((u, 0))
+            else:
+                mob = len(game.legal_moves(nxt))
+                scores.append((0.0, mob if game.current_player(nxt) == mover else -mob))
+        best = max(scores)
+        return self._rng.choice([a for a, sc in zip(moves, scores, strict=True) if sc == best])
