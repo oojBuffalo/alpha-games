@@ -12,6 +12,7 @@ import pytest
 
 from core import MCTS, EnvelopeError, assert_v1_envelope
 from games.connect4 import Connect4
+from games.othello import Othello
 from games.tictactoe import TicTacToe
 from tests.fixtures.bad_adapters import ImperfectInfoGame, StochasticGame, ThreePlayerGame
 
@@ -32,7 +33,7 @@ def test_mcts_construction_rejects_out_of_envelope_adapters(bad):
         MCTS(bad)
 
 
-@pytest.mark.parametrize("game", [TicTacToe(), Connect4()], ids=["ttt", "c4"])
+@pytest.mark.parametrize("game", [TicTacToe(), Connect4(), Othello()], ids=["ttt", "c4", "othello"])
 def test_envelope_accepts_valid_games(game):
     assert_v1_envelope(game)  # must not raise
     MCTS(game)  # must not raise
