@@ -112,6 +112,44 @@ class Othello(_Game):
         diff = board.count(player_id) - board.count(1 - player_id)
         return float((diff > 0) - (diff < 0))
 
+    # --- encoding surface (M1.5-carried, §12 M1.5 scope note) --------------------
+
+    def encode_state(self, state: State):
+        """Encode ``state`` as 2 mover-relative occupancy planes (own, opponent).
+
+        Nested 8×8 tuples over {0, 1} — stdlib-only until NumPy arrives at M2.
+        Mover-relative per §5.2's own/opponent convention: no side-to-move plane.
+        """
+        board, to_play = state
+        return tuple(
+            tuple(
+                tuple(1 if board[r * BOARD_SIZE + c] == player else 0 for c in range(BOARD_SIZE))
+                for r in range(BOARD_SIZE)
+            )
+            for player in (to_play, 1 - to_play)
+        )
+
+    def encode_action(self, move) -> Action:
+        """Encode ``(r, c)`` as ``r*8 + c``, or ``"pass"`` as 64."""
+        if move == "pass":
+            return PASS
+        r, c = move
+        return r * BOARD_SIZE + c
+
+    def decode_action(self, action: Action):
+        """Decode an action id into ``(r, c)``, or 64 into ``"pass"``."""
+        if action == PASS:
+            return "pass"
+        return divmod(action, BOARD_SIZE)
+
+    @property
+    def policy_shape(self) -> tuple[int, ...]:
+        return (65,)
+
+    @property
+    def input_planes(self) -> int:
+        return 2
+
     # --- test convenience ------------------------------------------------------
 
     def from_grid(self, rows: Sequence[str], to_play: PlayerId) -> State:
