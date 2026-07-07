@@ -9,6 +9,8 @@ pin block: 0-indexed row-major, ``a = r*8 + c``, Black = player 0 moves first.
 
 from __future__ import annotations
 
+import random
+
 from games.othello import PASS, Othello
 
 GAME = Othello()
@@ -176,3 +178,42 @@ def test_value_target_spec_is_primary_only():
     spec = GAME.value_targets
     assert spec.primary_name == "z"
     assert spec.aux_names == ()  # no aux head: score-diff aux is a Blokus D8 lever
+
+
+def test_pass_regain_is_non_monotone():
+    # §12 M1.5: a passed player later moves again — the property Blokus can't
+    # exercise (its blocking is monotone). White's only flankable target is
+    # Black's lone corner disc (unflankable), so White must pass; Black's forced
+    # (3,3) flips the diagonal, giving White (2,3) — a placement regained.
+    s = GAME.from_grid(
+        [
+            "B.......",
+            ".W......",
+            "..W.....",
+            "........",
+            "...W....",
+            "........",
+            "........",
+            "........",
+        ],
+        to_play=1,
+    )
+    assert list(GAME.legal_moves(s)) == [PASS]  # White blocked: must pass
+    s = GAME.apply(s, PASS)
+    assert list(GAME.legal_moves(s)) == [27]  # Black's forced diagonal capture
+    s = GAME.apply(s, 27)
+    assert list(GAME.legal_moves(s)) == [19]  # White can place again: regain
+    assert not GAME.is_terminal(s)
+
+
+def test_apply_alternates_mover_on_every_action():
+    # Strict alternation at the action level (§12 M1.5 pin): apply always hands
+    # the move over, for placements and passes alike. The *placement* sequence
+    # is what goes consecutive around a pass.
+    rng = random.Random(7)
+    for _ in range(10):
+        s = GAME.initial_state()
+        while not GAME.is_terminal(s):
+            mover = GAME.current_player(s)
+            s = GAME.apply(s, rng.choice(list(GAME.legal_moves(s))))
+            assert GAME.current_player(s) == 1 - mover
