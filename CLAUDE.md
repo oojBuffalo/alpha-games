@@ -95,6 +95,7 @@ Python 3.11+ (dev on 3.12). `core/` is **pure-stdlib through M0**; NumPy/torch a
 - **Tests:** `python3 -m pytest` from the repo root (full battery). Fast subset: `python3 -m pytest -m "not slow"` (the `slow` marker tags high-sim search sweeps).
 - **Lint / format:** `python3 -m ruff check .` · `python3 -m ruff format .` (check-only: add `--check`).
 - **CI:** `.github/workflows/ci.yml` runs lint + format-check + full battery on push/PR.
+- **Fixture generation (M1):** `python3 scripts/gen_blokus_symmetry_table.py` (seconds) · `python3 scripts/gen_blokus_perft.py` (~3 min; perft(3) is bitboard-generated, Klein-4 orbit-reduced). Both write `tests/fixtures/blokus/*.json` with the orientation hash + encoding conventions embedded; regeneration on unchanged code must be **byte-identical**.
 
 *(Fill in as tooling lands: training entrypoints, eval harness.)*
 

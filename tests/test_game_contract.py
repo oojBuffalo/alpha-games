@@ -10,19 +10,35 @@ import random
 
 import pytest
 
+from games.blokus_duo import BlokusDuo
+from games.blokus_duo.bitboard import BitboardEngine
+from games.blokus_duo.oracle import OracleEngine
 from games.connect4 import Connect4
 from games.tictactoe import TicTacToe
 from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
 
+# (game, playouts-per-test): cheap adapters get 60; the deliberately-slow
+# Blokus oracle engine gets fewer so the non-slow battery stays fast.
 GAMES = [
-    TicTacToe(),
-    Connect4(),
-    Connect4(4, 4, 3),
-    Connect4(3, 3, 3),
-    consecutive_win_game(),
-    consecutive_trap_game(),
+    (TicTacToe(), 60),
+    (Connect4(), 60),
+    (Connect4(4, 4, 3), 60),
+    (Connect4(3, 3, 3), 60),
+    (consecutive_win_game(), 60),
+    (consecutive_trap_game(), 60),
+    (BlokusDuo(OracleEngine()), 5),
+    (BlokusDuo(BitboardEngine()), 20),
 ]
-GAME_IDS = ["ttt", "c4-6x7", "c4-4x4x3", "c4-3x3x3", "pass-win", "pass-trap"]
+GAME_IDS = [
+    "ttt",
+    "c4-6x7",
+    "c4-4x4x3",
+    "c4-3x3x3",
+    "pass-win",
+    "pass-trap",
+    "blokus-oracle",
+    "blokus-bitboard",
+]
 
 
 def random_playout(game, rng):
@@ -37,25 +53,26 @@ def random_playout(game, rng):
     return s
 
 
-@pytest.mark.parametrize("game", GAMES, ids=GAME_IDS)
-def test_pass_invariant_holds_on_random_playouts(game):
+@pytest.mark.parametrize("game,n_playouts", GAMES, ids=GAME_IDS)
+def test_pass_invariant_holds_on_random_playouts(game, n_playouts):
     rng = random.Random(0)
-    for _ in range(60):
+    for _ in range(n_playouts):
         assert game.is_terminal(random_playout(game, rng))
 
 
-@pytest.mark.parametrize("game", GAMES, ids=GAME_IDS)
-def test_terminals_are_zero_sum(game):
+@pytest.mark.parametrize("game,n_playouts", GAMES, ids=GAME_IDS)
+def test_terminals_are_zero_sum(game, n_playouts):
     rng = random.Random(1)
-    for _ in range(60):
+    for _ in range(n_playouts):
         term = random_playout(game, rng)
         utils = [game.terminal_utility(term, p) for p in range(game.num_players)]
         assert abs(sum(utils)) < 1e-9
         assert all(u in (-1.0, 0.0, 1.0) for u in utils)
 
 
-@pytest.mark.parametrize("game", GAMES, ids=GAME_IDS)
-def test_apply_is_deterministic_and_nonmutating(game):
+@pytest.mark.parametrize("game,n_playouts", GAMES, ids=GAME_IDS)
+def test_apply_is_deterministic_and_nonmutating(game, n_playouts):
+    del n_playouts  # single traced playout regardless of budget
     rng = random.Random(2)
     s = game.initial_state()
     while not game.is_terminal(s):
