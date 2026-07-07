@@ -103,7 +103,14 @@ class Othello(_Game):
         return not _placements(state[0], 0) and not _placements(state[0], 1)
 
     def terminal_utility(self, state: State, player_id: PlayerId) -> float:
-        raise NotImplementedError
+        """Return ``sign(disc_diff)`` for ``player_id`` (§12 M1.5 pin).
+
+        Raw disc counts, empties unassigned — the sign (including draws) is
+        invariant to the empties-to-winner scoring convention.
+        """
+        board = state[0]
+        diff = board.count(player_id) - board.count(1 - player_id)
+        return float((diff > 0) - (diff < 0))
 
     # --- test convenience ------------------------------------------------------
 

@@ -126,3 +126,53 @@ def test_terminal_when_neither_player_can_place():
     # Full board: no empties, no placements.
     full = GAME.from_grid(["BW" * 4, "WB" * 4] * 4, to_play=0)
     assert GAME.is_terminal(full)
+
+
+def test_terminal_utility_is_sign_of_disc_diff():
+    # Black wipeout: 7 Black, 0 White.
+    s = GAME.from_grid(
+        [
+            "B.B.....",
+            ".BB.....",
+            "BBB.....",
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+        ],
+        to_play=1,
+    )
+    assert GAME.terminal_utility(s, 0) == 1.0
+    assert GAME.terminal_utility(s, 1) == -1.0
+
+    # White majority: 1 Black (unflankable corner), 2 White... make White win 3-1.
+    w = GAME.from_grid(
+        [
+            "B.......",
+            "........",
+            "...WW...",
+            "...W....",
+            "........",
+            "........",
+            "........",
+            "........",
+        ],
+        to_play=0,
+    )
+    assert GAME.is_terminal(w)  # no mixed lines anywhere
+    assert GAME.terminal_utility(w, 0) == -1.0
+    assert GAME.terminal_utility(w, 1) == 1.0
+
+
+def test_draw_is_zero_for_both_players():
+    # Full checkerboard: 32 Black, 32 White — a draw, z = 0 (not a loss).
+    full = GAME.from_grid(["BW" * 4, "WB" * 4] * 4, to_play=0)
+    assert GAME.terminal_utility(full, 0) == 0.0
+    assert GAME.terminal_utility(full, 1) == 0.0
+
+
+def test_value_target_spec_is_primary_only():
+    spec = GAME.value_targets
+    assert spec.primary_name == "z"
+    assert spec.aux_names == ()  # no aux head: score-diff aux is a Blokus D8 lever
