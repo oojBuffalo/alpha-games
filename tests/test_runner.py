@@ -106,6 +106,31 @@ def test_play_pairs_swaps_seats_and_reuses_the_pair_seed():
     assert len(set(calls_a)) == 3
 
 
+def test_game_records_carry_the_opening_action():
+    rec = play_game(GAME, (RandomAgent(seed=1), RandomAgent(seed=2)))
+    assert rec.opening in range(9)
+
+
+def test_opening_balancer_constrains_the_second_game_of_a_pair():
+    # Generic hook (§12 M1.6 pin): the balancer sees game 1's opening and
+    # returns a predicate restricting game 2's opener. Forcing equality makes
+    # both games of every pair open identically.
+    def same_opening(game, opening):
+        del game
+        return lambda a: a == opening
+
+    results = play_pairs(
+        GAME,
+        lambda s: RandomAgent(s),
+        lambda s: RandomAgent(s),
+        n_pairs=6,
+        seed=77,
+        opening_balancer=same_opening,
+    )
+    for pair in results:
+        assert pair.games[0].opening == pair.games[1].opening
+
+
 def test_draws_score_half_per_game():
     # Center-then-min self-play draws TTT from either seat: both games of the
     # pair end 0/0 and each must contribute exactly 0.5.
