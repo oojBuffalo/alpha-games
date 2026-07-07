@@ -18,6 +18,7 @@ from collections.abc import Sequence
 
 from core.game import Action, PlayerId, State, ValueTargetSpec
 from core.game import Game as _Game
+from games.othello.symmetry import GROUP_NAMES, action_permutation, plane_transform
 
 BOARD_SIZE = 8
 EMPTY = -1
@@ -43,7 +44,12 @@ class Othello(_Game):
 
     @property
     def symmetry_group(self) -> Sequence:
-        return ()
+        # Full D4 (§12 M1.5): real plane transforms (M1.5 carries its own
+        # encoding — no M2 sentinel here) + 65-head permutations with the
+        # pass id as a fixed point of every element.
+        return tuple(
+            (plane_transform(g), action_permutation(g)) for g in GROUP_NAMES
+        )
 
     @property
     def value_targets(self) -> ValueTargetSpec:
