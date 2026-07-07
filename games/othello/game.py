@@ -47,9 +47,7 @@ class Othello(_Game):
         # Full D4 (§12 M1.5): real plane transforms (M1.5 carries its own
         # encoding — no M2 sentinel here) + 65-head permutations with the
         # pass id as a fixed point of every element.
-        return tuple(
-            (plane_transform(g), action_permutation(g)) for g in GROUP_NAMES
-        )
+        return tuple((plane_transform(g), action_permutation(g)) for g in GROUP_NAMES)
 
     @property
     def value_targets(self) -> ValueTargetSpec:

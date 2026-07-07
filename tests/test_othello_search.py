@@ -75,9 +75,7 @@ def test_mcts_plays_optimally_on_pass_endgames(rows, to_play):
     states = reachable_states(GAME, root)
     # The property is only meaningful if the swept region really contains
     # forced passes (backup must cross pass plies, not just alternation).
-    assert any(
-        not GAME.is_terminal(s) and list(GAME.legal_moves(s)) == [PASS] for s in states
-    )
+    assert any(not GAME.is_terminal(s) and list(GAME.legal_moves(s)) == [PASS] for s in states)
     value_cache: dict = {}
     size_cache: dict = {}
     candidates = [
