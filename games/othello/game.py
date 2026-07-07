@@ -61,7 +61,17 @@ class Othello(_Game):
         return state[1]
 
     def legal_moves(self, state: State) -> Sequence[Action]:
-        return _placements(state[0], state[1])
+        """Return legal placements, or ``[PASS]`` when blocked but nonterminal.
+
+        Pass is legal iff the mover has no placement and the opponent has one
+        (§12 M1.5 pin) — so the pass invariant holds at every nonterminal state
+        and a terminal state offers no action at all.
+        """
+        board, to_play = state
+        moves = _placements(board, to_play)
+        if moves:
+            return moves
+        return [PASS] if _placements(board, 1 - to_play) else []
 
     def apply(self, state: State, action: Action) -> State:
         """Place (flipping flanked lines) and hand the move to the opponent.

@@ -74,3 +74,55 @@ def test_apply_does_not_mutate_input():
     before = s0[0]
     GAME.apply(s0, 19)
     assert s0[0] == before
+
+
+# A lone corner disc can never be flanked, so White has no placement here while
+# Black does (play (0,3) over the two Whites) — a forced explicit pass.
+_WHITE_MUST_PASS = [
+    "BWW.....",
+    "........",
+    "........",
+    "........",
+    "........",
+    "........",
+    "........",
+    "........",
+]
+
+
+def test_forced_pass_is_an_explicit_action():
+    s = GAME.from_grid(_WHITE_MUST_PASS, to_play=1)
+    assert not GAME.is_terminal(s)  # Black still has a placement
+    assert list(GAME.legal_moves(s)) == [PASS]  # pass is the *only* action when blocked
+    board_before = s[0]
+    nxt = GAME.apply(s, PASS)
+    assert nxt[0] == board_before  # pass leaves the board untouched
+    assert nxt[1] == 0  # and hands the move to the opponent
+    assert 3 in GAME.legal_moves(nxt)  # Black flanks W(0,1),W(0,2) from (0,3)
+
+
+def test_pass_never_legal_alongside_placements():
+    s0 = GAME.initial_state()
+    assert PASS not in GAME.legal_moves(s0)
+
+
+def test_terminal_when_neither_player_can_place():
+    # One color only on the board: no opponent discs to flank, in either direction.
+    s = GAME.from_grid(
+        [
+            "B.B.....",
+            ".BB.....",
+            "BBB.....",
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+        ],
+        to_play=1,
+    )
+    assert GAME.is_terminal(s)
+
+    # Full board: no empties, no placements.
+    full = GAME.from_grid(["BW" * 4, "WB" * 4] * 4, to_play=0)
+    assert GAME.is_terminal(full)
