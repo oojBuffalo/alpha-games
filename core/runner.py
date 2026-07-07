@@ -143,6 +143,27 @@ class _OpeningRestricted(Game):
     def terminal_utility(self, state, player_id):
         return self._inner.terminal_utility(state, player_id)
 
+    # Encoding surface: agents may key on it (e.g. Blokus's rung 2 sizes moves
+    # via decode_action), so it must delegate rather than fall through to the
+    # base-class not-implemented stubs.
+
+    def encode_state(self, state):
+        return self._inner.encode_state(state)
+
+    def encode_action(self, move):
+        return self._inner.encode_action(move)
+
+    def decode_action(self, action):
+        return self._inner.decode_action(action)
+
+    @property
+    def policy_shape(self):
+        return self._inner.policy_shape
+
+    @property
+    def input_planes(self):
+        return self._inner.input_planes
+
 
 def play_pairs(
     game: Game,

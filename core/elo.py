@@ -68,7 +68,9 @@ def fit_elo(
     # Fold in the virtual draw and collapse duplicate matchups.
     totals: dict[tuple[str, str], tuple[float, int]] = {}
     for a, b, score_a, n_games in matches:
-        key, score, n = ((a, b), score_a, n_games) if a <= b else ((b, a), n_games - score_a, n_games)
+        key, score, n = (
+            ((a, b), score_a, n_games) if a <= b else ((b, a), n_games - score_a, n_games)
+        )
         prev_score, prev_n = totals.get(key, (0.0, 0))
         totals[key] = (prev_score + score, prev_n + n)
     totals = {k: (s + 0.5, n + 1) for k, (s, n) in totals.items()}
