@@ -192,7 +192,13 @@ def play_pairs(
 
     Returns:
         One :class:`PairResult` per pair, in play order.
+
+    Raises:
+        ValueError: If ``n_pairs`` is not positive — a zero-game match must fail
+            loudly, not emit an empty result that fabricates a fake rating.
     """
+    if n_pairs <= 0:
+        raise ValueError(f"n_pairs must be positive, got {n_pairs}")
     master = random.Random(seed)
     results = []
     for i in range(n_pairs):

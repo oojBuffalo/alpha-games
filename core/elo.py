@@ -62,12 +62,18 @@ def fit_elo(
         Dict of agent name to Elo rating, with ``result[anchor] == 0.0``.
 
     Raises:
-        ValueError: If ``anchor`` appears in no matchup, or some agent is not
-            connected to the anchor through the matchup graph.
+        ValueError: If any matchup has ``n_games <= 0``, if ``anchor`` appears
+            in no matchup, or some agent is not connected to the anchor through
+            the matchup graph.
     """
     # Fold in the virtual draw and collapse duplicate matchups.
     totals: dict[tuple[str, str], tuple[float, int]] = {}
     for a, b, score_a, n_games in matches:
+        if n_games <= 0:
+            raise ValueError(
+                f"matchup {(a, b)} has n_games={n_games}; a zero-game matchup "
+                "would fit to a fake tie via the lone virtual draw"
+            )
         key, score, n = (
             ((a, b), score_a, n_games) if a <= b else ((b, a), n_games - score_a, n_games)
         )

@@ -54,12 +54,15 @@ class RandomAgent(Agent):
 class MobilityAgent(Agent):
     """Ladder rung 3: 1-ply mobility greedy over successors (§12 M1.6 pin).
 
-    Scores are ``(tier, mobility)`` compared lexicographically: a terminal win
-    is a higher tier than any nonterminal successor and a terminal loss a lower
-    one; nonterminal successors score ``-|legal(s')|`` when the opponent moves
+    Scores are ``(band, mobility)`` compared lexicographically, with terminal
+    ``terminal_utility`` taking priority over mobility. Four bands: a terminal
+    win (3) outranks every nonterminal successor; a terminal loss (0) ranks
+    below every one; a terminal draw (1) sits just above a loss — below all
+    live positions, so the agent plays on rather than lock an immediate tie.
+    Nonterminal successors (2) score ``-|legal(s')|`` when the opponent moves
     next and ``+|legal(s')|`` when the mover moves again (opponent skipped —
-    only observable through ``current_player``). A terminal draw sits in the
-    nonterminal tier at mobility 0. Ties break uniform-random, seeded.
+    only observable through ``current_player``). Ties break uniform-random,
+    seeded.
 
     Args:
         seed: Seed for the tie-breaking RNG stream.
@@ -80,9 +83,11 @@ class MobilityAgent(Agent):
             nxt = game.apply(state, a)
             if game.is_terminal(nxt):
                 u = game.terminal_utility(nxt, mover)
-                scores.append((u, 0))
+                band = 3 if u > 0 else (0 if u < 0 else 1)  # win / loss / draw
+                scores.append((band, 0))
             else:
                 mob = len(game.legal_moves(nxt))
-                scores.append((0.0, mob if game.current_player(nxt) == mover else -mob))
+                # Band 2: above a draw, below a win; mobility breaks intra-band ties.
+                scores.append((2, mob if game.current_player(nxt) == mover else -mob))
         best = max(scores)
         return self._rng.choice([a for a, sc in zip(moves, scores, strict=True) if sc == best])

@@ -11,7 +11,12 @@ from __future__ import annotations
 from core import MobilityAgent, RandomAgent
 from games.connect4 import Connect4
 from games.tictactoe import TicTacToe
-from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
+from tests.fixtures.pass_game import (
+    PassGame,
+    Scenario,
+    consecutive_trap_game,
+    consecutive_win_game,
+)
 
 GAME = TicTacToe()
 
@@ -91,6 +96,37 @@ def test_mobility_agent_minimizes_opponent_replies_on_connect4():
     assert sorted(set(reply_counts.values())) == [6, 7]
     for seed in range(5):
         assert MobilityAgent(seed=seed).select_action(c4, s) == 0
+
+
+def test_mobility_agent_plays_on_rather_than_taking_a_draw():
+    # A terminal draw ranks below every nonterminal successor: from state 0, P0
+    # can lock an immediate tie (action 0 -> terminal (0, 0)) or play on into a
+    # live position where the opponent replies next (action 1). The pinned order
+    # WIN > nonterminal > DRAW > LOSS must keep the game going.
+    g = PassGame(
+        Scenario(
+            start=0,
+            to_play={0: 0, 2: 1},
+            edges={0: [(0, 1), (1, 2)], 2: [(0, 3)]},
+            terminal={1: (0.0, 0.0), 3: (1.0, -1.0)},
+        )
+    )
+    for seed in range(5):
+        assert MobilityAgent(seed=seed).select_action(g, g.initial_state()) == 1
+
+
+def test_mobility_agent_prefers_a_draw_over_a_loss():
+    # ...but a terminal draw still outranks a terminal loss.
+    g = PassGame(
+        Scenario(
+            start=0,
+            to_play={0: 0},
+            edges={0: [(0, 1), (1, 2)]},
+            terminal={1: (0.0, 0.0), 2: (-1.0, 1.0)},
+        )
+    )
+    for seed in range(5):
+        assert MobilityAgent(seed=seed).select_action(g, g.initial_state()) == 0
 
 
 def test_mobility_agent_breaks_ties_by_seed_deterministically():

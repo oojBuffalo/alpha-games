@@ -7,6 +7,8 @@ seeds, draws 0.5, opening balancing) are layered on top of single games.
 
 from __future__ import annotations
 
+import pytest
+
 from core import RandomAgent
 from core.agents import Agent
 from core.runner import play_game, play_pairs
@@ -140,3 +142,14 @@ def test_draws_score_half_per_game():
     (pair,) = results
     assert all(rec.utilities == (0.0, 0.0) for rec in pair.games)
     assert pair.score_a == pair.score_b == 1.0  # 0.5 + 0.5 each
+
+
+def test_play_pairs_rejects_a_zero_game_match():
+    # A ladder that runs no games must fail loudly, not emit an empty result
+    # that downstream fabricates into a fake "tied random" rating.
+    def rand(s):
+        return RandomAgent(s)
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            play_pairs(GAME, rand, rand, n_pairs=bad, seed=0)

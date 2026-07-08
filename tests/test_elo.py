@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from core import RandomAgent
 from core.elo import fit_elo, matches_from_pairs
 from core.runner import play_pairs
@@ -53,6 +55,13 @@ def test_chain_fit_is_transitively_ordered():
     assert ratings["a"] > ratings["b"] > ratings["c"] == 0.0
     # BT is additive on independent chains: a ~ twice b (loose bound).
     assert abs(ratings["a"] - 2 * ratings["b"]) < 1.0
+
+
+def test_fit_elo_rejects_a_zero_game_match():
+    # A zero-game matchup would otherwise become a lone virtual draw and fit to
+    # equal ratings — a fake "tied" result masking a ladder that never ran.
+    with pytest.raises(ValueError):
+        fit_elo([("a", "b", 0.0, 0)], anchor="b")
 
 
 def test_matches_from_pairs_aggregates_scores_and_games():
