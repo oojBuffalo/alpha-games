@@ -14,6 +14,7 @@ from games.blokus_duo import BlokusDuo
 from games.blokus_duo.bitboard import BitboardEngine
 from games.blokus_duo.oracle import OracleEngine
 from games.connect4 import Connect4
+from games.othello import Othello
 from games.tictactoe import TicTacToe
 from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
 
@@ -28,6 +29,7 @@ GAMES = [
     (consecutive_trap_game(), 60),
     (BlokusDuo(OracleEngine()), 5),
     (BlokusDuo(BitboardEngine()), 20),
+    (Othello(), 30),
 ]
 GAME_IDS = [
     "ttt",
@@ -38,6 +40,7 @@ GAME_IDS = [
     "pass-trap",
     "blokus-oracle",
     "blokus-bitboard",
+    "othello",
 ]
 
 
