@@ -1,7 +1,7 @@
 ---
 id: 1
 title: Pin λ_aux doc-first and replace the NaN sentinel
-status: pending
+status: done
 priority: high
 dependencies: []
 complexity: 2
