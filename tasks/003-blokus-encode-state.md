@@ -48,3 +48,27 @@ burden is deliberately heavy.
 handling and mover-relativity; (2) inventory + monomino-flag planes, `input_planes`, and the
 adapter override wiring; (3) the `tests/test_blokus_encoding.py` module covering all six
 categories in the test strategy.
+
+## Subtasks
+### 3.1 Encode the occupancy planes — status: pending
+Own/opponent occupancy planes, mover-relative, over both engine representations. **Details:** in
+`games/blokus_duo/game.py`: planes 1–2 from `(occ0, occ1)` reordered by `to_play` (own first);
+cell-membership test handling both 196-bit ints (bit `r*14+c`, bitboard engine) and frozensets
+(oracle), the same dual dispatch `symmetry.state_transform` already uses; nested tuples of
+`{0,1}`. **Test:** occupancy planes match engine cell sets on seeded playouts; own/opponent swap
+after a move. **Depends on:** —
+
+### 3.2 Encode inventory and flag planes; wire the override — status: pending
+The remaining 44 planes and the public surface. **Details:** planes 3–23 own inventory / 24–44
+opponent inventory as constant broadcast planes (all-1s iff piece in `inv`), order pinned by
+`pieces.BASE_PIECES` (D3); planes 45–46 monomino-last flags, mover-relative like occupancy;
+`input_planes` property returns 46; full `encode_state` assembles 3.1 + these in the D3 order.
+**Test:** initial state has 42 full inventory planes + zero flags; a placed piece zeroes its
+plane. **Depends on:** 3.1
+
+### 3.3 Write tests/test_blokus_encoding.py — status: pending
+The six-category test module mirroring `tests/test_othello_encoding.py`. **Details:**
+`input_planes == 46`; initial-state goldens; mover-relativity flip; inventory-plane zeroing;
+monomino-last flag on a crafted end-state; occupancy-vs-engine agreement on seeded random
+playouts through both engines. **Test:** `python3 -m pytest tests/test_blokus_encoding.py`.
+**Depends on:** 3.2

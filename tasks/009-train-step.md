@@ -44,3 +44,26 @@ off-by-one (warmup peak, cosine floor), hence the goldens.
 **Suggested expansion approach:** split three ways — (1) `collate` with its round-trip golden;
 (2) `make_optimizer` + the warmup/cosine schedule factory with endpoint goldens; (3) the
 device-aware `train_step` with AMP/GradScaler and the loss-decreases test.
+
+## Subtasks
+### 9.1 Implement the collate boundary — status: pending
+The single point where stdlib samples become tensors. **Details:** `core/train.py`:
+`collate(game, samples)` converting `(planes, sparse_pi, z, aux)` batches — nested-tuple planes
+via `numpy.asarray` → `torch.as_tensor` (float32, `(N, 46, 14, 14)`), sparse π pairs into the
+padded legal-id/count/mask tensors task 8's loss consumes, z/aux into target tensors. **Test:**
+round-trip golden on real Blokus samples; padding mask matches per-sample legal counts.
+**Depends on:** —
+
+### 9.2 Implement the optimizer and LR schedule factories — status: pending
+The D5 recipe. **Details:** `make_optimizer(net, lr=0.02)` → `torch.optim.SGD(momentum=0.9,
+weight_decay=1e-4)`; warmup+cosine schedule factory with warmup length / total steps as
+arguments (shape only — M3 pins the run-length numbers). **Test:** schedule endpoint goldens:
+warmup peak hits base LR at the configured step, cosine decays monotonically toward ~0.
+**Depends on:** —
+
+### 9.3 Implement the device-aware AMP train_step — status: pending
+One full optimization step, GPU-real and CPU-degradable. **Details:** `train_step(net, optimizer,
+scaler, batch)`: `autocast` + `GradScaler` (both no-ops on CPU so CI runs GPU-free), forward,
+task-8 composite loss, backward, step; returns loss components for observability. **Test:** one
+step on a seeded synthetic batch — finite loss, parameters changed; two steps reduce the loss.
+**Depends on:** 9.1, 9.2

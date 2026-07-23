@@ -44,3 +44,26 @@ effort to the implementation.
 **Suggested expansion approach:** split three ways — (1) `sparse_policy_loss` with the padded
 gather/mask batching; (2) `composite_loss` assembly reading `ValueTargetSpec.aux_loss_weights`;
 (3) `tests/test_losses.py` goldens including the inline dense reference and invariance checks.
+
+## Subtasks
+### 8.1 Implement sparse_policy_loss with padded gather and masking — status: pending
+The legal-set-only cross-entropy over the flat policy head. **Details:** `core/losses.py`:
+per-sample gather of legal-action logits from `(N, 17836)`, batched via padded legal-id tensors +
+additive `-inf` mask on pad slots; `log_softmax` over the legal set only; targets
+`π_train(a) = N(a)/ΣN` (D10) from `(action_id, visit_count)` pairs. Guard the `-inf` numerics:
+pad positions must contribute exactly zero to the sum (mask the *output*, never subtract two
+`-inf`s). **Test:** matches an inline dense renormalized-softmax reference on tiny cases.
+**Depends on:** —
+
+### 8.2 Assemble composite_loss from the ValueTargetSpec — status: pending
+The §7 loss minus the weight-decay term. **Details:** value MSE `(z − v)²` + policy CE +
+`Σ λ_i·MSE(aux_i)` with weights read from the adapter's `ValueTargetSpec.aux_loss_weights`
+(pinned in task 1) — never hardcoded; docstring states that `c‖θ‖²` lives in SGD
+`weight_decay=1e-4` (D5) so nobody double-counts it. Returns components separately for
+observability. **Test:** `aux_weights=(0,)` removes the aux term bit-exactly. **Depends on:** 8.1
+
+### 8.3 Write tests/test_losses.py — status: pending
+Hand-computed goldens plus the invariance battery. **Details:** 2–3 legal-action cases with known
+logits/counts verified against the inline dense reference; perturbing an *illegal* logit leaves
+loss and gradients bit-identical; gradient of pad slots is zero; all gradients finite; seeded,
+CPU-only. **Test:** `python3 -m pytest tests/test_losses.py`. **Depends on:** 8.2

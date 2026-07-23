@@ -52,3 +52,35 @@ piece must respect.
 `input_planes`/`policy_shape`; (2) stem + residual trunk; (3) the three heads including the
 HWC permute/flatten pinned to `actions.encode`; (4) `tests/test_network.py` with the
 flatten-order golden and the micro-config parameterization proof.
+
+## Subtasks
+### 7.1 Define NetworkConfig and the from_game bridge — status: pending
+Frozen dataclass carrying every dimension the net needs; nothing downstream hardcodes Blokus
+numbers. **Details:** `core/network.py`: `NetworkConfig(input_planes, board_size,
+policy_channels, trunk_blocks=8, trunk_channels=128, num_aux=1)` + classmethod
+`from_game(game)` reading `game.input_planes` and `game.policy_shape` (Blokus → 46/14/91;
+validate `policy_shape == (board, board, channels)` 3-tuple vs flat heads like Othello's `(65,)`
+— decide and document the flat-head story: `from_game` may reject non-spatial heads for now).
+**Test:** `from_game(BlokusDuo())` golden; a hand-built micro config constructs. **Depends on:** —
+
+### 7.2 Build the conv stem and residual trunk — status: pending
+The D5 body: 3×3 conv stem to `trunk_channels`, then `trunk_blocks` residual blocks
+(conv-BN-ReLU ×2 with skip), AlphaZero-style. **Details:** plain `nn.Module`s parameterized only
+by `NetworkConfig`; no pooling, board size preserved throughout; seeded init. **Test:** forward
+shape `(N, trunk_channels, board, board)` for Blokus and a micro config; gradients flow.
+**Depends on:** 7.1
+
+### 7.3 Add the three heads with the pinned HWC flatten — status: pending
+Policy, value, aux heads with the §5.1 flatten contract — the load-bearing subtask. **Details:**
+policy: 1×1 conv to `policy_channels` → `(N, C, H, W)`, then `permute(0, 2, 3, 1)` and flatten so
+flat index `(r*board+c)*policy_channels + o` matches `games/blokus_duo/actions.py::encode` ("M2
+pays one tensor permute before the sparse gather"); raw logits, no masking. Value: 1×1 conv → FC
+→ scalar `tanh` (D1). Aux: 1×1 conv → FC → `num_aux` linear outputs. **Test:** flatten-order
+spot-check by indexing the pre-flatten tensor at `(o, r, c)`; value range. **Depends on:** 7.2
+
+### 7.4 Write tests/test_network.py — status: pending
+The module-level battery proving shapes, the flatten golden, and parameterization. **Details:**
+forward shapes `(N, 17836)`/`(N,)`/`(N, 1)` for `from_game(BlokusDuo())`; value ∈ [−1, 1];
+the flatten-order golden against `actions.encode` over a sample of `(r, c, o)` triples; a
+synthetic micro config (board 5, 7 planes, 3 channels) runs forward — CPU-only, seeded.
+**Test:** `python3 -m pytest tests/test_network.py`. **Depends on:** 7.3
