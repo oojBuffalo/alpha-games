@@ -4,8 +4,8 @@ title: Pin λ_aux doc-first and replace the NaN sentinel
 status: pending
 priority: high
 dependencies: []
-complexity:
-recommended_subtasks:
+complexity: 2
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -30,3 +30,12 @@ Doc-first, per the project working principle — the doc amendment precedes the 
 ## Test Strategy
 `python3 -m pytest tests/test_blokus_targets.py` passes with the new golden; grep the design doc
 for the pinned value to confirm doc and code agree; full battery stays green.
+
+## Complexity Analysis
+A one-line doc amendment, a one-tuple code change, and one test-golden update — all three sites
+are already located (`§7`, `targets.py::value_target_spec`, `test_blokus_targets.py`). The only
+non-mechanical element is the human sign-off on the value, which is a decision gate, not
+implementation effort.
+
+**Suggested expansion approach:** none — already atomic; splitting a three-line change would be
+overhead.

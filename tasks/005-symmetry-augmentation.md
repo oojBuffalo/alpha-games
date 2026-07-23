@@ -4,8 +4,8 @@ title: Add training-side symmetry augmentation
 status: pending
 priority: medium
 dependencies: [4]
-complexity:
-recommended_subtasks:
+complexity: 2
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -30,3 +30,11 @@ Unit tests: identity element is a no-op on both planes and pairs; visit-count mu
 preserved under every g; applying g then its inverse round-trips (Klein-4 elements are
 self-inverse). Run the same tests against both `BlokusDuo` and `Othello` adapters to prove
 game-genericity.
+
+## Complexity Analysis
+A few-line pure function over already-built pieces: the adapter-declared `symmetry_group` pairs
+(real after task 4) and the D12 sparse-pair shape. Stdlib-only, no tensor handling, no group
+logic of its own — it just composes the two declared callables. The two-game test matrix is
+cheap because both adapters share the `SymmetryElement` contract.
+
+**Suggested expansion approach:** none — atomic; this is a single utility plus its unit tests.

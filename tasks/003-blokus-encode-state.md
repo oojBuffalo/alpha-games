@@ -4,8 +4,8 @@ title: Implement Blokus 46-plane encode_state
 status: pending
 priority: high
 dependencies: []
-complexity:
-recommended_subtasks:
+complexity: 5
+recommended_subtasks: 3
 ---
 
 ## Description
@@ -35,3 +35,16 @@ New `tests/test_blokus_encoding.py` mirroring `tests/test_othello_encoding.py`: 
 mover-relativity (own/opponent planes swap after one move); inventory plane for a placed piece
 zeroes out; monomino-last flag plane sets on a crafted end-state; occupancy planes match
 `bitboard`/`oracle` cell sets on seeded random playouts.
+
+## Complexity Analysis
+Conceptually a pure projection of a state tuple that already carries every plane's data, with a
+direct template to mirror (`games/othello/game.py::encode_state`) — that caps the score. What
+raises it: 46 planes with a pinned order that downstream training silently depends on (D3),
+mover-relative perspective, dual occupancy representations (196-bit ints vs frozensets), and a
+six-category test module. Encoding bugs here corrupt every later training signal, so the testing
+burden is deliberately heavy.
+
+**Suggested expansion approach:** split three ways — (1) occupancy planes with dual-representation
+handling and mover-relativity; (2) inventory + monomino-flag planes, `input_planes`, and the
+adapter override wiring; (3) the `tests/test_blokus_encoding.py` module covering all six
+categories in the test strategy.

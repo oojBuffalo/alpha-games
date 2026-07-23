@@ -4,8 +4,8 @@ title: Add the overfit-one-batch test
 status: pending
 priority: high
 dependencies: [1, 3, 9]
-complexity:
-recommended_subtasks:
+complexity: 4
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -33,3 +33,13 @@ This task is a test. `python3 -m pytest tests/test_overfit.py` passes determinis
 seeds, CPU); it must run in tens of seconds, not minutes — shrink the batch or steps if not.
 Sanity-check it fails when sabotaged (e.g. zero the LR, or feed permuted policy targets) before
 trusting the green.
+
+## Complexity Analysis
+Test-only, with all machinery supplied by tasks 1–9 — this task writes no production code. The
+effort is empirical tuning: picking batch size, step count, and LR so memorization is
+deterministic *and* fast on CPU, which typically takes several iterations. Kept unsplit because
+the batch construction and the assertions are meaningless apart; the deliverable is one
+end-to-end proof.
+
+**Suggested expansion approach:** none — atomic; iterate on thresholds within the single test
+module.

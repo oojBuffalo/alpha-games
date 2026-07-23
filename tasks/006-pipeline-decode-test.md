@@ -4,8 +4,8 @@ title: Add the pipeline decode test
 status: pending
 priority: high
 dependencies: [5]
-complexity:
-recommended_subtasks:
+complexity: 4
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -36,3 +36,13 @@ declared `g`: build `(g·state, g·π)` via plane transform + action permutation
 ## Test Strategy
 This task *is* a test. Verify it fails when sabotaged: temporarily swap `diag`/`antidiag` in the
 plane transform (or transpose a plane) and confirm the test catches it, then restore.
+
+## Complexity Analysis
+Test-only, and every primitive it composes already exists (`action_cells`, `cell_map`,
+`augment_sample`, random playout via the adapter) — no new production code. Scored mid-range
+because the assertion is conceptually dense (multiset of `(cell-set, count)` across four group
+elements and several game phases), and its value depends on the sabotage check actually being
+performed — a vacuously-green version of this test is worse than none.
+
+**Suggested expansion approach:** none — one test module; splitting the state-generation helper
+from the assertions would fragment a single coherent check.

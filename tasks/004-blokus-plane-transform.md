@@ -4,8 +4,8 @@ title: Implement Blokus plane-side symmetry transform
 status: pending
 priority: high
 dependencies: [3]
-complexity:
-recommended_subtasks:
+complexity: 3
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -31,3 +31,13 @@ and seeded random reachable states, `plane_transform(g)(encode_state(s)) ==
 encode_state(state_transform(g)(s))` — reusing the module utility
 `games/blokus_duo/symmetry.state_transform` from the M1 battery. Also assert
 `symmetry_group[0]` (identity) round-trips exactly.
+
+## Complexity Analysis
+Small, well-fenced change: apply the existing `cell_map` spatially across planes, mirroring the
+Othello `plane_transform` template, and swap out one sentinel in `symmetry_group`. The Klein-4
+elements are self-inverse, the equivariance test pattern already exists (`state_transform` is
+built for exactly this), and the risky geometric work — the `(g,a)→a′` table — is M1-owned and
+untouched.
+
+**Suggested expansion approach:** none — atomic; the implementation and its equivariance test
+belong in one change.

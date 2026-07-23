@@ -4,14 +4,14 @@
 
 | ID | Title | Status | Priority | Depends on | Complexity | Subtasks |
 |----|-------|--------|----------|------------|------------|----------|
-| 1 | Pin λ_aux doc-first and replace the NaN sentinel | pending | high | — | — | — |
-| 2 | Add NumPy and PyTorch dependencies | pending | high | — | — | — |
-| 3 | Implement Blokus 46-plane encode_state | pending | high | — | — | — |
-| 4 | Implement Blokus plane-side symmetry transform | pending | high | 3 | — | — |
-| 5 | Add training-side symmetry augmentation | pending | medium | 4 | — | — |
-| 6 | Add the pipeline decode test | pending | high | 5 | — | — |
-| 7 | Build the D5 residual network | pending | high | 2 | — | — |
-| 8 | Implement sparse policy and composite loss | pending | high | 7 | — | — |
-| 9 | Implement the AMP train step | pending | high | 8 | — | — |
-| 10 | Add the overfit-one-batch test | pending | high | 1, 3, 9 | — | — |
-| 11 | Promote the encoding surface to abstract methods | pending | low | 3 | — | — |
+| 1 | Pin λ_aux doc-first and replace the NaN sentinel | pending | high | — | 2 | — |
+| 2 | Add NumPy and PyTorch dependencies | pending | high | — | 3 | — |
+| 3 | Implement Blokus 46-plane encode_state | pending | high | — | 5 | — |
+| 4 | Implement Blokus plane-side symmetry transform | pending | high | 3 | 3 | — |
+| 5 | Add training-side symmetry augmentation | pending | medium | 4 | 2 | — |
+| 6 | Add the pipeline decode test | pending | high | 5 | 4 | — |
+| 7 | Build the D5 residual network | pending | high | 2 | 6 | — |
+| 8 | Implement sparse policy and composite loss | pending | high | 7 | 5 | — |
+| 9 | Implement the AMP train step | pending | high | 8 | 5 | — |
+| 10 | Add the overfit-one-batch test | pending | high | 1, 3, 9 | 4 | — |
+| 11 | Promote the encoding surface to abstract methods | pending | low | 3 | 4 | — |

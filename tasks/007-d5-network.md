@@ -4,8 +4,8 @@ title: Build the D5 residual network
 status: pending
 priority: high
 dependencies: [2]
-complexity:
-recommended_subtasks:
+complexity: 6
+recommended_subtasks: 4
 ---
 
 ## Description
@@ -38,3 +38,17 @@ construction (or index the pre-flatten tensor at `(o, r, c)`) and assert it land
 `(r*14+c)*91+o`; `from_game(BlokusDuo())` picks up 46/14/91; a small synthetic config (e.g.
 board 5, 7 planes, 3 policy channels) constructs and runs forward — proving parameterization.
 CPU-only, seeded.
+
+## Complexity Analysis
+The largest single build in M2: first torch module in the repo, a config dataclass with a
+`from_game` bridge, an 8-block residual trunk, and three heads with different output contracts.
+The highest-risk element is the policy-head flatten: `(N, 91, 14, 14)` must permute to HWC before
+flattening so flat indices match `actions.encode` — a silent mismatch here corrupts every
+training target while all shapes still check out, which is why the flatten-order golden is
+non-negotiable. Parameterization for M2.5 (nothing hardcodes 46/14/91) adds a second axis every
+piece must respect.
+
+**Suggested expansion approach:** split four ways — (1) `NetworkConfig` + `from_game` reading
+`input_planes`/`policy_shape`; (2) stem + residual trunk; (3) the three heads including the
+HWC permute/flatten pinned to `actions.encode`; (4) `tests/test_network.py` with the
+flatten-order golden and the micro-config parameterization proof.

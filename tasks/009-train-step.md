@@ -4,8 +4,8 @@ title: Implement the AMP train step
 status: pending
 priority: high
 dependencies: [8]
-complexity:
-recommended_subtasks:
+complexity: 5
+recommended_subtasks: 3
 ---
 
 ## Description
@@ -33,3 +33,14 @@ New `tests/test_train_step.py`: one step on a small seeded synthetic batch runs 
 CPU with finite loss and updated parameters (assert some parameter tensor changed); two steps on
 the same batch reduce the loss; LR-schedule goldens (warmup endpoint hits the base LR, cosine
 decays toward ~0); collate round-trip golden on a couple of real Blokus samples.
+
+## Complexity Analysis
+Four distinct pieces (optimizer factory, LR schedule, collate boundary, AMP step) that are each
+individually simple but couple at the edges: the collate is the single stdlib→tensor conversion
+point and must preserve the padded-mask contract from task 8, and the AMP path must degrade to
+no-ops on CPU or the whole battery becomes GPU-dependent. Schedule endpoints are easy to get
+off-by-one (warmup peak, cosine floor), hence the goldens.
+
+**Suggested expansion approach:** split three ways — (1) `collate` with its round-trip golden;
+(2) `make_optimizer` + the warmup/cosine schedule factory with endpoint goldens; (3) the
+device-aware `train_step` with AMP/GradScaler and the loss-decreases test.

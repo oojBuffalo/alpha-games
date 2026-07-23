@@ -4,8 +4,8 @@ title: Promote the encoding surface to abstract methods
 status: pending
 priority: low
 dependencies: [3]
-complexity:
-recommended_subtasks:
+complexity: 4
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -34,3 +34,13 @@ this forces.
 Full battery green (`python3 -m pytest`). Add one negative test: a `Game` subclass missing
 `encode_state` raises `TypeError` at instantiation. Spot-check TTT/Connect4 encodings with tiny
 goldens (a placed mark shows up in the right plane/cell).
+
+## Complexity Analysis
+Each backfill is trivial (tiny boards, identity codecs), but the breadth is real: one ABC change
+ripples into two game adapters, two test fixtures, and potentially any test that instantiates a
+partial `Game`. The risk is discovering unlisted instantiation sites mid-change — mechanical to
+fix, annoying to chase. The documented fallback (doc-first amendment keeping loud stubs) bounds
+the downside if the ripple is worse than mapped.
+
+**Suggested expansion approach:** none — keep as one change so the battery is green in a single
+commit; splitting per-adapter would leave the tree broken between subtasks.

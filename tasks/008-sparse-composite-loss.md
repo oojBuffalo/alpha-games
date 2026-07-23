@@ -4,8 +4,8 @@ title: Implement sparse policy and composite loss
 status: pending
 priority: high
 dependencies: [7]
-complexity:
-recommended_subtasks:
+complexity: 5
+recommended_subtasks: 3
 ---
 
 ## Description
@@ -32,3 +32,15 @@ New `tests/test_losses.py`: hand-computed goldens on tiny cases (2–3 legal act
 logits/counts, values verified by a dense reference computed inline with explicit renormalized
 softmax); perturbing an *illegal* logit leaves the loss bit-identical; `aux_weights=(0,)` removes
 the aux term exactly; gradients are finite. Seeded, CPU-only.
+
+## Complexity Analysis
+Compact code with subtle failure modes: padded gathers with `-inf` masking interact with
+`log_softmax` numerics (a stray `nan` from `-inf − -inf` is the classic bug), the legal-set-only
+renormalization must leave illegal logits with exactly zero gradient, and the weight-decay term
+must stay out of the loss to avoid double-counting against SGD. The invariant tests (illegal-logit
+perturbation, dense-reference agreement) are what make this trustworthy, and they take comparable
+effort to the implementation.
+
+**Suggested expansion approach:** split three ways — (1) `sparse_policy_loss` with the padded
+gather/mask batching; (2) `composite_loss` assembly reading `ValueTargetSpec.aux_loss_weights`;
+(3) `tests/test_losses.py` goldens including the inline dense reference and invariance checks.

@@ -4,8 +4,8 @@ title: Add NumPy and PyTorch dependencies
 status: pending
 priority: high
 dependencies: []
-complexity:
-recommended_subtasks:
+complexity: 3
+recommended_subtasks: 0
 ---
 
 ## Description
@@ -26,3 +26,12 @@ Introduce NumPy and PyTorch as project dependencies — M2 is the milestone wher
 ## Test Strategy
 `python3 -m pip install -e ".[dev]"` succeeds; `python3 -c "import numpy, torch"` works; the full
 existing battery (`python3 -m pytest`) still passes; CI run completes on a branch push.
+
+## Complexity Analysis
+Config-only change (two `pyproject.toml` lines plus a CI install tweak), but scored above minimum
+because CI wheel selection is iteration-prone: CPU-only torch indexes, wheel size/cache limits on
+GitHub Actions, and the risk of the resolver pulling CUDA wheels locally vs CPU in CI. No
+production code changes; the battery itself is untouched.
+
+**Suggested expansion approach:** none — atomic; any CI fixes are part of landing this task, not
+separate subtasks.
