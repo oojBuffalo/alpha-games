@@ -7,10 +7,11 @@ name = "alpha-games"
 version = "0.0.0"
 description = "AlphaZero replication as a game-agnostic engine; POC game Blokus Duo."
 requires-python = ">=3.11"
-dependencies = []
+# NumPy/torch arrive at M2 with encoding/training; adapters (games/) stay stdlib-pure —
+# torch/numpy imports are confined to core/network.py, core/losses.py, core/train.py.
+dependencies = ["numpy>=1.26", "torch>=2.2"]
 
 [project.optional-dependencies]
-# Dev-only. core/ is pure-stdlib at M0; NumPy/torch arrive with encoding/training (M2).
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.setuptools.packages.find]
