@@ -5,7 +5,7 @@
 | ID | Title | Status | Priority | Depends on | Complexity | Subtasks |
 |----|-------|--------|----------|------------|------------|----------|
 | 1 | Pin λ_aux doc-first and replace the NaN sentinel | done | high | — | 2 | — |
-| 2 | Add NumPy and PyTorch dependencies | pending | high | — | 3 | — |
+| 2 | Add NumPy and PyTorch dependencies | done | high | — | 3 | — |
 | 3 | Implement Blokus 46-plane encode_state | pending | high | — | 5 | 3 |
 | 4 | Implement Blokus plane-side symmetry transform | pending | high | 3 | 3 | — |
 | 5 | Add training-side symmetry augmentation | pending | medium | 4 | 2 | — |

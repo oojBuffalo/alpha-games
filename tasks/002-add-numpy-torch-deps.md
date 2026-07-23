@@ -1,7 +1,7 @@
 ---
 id: 2
 title: Add NumPy and PyTorch dependencies
-status: pending
+status: done
 priority: high
 dependencies: []
 complexity: 3
