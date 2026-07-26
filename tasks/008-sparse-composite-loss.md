@@ -3,7 +3,7 @@ id: 8
 title: Implement sparse policy and composite loss
 status: pending
 priority: high
-dependencies: [7]
+dependencies: [1, 7]
 complexity: 5
 recommended_subtasks: 3
 ---

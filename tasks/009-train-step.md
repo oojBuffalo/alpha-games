@@ -27,6 +27,10 @@ stdlib-encoded samples into tensors.
   loss, backward, step, return the loss components for observability. Device-aware: autocast and
   scaler must degrade to no-ops on CPU so the battery runs GPU-free (CI has no GPU); AMP is
   exercised for real on the 4060 Ti.
+- **Batch size 256 is the D5 default** — carry it as an explicit default constant/config field
+  here (the M3 loop consumes it), not an implicit property of whatever batch the caller passes.
+  `train_step` itself stays batch-size-agnostic; the CPU battery uses small synthetic batches,
+  and the D5 batch is exercised for real by the task-13 GPU benchmark (128/256/512).
 
 ## Test Strategy
 New `tests/test_train_step.py`: one step on a small seeded synthetic batch runs end-to-end on

@@ -68,7 +68,7 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 **M6** ordered levers, each gated on the M4-defined plateau: (1) FPU reduction, (2) 8-fold augmentation (rung-7 Elo), (3) value-only fast-position storage iff value-limited, (4) global-pooling, (5) KataGo aux bundle →
 **M7** (future) N-player engine for 4p Blokus: vector value head, max-n/paranoid backup, tournament eval.
 
-Unpinned scalars flagged doc-first: aux loss weight λ_aux (M2/§7), weight-publish interval / checkpoint count K (M3/§6.2), mirrored pairs per (checkpoint,rung) cell (M4/§9).
+Unpinned scalars flagged doc-first: weight-publish interval / checkpoint count K (M3/§6.2), mirrored pairs per (checkpoint,rung) cell (M4/§9). Already pinned at its milestone: aux loss weight **λ_aux = 0.25** (M2, §7).
 
 ## Test battery highlights (M1)
 
