@@ -15,12 +15,14 @@ this forces.
 
 ## Details
 - `core/game.py` lines ~148–173: `encode_state`, `encode_action`, `decode_action`,
-  `policy_shape`, `input_planes` are concrete `NotImplementedError` stubs. Promote them to
-  `@abstractmethod` (properties stay properties).
-- Ripple — every concrete `Game` must now implement all five. Backfill trivially:
-  - `games/tictactoe`: 2 mover-relative 3×3 occupancy planes, flat `policy_shape (9,)`, identity
-    codec.
-  - `games/connect4`: 2 planes 6×7, `policy_shape (7,)` (column id), identity codec.
+  `policy_shape`, `input_planes`, and `input_shape` (stub added by task 3) are concrete
+  `NotImplementedError` stubs. Promote them to `@abstractmethod` (properties stay properties).
+- Ripple — every concrete `Game` must now implement all six. Backfill trivially:
+  - `games/tictactoe`: 2 mover-relative 3×3 occupancy planes, `input_shape (3, 3)`, flat
+    `policy_shape (9,)`, identity codec.
+  - `games/connect4`: 2 planes 6×7, `input_shape (6, 7)` — the tree's one non-square grid,
+    which is why task 7's geometry handling never assumes `H == W` — `policy_shape (7,)`
+    (column id), identity codec.
   - `tests/fixtures/pass_game.py`: minimal 1–2 plane encoding over its tiny state space.
   - `tests/fixtures/bad_adapters.py`: these exist to violate the *envelope*, not the encoding
     surface — give them the same trivial stubs so they still instantiate far enough to hit

@@ -24,6 +24,10 @@ composite loss `l = (z − v)² − πᵀ log p + λ_aux·(aux term) + c‖θ‖
   `ValueTargetSpec.aux_loss_weights` (pinned in task 1 — read it from the spec, don't hardcode).
   The `c‖θ‖²` term is *not* computed in the loss: it lives in SGD `weight_decay=1e-4` (D5);
   say so in the docstring so nobody double-counts it.
+- **The empty aux spec is a first-class input, not an edge case:** `aux_weights=()` with no aux
+  predictions/targets at all (`None`/absent) must reduce bit-exactly to value MSE + policy CE.
+  Othello declares zero aux heads, and M3 drives it through this exact code path with zero
+  `core/` changes — a loss that assumes at least one aux head breaks that requirement.
 - Sparse targets come straight from the D12 replay shape `(action_id, visit_count)` — no dense
   17,836-vector materialization anywhere.
 
@@ -31,7 +35,9 @@ composite loss `l = (z − v)² − πᵀ log p + λ_aux·(aux term) + c‖θ‖
 New `tests/test_losses.py`: hand-computed goldens on tiny cases (2–3 legal actions, known
 logits/counts, values verified by a dense reference computed inline with explicit renormalized
 softmax); perturbing an *illegal* logit leaves the loss bit-identical; `aux_weights=(0,)` removes
-the aux term exactly; gradients are finite. Seeded, CPU-only.
+the aux term exactly; the empty spec `aux_weights=()` with no aux tensors equals the
+value+policy-only loss (the Othello no-aux path — distinct from a present-but-zero-weighted
+head); gradients are finite. Seeded, CPU-only.
 
 ## Complexity Analysis
 Compact code with subtle failure modes: padded gathers with `-inf` masking interact with
@@ -58,12 +64,15 @@ pad positions must contribute exactly zero to the sum (mask the *output*, never 
 ### 8.2 Assemble composite_loss from the ValueTargetSpec — status: pending
 The §7 loss minus the weight-decay term. **Details:** value MSE `(z − v)²` + policy CE +
 `Σ λ_i·MSE(aux_i)` with weights read from the adapter's `ValueTargetSpec.aux_loss_weights`
-(pinned in task 1) — never hardcoded; docstring states that `c‖θ‖²` lives in SGD
-`weight_decay=1e-4` (D5) so nobody double-counts it. Returns components separately for
-observability. **Test:** `aux_weights=(0,)` removes the aux term bit-exactly. **Depends on:** 8.1
+(pinned in task 1) — never hardcoded; the empty spec (`aux_weights=()`, no aux tensors —
+Othello) reduces bit-exactly to value MSE + policy CE; docstring states that `c‖θ‖²` lives in
+SGD `weight_decay=1e-4` (D5) so nobody double-counts it. Returns components separately for
+observability. **Test:** `aux_weights=(0,)` removes the aux term bit-exactly; `aux_weights=()`
+with no aux tensors works. **Depends on:** 8.1
 
 ### 8.3 Write tests/test_losses.py — status: pending
 Hand-computed goldens plus the invariance battery. **Details:** 2–3 legal-action cases with known
 logits/counts verified against the inline dense reference; perturbing an *illegal* logit leaves
-loss and gradients bit-identical; gradient of pad slots is zero; all gradients finite; seeded,
-CPU-only. **Test:** `python3 -m pytest tests/test_losses.py`. **Depends on:** 8.2
+loss and gradients bit-identical; gradient of pad slots is zero; the empty aux spec equals the
+value+policy-only loss; all gradients finite; seeded, CPU-only. **Test:**
+`python3 -m pytest tests/test_losses.py`. **Depends on:** 8.2

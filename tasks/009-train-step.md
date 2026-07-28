@@ -22,7 +22,9 @@ stdlib-encoded samples into tensors.
 - `collate(game, samples)`: converts a batch of `(planes, sparse_pi, z, aux)` — planes as the
   nested tuples from `encode_state`, π as `(action_id, visit_count)` pairs — into the tensor
   batch task 8's loss consumes (`numpy.asarray` → `torch.as_tensor`, padded legal-id/mask
-  tensors). This is the single point where stdlib data becomes tensors.
+  tensors). This is the single point where stdlib data becomes tensors. Aux handling is
+  spec-driven: for a game whose `ValueTargetSpec` declares no aux heads (Othello), samples carry
+  no aux targets and collate emits none — not zero-filled placeholders.
 - `train_step(net, optimizer, scaler, batch)`: AMP `autocast` + `GradScaler`, forward, composite
   loss, backward, step, return the loss components for observability. Device-aware: autocast and
   scaler must degrade to no-ops on CPU so the battery runs GPU-free (CI has no GPU); AMP is
@@ -36,7 +38,9 @@ stdlib-encoded samples into tensors.
 New `tests/test_train_step.py`: one step on a small seeded synthetic batch runs end-to-end on
 CPU with finite loss and updated parameters (assert some parameter tensor changed); two steps on
 the same batch reduce the loss; LR-schedule goldens (warmup endpoint hits the base LR, cosine
-decays toward ~0); collate round-trip golden on a couple of real Blokus samples.
+decays toward ~0); collate round-trip golden on a couple of real Blokus samples; **the no-aux
+path end-to-end** — an Othello-shaped batch (no aux targets) collates and completes a train
+step with finite loss, proving M3's zero-`core/`-diff requirement reaches the training stack.
 
 ## Complexity Analysis
 Four distinct pieces (optimizer factory, LR schedule, collate boundary, AMP step) that are each
@@ -54,9 +58,10 @@ device-aware `train_step` with AMP/GradScaler and the loss-decreases test.
 The single point where stdlib samples become tensors. **Details:** `core/train.py`:
 `collate(game, samples)` converting `(planes, sparse_pi, z, aux)` batches — nested-tuple planes
 via `numpy.asarray` → `torch.as_tensor` (float32, `(N, 46, 14, 14)`), sparse π pairs into the
-padded legal-id/count/mask tensors task 8's loss consumes, z/aux into target tensors. **Test:**
-round-trip golden on real Blokus samples; padding mask matches per-sample legal counts.
-**Depends on:** —
+padded legal-id/count/mask tensors task 8's loss consumes, z/aux into target tensors — aux
+spec-driven, emitting no aux tensors for a no-aux game (Othello). **Test:** round-trip golden on
+real Blokus samples; padding mask matches per-sample legal counts; an Othello-shaped no-aux
+batch collates. **Depends on:** —
 
 ### 9.2 Implement the optimizer and LR schedule factories — status: pending
 The D5 recipe. **Details:** `make_optimizer(net, lr=0.02)` → `torch.optim.SGD(momentum=0.9,
@@ -69,5 +74,5 @@ warmup peak hits base LR at the configured step, cosine decays monotonically tow
 One full optimization step, GPU-real and CPU-degradable. **Details:** `train_step(net, optimizer,
 scaler, batch)`: `autocast` + `GradScaler` (both no-ops on CPU so CI runs GPU-free), forward,
 task-8 composite loss, backward, step; returns loss components for observability. **Test:** one
-step on a seeded synthetic batch — finite loss, parameters changed; two steps reduce the loss.
-**Depends on:** 9.1, 9.2
+step on a seeded synthetic batch — finite loss, parameters changed; two steps reduce the loss;
+one step on an Othello-shaped no-aux batch completes with finite loss. **Depends on:** 9.1, 9.2

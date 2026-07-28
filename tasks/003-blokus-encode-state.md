@@ -28,10 +28,20 @@ base-class `NotImplementedError` stubs) with the D3 46-plane encoding from desig
 - Return nested tuples of `{0,1}` shaped 46×14×14, mirroring `games/othello/game.py::encode_state`
   (the M1.5 precedent). Adapters stay stdlib-pure; the training boundary converts with
   `numpy.asarray` (task 9).
+- **Contract addition (owned here): `input_shape`.** Add an `input_shape -> tuple[int, int]`
+  stub property to the `core/game.py` encoding surface next to `input_planes` — the
+  `(height, width)` of every input plane, so the full tensor is `(input_planes, *input_shape)`.
+  Doc-first: extend the §6.1 contract list (and the CLAUDE.md digest's contract line) before the
+  code lands. Implement `(14, 14)` for Blokus and backfill `(8, 8)` on the existing Othello
+  adapter (M1.5 predates the property). Rationale: a flat policy head like Othello's `(65,)`
+  carries no geometry, so task 7's `from_game` cannot derive `(H, W)` from `policy_shape`; this
+  property is the stable source. Task 11 promotes it abstract with the rest of the surface
+  (Connect4's is the non-square `(6, 7)`).
 
 ## Test Strategy
 New `tests/test_blokus_encoding.py` mirroring `tests/test_othello_encoding.py`: `input_planes ==
-46`; initial state has empty occupancy planes, all 42 inventory planes full, flag planes zero;
+46` and `input_shape == (14, 14)` (plus `Othello().input_shape == (8, 8)` for the backfill);
+initial state has empty occupancy planes, all 42 inventory planes full, flag planes zero;
 mover-relativity (own/opponent planes swap after one move); inventory plane for a placed piece
 zeroes out; monomino-last flag plane sets on a crafted end-state; occupancy planes match
 `bitboard`/`oracle` cell sets on seeded random playouts.
@@ -62,7 +72,9 @@ after a move. **Depends on:** —
 The remaining 44 planes and the public surface. **Details:** planes 3–23 own inventory / 24–44
 opponent inventory as constant broadcast planes (all-1s iff piece in `inv`), order pinned by
 `pieces.BASE_PIECES` (D3); planes 45–46 monomino-last flags, mover-relative like occupancy;
-`input_planes` property returns 46; full `encode_state` assembles 3.1 + these in the D3 order.
+`input_planes` returns 46 and `input_shape` returns `(14, 14)` — including the `core/game.py`
+stub property and the Othello `(8, 8)` backfill from the contract-addition bullet; full
+`encode_state` assembles 3.1 + these in the D3 order.
 **Test:** initial state has 42 full inventory planes + zero flags; a placed piece zeroes its
 plane. **Depends on:** 3.1
 
