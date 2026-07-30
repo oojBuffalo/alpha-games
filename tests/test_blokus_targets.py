@@ -2,14 +2,12 @@
 
 ``z = sign(score_diff)`` including ``sign(0) = 0`` (draws are not losses; §4 has
 ``z = 0``), ``aux = score_diff / 109``, and the ``|score_diff| <= 109`` range
-assertion. Also the [F7] NaN sentinel: the aux loss weight λ_aux is unpinned
-until M2 pins it doc-first, so the declared weight must poison any loss that
-uses it early — 0.0 would silently train the aux head at weight zero.
+assertion. Also the declared aux-loss weight: λ_aux was pinned doc-first at M2
+(§7), so the spec golden is a hardcoded equality — code drifting from the doc
+fails here.
 """
 
 from __future__ import annotations
-
-import math
 
 import pytest
 
@@ -41,11 +39,10 @@ def test_range_assertion_on_impossible_diffs():
         value_targets(-90, 20)
 
 
-def test_value_target_spec_declares_nan_sentinel():
-    # [F7] λ_aux is pinned doc-first at M2; until then the weight is NaN so any
-    # loss computed with it is poisoned rather than silently trained at 0.0.
+def test_value_target_spec_declares_pinned_lambda_aux():
+    # λ_aux = 0.25, pinned doc-first in design doc §7 — hardcoded here so code
+    # drifting from the doc fails loudly.
     spec = value_target_spec()
     assert spec.primary_name == "z"
     assert spec.aux_names == ("score_diff",)
-    assert len(spec.aux_loss_weights) == 1
-    assert math.isnan(spec.aux_loss_weights[0])  # NaN != NaN — assert via isnan
+    assert spec.aux_loss_weights == (0.25,)
