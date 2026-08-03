@@ -5,7 +5,11 @@ planes, 21 opponent-inventory planes (piece order = ``pieces.BASE_PIECES``,
 §5.1), own/opponent monomino-last flags. Mover-relative ("own" = side to move,
 no side-to-move plane), constant broadcast planes for inventory/flags, nested
 14×14 tuples over {0, 1}, ``T=1``. Plus the §6.1 contract addition owned here:
-``input_shape``, incl. the Othello ``(8, 8)`` backfill.
+``input_shape``, incl. the Othello ``(8, 8)`` backfill. Plus the M2 plane-side
+symmetry: the Klein-4 ``plane_transform`` now filling the adapter's
+``symmetry_group`` first slot, tested equivariant against
+``encode_state ∘ state_transform`` (M1 [F4] pattern: states transform through
+the module utility, planes through the transform under test).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from games.blokus_duo.actions import BOARD_SIZE, encode
 from games.blokus_duo.bitboard import BitboardEngine
 from games.blokus_duo.oracle import MONOMINO, OracleEngine
 from games.blokus_duo.pieces import BASE_PIECES
+from games.blokus_duo.symmetry import GROUP_NAMES, plane_transform, state_transform
 from games.othello import Othello
 from tests.test_blokus_oracle import make_state
 
@@ -149,3 +154,45 @@ def test_encodings_agree_across_engines():
         s_bb, s_or = GAME.apply(s_bb, a), ORACLE_GAME.apply(s_or, a)
     assert ORACLE_GAME.is_terminal(s_or)
     assert GAME.encode_state(s_bb) == ORACLE_GAME.encode_state(s_or)
+
+
+# --- plane-side symmetry (M2): Klein-4 equivariance -------------------------------
+
+
+def _seeded_states(game, seed, stride):
+    """Sample every ``stride``-th state (terminal included) of one seeded random game."""
+    rng = random.Random(seed)
+    s = game.initial_state()
+    states = [s]
+    while not game.is_terminal(s):
+        s = game.apply(s, rng.choice(list(game.legal_moves(s))))
+        states.append(s)
+    return states[::stride]
+
+
+def test_plane_transform_equivariance_on_seeded_states():
+    # plane_transform_g(encode_state(s)) == encode_state(g·s) for every group
+    # element, on both engines (state_transform handles bitboard ints and
+    # oracle frozensets alike).
+    for game, seed in ((GAME, 31), (ORACLE_GAME, 37)):
+        for s in _seeded_states(game, seed, stride=4):
+            planes = game.encode_state(s)
+            for g in GROUP_NAMES:
+                assert plane_transform(g)(planes) == game.encode_state(state_transform(g)(s)), g
+
+
+def test_plane_transforms_are_involutions():
+    # Klein-4: every element is self-inverse on the plane tensor too.
+    for s in _seeded_states(GAME, seed=41, stride=9):
+        planes = GAME.encode_state(s)
+        for g in GROUP_NAMES:
+            assert plane_transform(g)(plane_transform(g)(planes)) == planes, g
+
+
+def test_symmetry_group_identity_round_trips_exactly():
+    # symmetry_group[0] is identity: its plane slot must return an asymmetric
+    # mid-game encoding unchanged (exact tuple equality).
+    identity_plane_t, _ = GAME.symmetry_group[0]
+    s1 = GAME.apply(GAME.initial_state(), encode(4, 4, 0))
+    planes = GAME.encode_state(s1)
+    assert identity_plane_t(planes) == planes
