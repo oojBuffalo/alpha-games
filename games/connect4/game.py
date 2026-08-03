@@ -90,6 +90,46 @@ class Connect4(_Game):
             return 0.0
         return 1.0 if winner == player_id else -1.0
 
+    # --- encoding surface (M2 backfill; abstract since the §6.1 promotion) -------
+
+    def encode_state(self, state: State):
+        """Encode ``state`` as 2 mover-relative occupancy planes (own, opponent).
+
+        Nested ``rows × cols`` tuples over {0, 1} — stdlib-only; the training
+        boundary converts with ``numpy.asarray``. Mover-relative per §5.2's
+        own/opponent convention: no side-to-move plane. The standard board is
+        the tree's one non-square grid (6×7), so anything consuming this must
+        not assume ``H == W``.
+        """
+        board, to_play = state
+        return tuple(
+            tuple(
+                tuple(1 if board[r * self.cols + c] == player else 0 for c in range(self.cols))
+                for r in range(self.rows)
+            )
+            for player in (to_play, 1 - to_play)
+        )
+
+    def encode_action(self, move: Action) -> Action:
+        """Identity codec: moves already are column ids ``0..cols-1``."""
+        return move
+
+    def decode_action(self, action: Action) -> Action:
+        """Identity codec: action ids decode to themselves (column ids)."""
+        return action
+
+    @property
+    def policy_shape(self) -> tuple[int, ...]:
+        return (self.cols,)
+
+    @property
+    def input_planes(self) -> int:
+        return 2
+
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        return (self.rows, self.cols)
+
     # --- internals -------------------------------------------------------------
 
     def _drop_row(self, board: tuple[int, ...], col: int) -> int | None:
