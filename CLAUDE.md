@@ -11,7 +11,7 @@ AlphaZero replication on a **single consumer GPU (RTX 4060 Ti 16 GB)**, built as
 
 ## Scope (asserted in code, not just prose)
 
-v1 engine envelope: **2-player, zero-sum, perfect-information, deterministic.** Adapters declare capabilities (`num_players`, `is_stochastic`, `is_perfect_information`, `symmetry_group`, `value_targets`); `core/` asserts the envelope and fails loudly outside it. Core contract: `current_player`, `legal_moves`, `apply`, `terminal_utility(state, player_id)`, `encode_state`, `encode_action`/`decode_action`, `policy_shape`, `input_planes`.
+v1 engine envelope: **2-player, zero-sum, perfect-information, deterministic.** Adapters declare capabilities (`num_players`, `is_stochastic`, `is_perfect_information`, `symmetry_group`, `value_targets`); `core/` asserts the envelope and fails loudly outside it. Core contract: `current_player`, `legal_moves`, `apply`, `terminal_utility(state, player_id)`, `encode_state`, `encode_action`/`decode_action`, `policy_shape`, `input_planes`, `input_shape` (per-plane `(height, width)`; full tensor `(input_planes, *input_shape)`).
 
 Seams are documented but **not built**: N-player (value head + backup, M7) and stochastic transitions (`apply`/node types). Imperfect information is permanently out of scope for this codebase (future sibling engine, different solver family).
 

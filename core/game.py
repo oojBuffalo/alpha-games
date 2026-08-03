@@ -172,6 +172,16 @@ class Game(ABC):
         """Number of input planes (M2)."""
         raise NotImplementedError("input_planes arrives at M2 (encoding + network)")
 
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        """``(height, width)`` of every input plane (M2).
+
+        The full input tensor is ``(input_planes, *input_shape)``. Declared, not
+        derived: a flat policy head (Othello's ``(65,)``) carries no board
+        geometry to recover ``(H, W)`` from.
+        """
+        raise NotImplementedError("input_shape arrives at M2 (encoding + network)")
+
 
 def assert_v1_envelope(game: Game) -> None:
     """Assert ``game`` lies within the v1 engine envelope, or raise ``EnvelopeError``.
