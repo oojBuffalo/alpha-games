@@ -26,7 +26,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from core.game import Game
+from core.game import Action, Game, State
+from core.mcts import Evaluator
 
 # Head reduction widths — 1×1 conv channels ahead of each head's FC,
 # AlphaZero-style: two planes feed the flat policy FC, one plane each feeds
@@ -238,3 +239,92 @@ class Network(nn.Module):
         value = torch.tanh(self.value_fc(self.value_conv(trunk).flatten(1))).squeeze(-1)
         aux = None if self.aux_fc is None else self.aux_fc(self.aux_conv(trunk).flatten(1))
         return policy, value, aux
+
+
+def make_network_evaluator(net: Network, game: Game, device: str = "cpu") -> Evaluator:
+    """Bridge ``net`` into the ``MCTS.evaluate`` seam (§12 M0: "from M2, the network").
+
+    The returned callable matches the M0 ``Evaluator`` seam exactly — the same
+    seam, no new abstraction — so ``MCTS(game, evaluate=make_network_evaluator(...))``
+    is the whole wiring. Batch-1 per-leaf inference is the M2/M3 functional
+    path; batched/asynchronous inference (queueing across concurrent descents)
+    is explicitly M5 scope and does not live here.
+
+    **Value sign convention (the bug this docstring exists to prevent):** the
+    scalar ``tanh`` head is returned as-is because it is *mover-relative by
+    construction* — the §5.2 encoding is own/opponent from the side to move
+    (no side-to-move plane), and training targets ``z`` are stored from the
+    mover's perspective over that same encoding. That is precisely the seam's
+    ``value_from_movers_perspective`` contract; the player-aware backup owns
+    every sign flip from there. Any absolute-player (or opponent-relative)
+    value returned here would corrupt search silently, not crash.
+
+    **Priors are raw logits, not probabilities:** ``legal_moves`` yields flat
+    action ids and the flat policy vector is indexed by action id (the §5.1
+    flatten golden — the legal ids *are* the logit indices; nothing
+    re-encodes), so the priors dict is ``{action_id: logit}`` with an entry
+    for **every** legal id (``MCTS._priors`` defaults missing ids to logit
+    ``0.0``). Only the legal logits are gathered on-device and transferred —
+    never the dense head (sparse-everywhere; Blokus is 17,836 wide).
+    ``MCTS._priors`` owns the single legal-subset softmax; normalizing here
+    as well would softmax the policy twice and skew every prior toward
+    uniform. ``uniform_prior=True`` on the engine (ladder rung 6) discards
+    these priors while keeping the value.
+
+    **Cross-wiring guard:** states are encoded with the factory-validated
+    adapter — the pairing the net was checked against — never with the
+    callback-time ``game``, and a callback-time ``game`` whose declared
+    encoding surface disagrees with the validated one is rejected before any
+    inference (``MCTS(game_b, evaluate=make_network_evaluator(net_a, game_a))``
+    constructs fine — the evaluator is an opaque callable — so the first
+    search call is the earliest loud failure). Delegating wrappers that
+    preserve the surface (e.g. the runner's opening restriction) pass the
+    guard: legal ids come from the callback-time ``game``, encoding from the
+    validated adapter. An equal-surface *different* game is undetectable here
+    (states are opaque); that pairing remains the caller's contract.
+
+    Args:
+        net: The network to evaluate leaves with. Moved to ``device`` and
+            switched to ``eval()`` mode in place; forwards run under
+            ``torch.inference_mode()``.
+        game: The adapter ``net`` was built for — validated against
+            ``net.config`` so a mismatched pairing fails loudly here instead
+            of silently indexing the wrong logits.
+        device: Torch device for inference (default ``"cpu"``).
+
+    Returns:
+        An ``Evaluator``: ``(game, state) -> (value, {action_id: raw_logit})``
+        with the value from the mover's perspective.
+
+    Raises:
+        ValueError: If ``net.config`` disagrees with ``game``'s declared
+            ``input_planes`` / ``input_shape`` / ``policy_shape``.
+    """
+    cfg = net.config
+    adapter = game
+    surface = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
+    if (cfg.input_planes, cfg.input_shape, cfg.policy_shape) != surface:
+        raise ValueError(
+            f"net config ({cfg.input_planes}, {cfg.input_shape}, {cfg.policy_shape}) does "
+            f"not match {type(game).__name__}'s declared encoding surface {surface}"
+        )
+    dev = torch.device(device)
+    net.to(dev).eval()
+
+    def evaluate(game: Game, state: State) -> tuple[float, dict[Action, float]]:
+        if game is not adapter:
+            declared = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
+            if declared != surface:
+                raise ValueError(
+                    f"evaluator cross-wired: built for {type(adapter).__name__} with "
+                    f"encoding surface {surface}, called with {type(game).__name__} "
+                    f"declaring {declared}"
+                )
+        legal = list(game.legal_moves(state))
+        x = torch.as_tensor(adapter.encode_state(state), dtype=torch.float32, device=dev)
+        with torch.inference_mode():
+            policy, value, _ = net(x.unsqueeze(0))
+        idx = torch.as_tensor(legal, dtype=torch.long, device=dev)
+        return value.item(), dict(zip(legal, policy[0, idx].tolist(), strict=True))
+
+    return evaluate
