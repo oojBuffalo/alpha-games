@@ -264,10 +264,24 @@ def make_network_evaluator(net: Network, game: Game, device: str = "cpu") -> Eva
     flatten golden — the legal ids *are* the logit indices; nothing
     re-encodes), so the priors dict is ``{action_id: logit}`` with an entry
     for **every** legal id (``MCTS._priors`` defaults missing ids to logit
-    ``0.0``). ``MCTS._priors`` owns the single legal-subset softmax;
-    normalizing here as well would softmax the policy twice and skew every
-    prior toward uniform. ``uniform_prior=True`` on the engine (ladder rung 6)
-    discards these priors while keeping the value.
+    ``0.0``). Only the legal logits are gathered on-device and transferred —
+    never the dense head (sparse-everywhere; Blokus is 17,836 wide).
+    ``MCTS._priors`` owns the single legal-subset softmax; normalizing here
+    as well would softmax the policy twice and skew every prior toward
+    uniform. ``uniform_prior=True`` on the engine (ladder rung 6) discards
+    these priors while keeping the value.
+
+    **Cross-wiring guard:** states are encoded with the factory-validated
+    adapter — the pairing the net was checked against — never with the
+    callback-time ``game``, and a callback-time ``game`` whose declared
+    encoding surface disagrees with the validated one is rejected before any
+    inference (``MCTS(game_b, evaluate=make_network_evaluator(net_a, game_a))``
+    constructs fine — the evaluator is an opaque callable — so the first
+    search call is the earliest loud failure). Delegating wrappers that
+    preserve the surface (e.g. the runner's opening restriction) pass the
+    guard: legal ids come from the callback-time ``game``, encoding from the
+    validated adapter. An equal-surface *different* game is undetectable here
+    (states are opaque); that pairing remains the caller's contract.
 
     Args:
         net: The network to evaluate leaves with. Moved to ``device`` and
@@ -287,20 +301,30 @@ def make_network_evaluator(net: Network, game: Game, device: str = "cpu") -> Eva
             ``input_planes`` / ``input_shape`` / ``policy_shape``.
     """
     cfg = net.config
-    declared = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
-    if (cfg.input_planes, cfg.input_shape, cfg.policy_shape) != declared:
+    adapter = game
+    surface = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
+    if (cfg.input_planes, cfg.input_shape, cfg.policy_shape) != surface:
         raise ValueError(
             f"net config ({cfg.input_planes}, {cfg.input_shape}, {cfg.policy_shape}) does "
-            f"not match {type(game).__name__}'s declared encoding surface {declared}"
+            f"not match {type(game).__name__}'s declared encoding surface {surface}"
         )
     dev = torch.device(device)
     net.to(dev).eval()
 
     def evaluate(game: Game, state: State) -> tuple[float, dict[Action, float]]:
-        x = torch.as_tensor(game.encode_state(state), dtype=torch.float32, device=dev)
+        if game is not adapter:
+            declared = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
+            if declared != surface:
+                raise ValueError(
+                    f"evaluator cross-wired: built for {type(adapter).__name__} with "
+                    f"encoding surface {surface}, called with {type(game).__name__} "
+                    f"declaring {declared}"
+                )
+        legal = list(game.legal_moves(state))
+        x = torch.as_tensor(adapter.encode_state(state), dtype=torch.float32, device=dev)
         with torch.inference_mode():
             policy, value, _ = net(x.unsqueeze(0))
-        flat = policy[0].tolist()
-        return value.item(), {a: flat[a] for a in game.legal_moves(state)}
+        idx = torch.as_tensor(legal, dtype=torch.long, device=dev)
+        return value.item(), dict(zip(legal, policy[0, idx].tolist(), strict=True))
 
     return evaluate

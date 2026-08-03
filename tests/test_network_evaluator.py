@@ -22,6 +22,7 @@ import torch
 
 from core import MCTS
 from core.network import Network, NetworkConfig, make_network_evaluator
+from core.runner import _OpeningRestricted
 from games.blokus_duo import BlokusDuo
 from games.othello import Othello
 
@@ -153,3 +154,84 @@ def test_bridge_rejects_mismatched_net_game_pairing():
         make_network_evaluator(OTHELLO_NET, BLOKUS)
     with pytest.raises(ValueError):
         make_network_evaluator(BLOKUS_NET, OTHELLO)
+
+
+def test_evaluator_rejects_cross_wired_callback_game():
+    # The factory validates its own (net, game) pairing, but the evaluator is
+    # an opaque callable — MCTS(game_b, evaluate=bridge(net_a, game_a))
+    # constructs without complaint. The callback-time guard makes the first
+    # search call the loud failure, not a shape blowup (or, for equal-shaped
+    # adapters, silent semantic mixing) somewhere inside the net.
+    ev = make_network_evaluator(OTHELLO_NET, OTHELLO)
+    with pytest.raises(ValueError, match="cross-wired"):
+        ev(BLOKUS, BLOKUS.initial_state())
+    with pytest.raises(ValueError, match="cross-wired"):
+        MCTS(BLOKUS, evaluate=ev).run(1, root_state=BLOKUS.initial_state())
+
+
+class _SurfacePreservingWrapper:
+    """Delegating stand-in for the runner's opening-restriction wrapper.
+
+    Same declared encoding surface and legal-move filtering as the wrapped
+    adapter, but a different identity — and a booby-trapped ``encode_state``
+    proving the bridge encodes with the factory-validated adapter, never the
+    callback-time game.
+    """
+
+    def __init__(self, inner, keep):
+        self._inner = inner
+        self._keep = keep
+
+    @property
+    def input_planes(self):
+        return self._inner.input_planes
+
+    @property
+    def input_shape(self):
+        return self._inner.input_shape
+
+    @property
+    def policy_shape(self):
+        return self._inner.policy_shape
+
+    def legal_moves(self, state):
+        return [a for a in self._inner.legal_moves(state) if self._keep(a)]
+
+    def encode_state(self, state):
+        raise AssertionError("bridge must encode with the validated adapter")
+
+
+def test_evaluator_accepts_surface_preserving_wrapper():
+    # Runner-style delegating wrappers (same surface, different identity) pass
+    # the cross-wiring guard; legal ids come from the wrapper, encoding from
+    # the validated adapter (the pairing the net was checked against).
+    s0 = OTHELLO.initial_state()
+    full = list(OTHELLO.legal_moves(s0))
+    restricted = full[: len(full) // 2]
+    wrapper = _SurfacePreservingWrapper(OTHELLO, keep=set(restricted).__contains__)
+
+    ev = make_network_evaluator(OTHELLO_NET, OTHELLO)
+    value, priors = ev(wrapper, s0)
+    assert set(priors) == set(restricted)
+    _, unrestricted = ev(OTHELLO, s0)
+    for a in restricted:
+        assert priors[a] == pytest.approx(unrestricted[a], rel=1e-9)
+    assert -1.0 <= value <= 1.0
+
+
+def test_evaluator_accepts_the_runner_opening_restriction_wrapper():
+    # The named integration path (§9 pairing), pinned against the runner's
+    # *real* wrapper rather than a test stand-in: a network-backed agent
+    # handed game 2's opening-restricted view must search it, not crash on
+    # the cross-wiring guard.
+    s0 = OTHELLO.initial_state()
+    keep = set(list(OTHELLO.legal_moves(s0))[:2])
+    wrapped = _OpeningRestricted(OTHELLO, keep.__contains__)
+
+    ev = make_network_evaluator(OTHELLO_NET, OTHELLO)
+    _, priors = ev(wrapped, s0)
+    assert set(priors) == keep
+
+    m = MCTS(wrapped, evaluate=ev)
+    m.run(8, root_state=s0)
+    assert m.best_action() in keep

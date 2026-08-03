@@ -164,6 +164,10 @@ class _OpeningRestricted(Game):
     def input_planes(self):
         return self._inner.input_planes
 
+    @property
+    def input_shape(self):
+        return self._inner.input_shape
+
 
 def play_pairs(
     game: Game,
