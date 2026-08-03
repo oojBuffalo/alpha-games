@@ -66,6 +66,24 @@ def test_pad_sparse_targets_rejects_bad_input():
         pad_sparse_targets([[(3, 2)], []])  # empty sample breaks the pass invariant
     with pytest.raises(ValueError):
         pad_sparse_targets([[(-1, 2)]])  # collides with the pad sentinel
+    with pytest.raises(ValueError):
+        pad_sparse_targets([[(-2, 2)]])  # any negative id, not just the sentinel
+
+
+def test_pad_sparse_targets_rejects_malformed_rows():
+    # The collate boundary owns structural validation (the loss body is
+    # synchronization-free): duplicates, bad counts, and zero totals must
+    # all die here, before any tensor reaches the hot path.
+    with pytest.raises(ValueError, match="duplicate"):
+        pad_sparse_targets([[(1, 1), (1, 2)]])  # would enter the softmax twice
+    with pytest.raises(ValueError, match="finite"):
+        pad_sparse_targets([[(3, float("inf"))]])
+    with pytest.raises(ValueError, match="finite"):
+        pad_sparse_targets([[(3, float("nan"))]])
+    with pytest.raises(ValueError, match="finite"):
+        pad_sparse_targets([[(3, 2), (5, -1)]])  # negative visit count
+    with pytest.raises(ValueError, match="sum to zero"):
+        pad_sparse_targets([[(3, 0), (5, 0)]])  # D10: π_train ∝ N needs ΣN > 0
 
 
 # --- sparse_policy_loss goldens ------------------------------------------------------
@@ -139,8 +157,8 @@ def test_illegal_logit_perturbation_is_bit_identical():
 
 
 def test_pad_slot_gradient_exactly_zero():
-    # Row 1 pads out to row 0's width; the pad gather clamps to action id 0,
-    # which is illegal in every row — its gradient must still be exactly zero.
+    # Row 1 pads out to row 0's width; pad slots gather action id 0, which is
+    # illegal in every row — its gradient must still be exactly zero.
     logits = torch.randn(2, NUM_ACTIONS, generator=torch.Generator().manual_seed(11))
     logits.requires_grad_()
     legal_ids, visit_counts = pad_sparse_targets([[(3, 1), (5, 2), (7, 1)], [(9, 4)]])
@@ -172,19 +190,36 @@ def test_gradients_finite_on_extreme_logits():
     assert torch.isfinite(logits.grad).all()
 
 
-def test_sparse_policy_loss_rejects_bad_rows():
+def test_sparse_policy_loss_rejects_bad_metadata():
+    # The loss checks tensor metadata only (row validity is owned by
+    # pad_sparse_targets — no tensor-value test may run on the hot path);
+    # both degenerate shapes would otherwise reduce to nan, not raise.
     logits, _ = random_batch(14, n=2)
-    all_pad = torch.tensor([[3, 5], [PAD_ID, PAD_ID]])
-    counts = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
-    with pytest.raises(ValueError):
-        sparse_policy_loss(logits, all_pad, counts)  # row with no legal slot
     ids = torch.tensor([[3, 5], [4, 6]])
     with pytest.raises(ValueError):
-        sparse_policy_loss(logits, ids, torch.tensor([[1.0, 1.0], [0.0, 0.0]]))  # ΣN = 0
-    with pytest.raises(ValueError):
-        sparse_policy_loss(logits, ids, torch.tensor([[1.0, 1.0], [2.0, -1.0]]))
-    with pytest.raises(ValueError):
         sparse_policy_loss(logits, ids, torch.tensor([[1.0], [1.0]]))  # shape mismatch
+    with pytest.raises(ValueError):
+        sparse_policy_loss(
+            torch.zeros(0, NUM_ACTIONS),
+            torch.zeros(0, 2, dtype=torch.int64),
+            torch.zeros(0, 2),
+        )  # empty batch
+    with pytest.raises(ValueError):
+        sparse_policy_loss(
+            logits,
+            torch.zeros(2, 0, dtype=torch.int64),
+            torch.zeros(2, 0),
+        )  # zero-width targets
+
+
+def test_stray_negative_id_fails_loudly_not_silently():
+    # Only PAD_ID marks padding. A hand-built -2 must not be silently
+    # discarded as a pad slot: it reaches the gather out of range and raises.
+    logits, _ = random_batch(15, n=1)
+    ids = torch.tensor([[3, -2]])
+    counts = torch.tensor([[1.0, 1.0]])
+    with pytest.raises((RuntimeError, IndexError)):
+        sparse_policy_loss(logits, ids, counts)
 
 
 # --- composite_loss ------------------------------------------------------------------
@@ -248,6 +283,8 @@ def test_composite_rejects_mismatches():
     value, z, aux_pred, aux_target = make_heads(24)
     with pytest.raises(ValueError):
         composite_loss(policy, value, z[:-1])  # value/z shape disagreement
+    with pytest.raises(ValueError):
+        composite_loss(policy, value[:0], z[:0])  # empty batch: mean() would be nan
     with pytest.raises(ValueError):
         composite_loss(policy, value, z, aux_pred, aux_target, ())  # tensors, empty spec
     with pytest.raises(ValueError):

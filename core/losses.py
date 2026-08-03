@@ -18,17 +18,27 @@ zero counts. Pad slots get an additive ``-inf`` mask before the softmax, and
 their log-probabilities are zeroed *after* it — the output is masked, never a
 ``0 · (-inf)`` product or a difference of two ``-inf``s — so a pad slot
 contributes exactly zero to the loss and exactly zero gradient.
+
+Validation ownership: ``pad_sparse_targets`` is the structural validator —
+every malformed-sparse-row failure mode (duplicate ids, negative ids,
+non-finite or negative counts, zero-total rows, empty rows/batches) is
+rejected there, in Python on CPU at collate time. The loss bodies check only
+tensor *metadata* (shapes) and perform no tensor-value tests, so the AMP hot
+path never forces a device-to-host synchronization per training step.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
-# Sentinel action id marking a pad slot in a padded legal-id tensor. Real
-# action ids are nonnegative, so the pad mask is simply ``legal_ids >= 0``.
+# Sentinel action id marking a pad slot in a padded legal-id tensor. The pad
+# mask is exactly ``legal_ids == PAD_ID``; any other negative id is not
+# treated as padding and fails the loss's gather loudly (out-of-range index)
+# rather than being silently discarded.
 PAD_ID = -1
 
 
@@ -36,6 +46,10 @@ def pad_sparse_targets(
     batch: Sequence[Sequence[tuple[int, int]]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad a batch of sparse D12 policy targets into loss-ready tensors.
+
+    This is the structural validation boundary (see the module docstring):
+    every malformed-row failure mode is rejected here, in Python on CPU at
+    collate time, so ``sparse_policy_loss`` can stay synchronization-free.
 
     Args:
         batch: Per-sample sequences of ``(action_id, visit_count)`` pairs —
@@ -49,18 +63,32 @@ def pad_sparse_targets(
         where ``L`` is the widest legal set in the batch.
 
     Raises:
-        ValueError: If the batch is empty, a sample has no pairs (the pass
+        ValueError: If the batch is empty; a sample has no pairs (the pass
             invariant guarantees >= 1 legal action at every stored
-            position), or an action id is negative (indistinguishable from
-            the pad sentinel).
+            position); an action id is negative (indistinguishable from the
+            pad sentinel) or duplicated within its sample (a duplicate would
+            enter the softmax as two legal slots and skew the D10 target);
+            or a visit count is non-finite, negative, or the sample's counts
+            sum to zero (D10: ``π_train ∝ N`` needs a positive total).
     """
     rows = [tuple(sample) for sample in batch]
     if not rows:
         raise ValueError("empty batch of policy targets")
-    if any(not row for row in rows):
-        raise ValueError("a sample has no (action_id, visit_count) pairs (pass invariant)")
-    if any(action < 0 for row in rows for action, _ in row):
-        raise ValueError(f"negative action id collides with the pad sentinel {PAD_ID}")
+    for i, row in enumerate(rows):
+        if not row:
+            raise ValueError(f"sample {i} has no (action_id, visit_count) pairs (pass invariant)")
+        ids = [action for action, _ in row]
+        if any(action < 0 for action in ids):
+            raise ValueError(
+                f"sample {i}: negative action id collides with the pad sentinel {PAD_ID}"
+            )
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"sample {i}: duplicate action id in a sparse policy row")
+        counts = [count for _, count in row]
+        if any(not math.isfinite(count) or count < 0 for count in counts):
+            raise ValueError(f"sample {i}: visit counts must be finite and nonnegative")
+        if sum(counts) <= 0:
+            raise ValueError(f"sample {i}: visit counts sum to zero (D10: π_train ∝ N)")
     width = max(len(row) for row in rows)
     legal_ids = torch.full((len(rows), width), PAD_ID, dtype=torch.int64)
     visit_counts = torch.zeros((len(rows), width), dtype=torch.float32)
@@ -85,20 +113,30 @@ def sparse_policy_loss(
     (additive ``-inf``) and out of the output (log-probs zeroed), so they
     contribute exactly zero — no ``0 · (-inf) = nan`` enters the graph.
 
+    Structural row validity — unique nonnegative ids, finite nonnegative
+    counts, >= 1 real slot and a positive count total per row — is the
+    caller's contract, owned by ``pad_sparse_targets`` at collate time. This
+    body checks tensor metadata only and runs no tensor-value test, so it
+    never forces a device-to-host synchronization on the AMP hot path. A
+    stray negative id other than ``PAD_ID`` is not treated as padding: it
+    reaches the gather out of range and fails loudly.
+
     Args:
         logits: ``(N, num_actions)`` raw policy-head logits, unmasked.
         legal_ids: ``(N, L)`` int64 legal action ids, ragged rows padded
-            with ``PAD_ID``; e.g. from ``pad_sparse_targets``.
+            with ``PAD_ID`` — from ``pad_sparse_targets``, which validated
+            them.
         visit_counts: ``(N, L)`` root visit counts aligned with
-            ``legal_ids``; values in pad slots are ignored. Real slots must
-            be nonnegative with a positive row sum (D10: ``π_train ∝ N``).
+            ``legal_ids``; values in pad slots are ignored.
 
     Returns:
         Scalar batch-mean cross-entropy ``-Σ_a π_train(a) · log p(a)``.
 
     Raises:
-        ValueError: On shape disagreement, a row with no legal slot, a
-            negative count, or a row whose counts sum to zero.
+        ValueError: On shape disagreement, an empty batch, or zero-width
+            targets (either would otherwise reduce to ``nan``).
+        RuntimeError: From the gather, if an id is out of range for the
+            head — including any negative id that is not ``PAD_ID``.
     """
     if logits.dim() != 2:
         raise ValueError(f"logits must be (N, num_actions), got {tuple(logits.shape)}")
@@ -111,23 +149,21 @@ def sparse_policy_loss(
         raise ValueError(
             f"batch mismatch: {logits.shape[0]} logit rows, {legal_ids.shape[0]} target rows"
         )
-    mask = legal_ids >= 0
-    if not mask.any(dim=1).all():
-        raise ValueError("a sample has no legal slot (pass invariant: >= 1 legal action)")
-    counts = visit_counts.to(logits.dtype).masked_fill(~mask, 0.0)
-    if (counts < 0).any():
-        raise ValueError("negative visit count in a legal slot")
+    if logits.shape[0] == 0:
+        raise ValueError("empty batch: the batch-mean policy loss is undefined")
+    if legal_ids.shape[1] == 0:
+        raise ValueError("zero-width targets: every sample needs >= 1 legal slot")
+    pad = legal_ids.eq(PAD_ID)
+    counts = visit_counts.to(logits.dtype).masked_fill(pad, 0.0)
     totals = counts.sum(dim=1, keepdim=True)
-    if not (totals > 0).all():
-        raise ValueError("a sample's visit counts sum to zero (D10: π_train ∝ N)")
-    gathered = logits.gather(1, legal_ids.clamp(min=0))
+    gathered = logits.gather(1, legal_ids.masked_fill(pad, 0))
     # Additive -inf mask on pad slots: the softmax renormalizes over the
     # legal set only. masked_fill's backward is an exact zero at filled
-    # positions, so the clamped-to-0 pad gathers leak no gradient.
-    log_p = torch.log_softmax(gathered.masked_fill(~mask, float("-inf")), dim=1)
+    # positions, so the pad slots' id-0 gathers leak no gradient.
+    log_p = torch.log_softmax(gathered.masked_fill(pad, float("-inf")), dim=1)
     # Mask the *output*: pad log-probs are -inf here; zeroing them (rather
     # than multiplying by a zero target) keeps 0 · (-inf) = nan out.
-    log_p = log_p.masked_fill(~mask, 0.0)
+    log_p = log_p.masked_fill(pad, 0.0)
     per_sample = -(counts / totals * log_p).sum(dim=1)
     return per_sample.mean()
 
@@ -187,12 +223,15 @@ def composite_loss(
         ``LossBreakdown`` carrying the total and each component.
 
     Raises:
-        ValueError: If ``value`` and ``z`` shapes disagree, aux tensors are
-            present under an empty spec (or absent under a nonempty one), or
-            an aux tensor's shape disagrees with ``(N, len(aux_weights))``.
+        ValueError: If ``value`` and ``z`` shapes disagree, the batch is
+            empty (the batch-mean would be ``nan``), aux tensors are present
+            under an empty spec (or absent under a nonempty one), or an aux
+            tensor's shape disagrees with ``(N, len(aux_weights))``.
     """
     if value.shape != z.shape:
         raise ValueError(f"value shape {tuple(value.shape)} != z shape {tuple(z.shape)}")
+    if value.numel() == 0:
+        raise ValueError("empty batch: the batch-mean value loss is undefined")
     value_mse = torch.mean((z - value) ** 2)
     if len(aux_weights) == 0:
         if aux_pred is not None or aux_target is not None:
