@@ -43,6 +43,13 @@ class PassGame(_Game):
     def __init__(self, scenario: Scenario):
         self.s = scenario
         self._next = {(st, a): nxt for st, moves in scenario.edges.items() for (a, nxt) in moves}
+        # Encoding-surface bounds, derived from the scripted tree: state ids are
+        # small contiguous ints, action ids small ints.
+        states = {scenario.start} | set(scenario.to_play) | set(scenario.terminal)
+        states.update(nxt for moves in scenario.edges.values() for (_, nxt) in moves)
+        self._num_states = max(states) + 1
+        actions = {a for moves in scenario.edges.values() for (a, _) in moves}
+        self._num_actions = max(actions) + 1
 
     @property
     def num_players(self) -> int:
@@ -81,6 +88,34 @@ class PassGame(_Game):
 
     def terminal_utility(self, state: State, player_id: PlayerId) -> float:
         return self.s.terminal[state][player_id]
+
+    # --- encoding surface (M2 backfill; abstract since the §6.1 promotion) -------
+    # The fixture exists to pin the backup sign, not to train; the minimal
+    # coherent encoding is a one-hot of the node id on a single plane.
+
+    def encode_state(self, state: State):
+        """Encode a node id as a one-hot on a single ``1 × num_states`` plane."""
+        return ((tuple(1 if i == state else 0 for i in range(self._num_states)),),)
+
+    def encode_action(self, move: Action) -> Action:
+        """Identity codec: moves already are scripted action ids."""
+        return move
+
+    def decode_action(self, action: Action) -> Action:
+        """Identity codec: action ids decode to themselves."""
+        return action
+
+    @property
+    def policy_shape(self) -> tuple[int, ...]:
+        return (self._num_actions,)
+
+    @property
+    def input_planes(self) -> int:
+        return 1
+
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        return (1, self._num_states)
 
 
 def consecutive_win_game() -> PassGame:

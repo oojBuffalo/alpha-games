@@ -55,6 +55,31 @@ class _StubGame(_Game):
     def terminal_utility(self, state: State, player_id: PlayerId) -> float:
         return 0.0
 
+    # Encoding surface (abstract since M2): these stubs violate the *envelope*,
+    # not the encoding surface — trivial single-cell implementations so they
+    # still instantiate far enough to hit ``assert_v1_envelope``.
+
+    def encode_state(self, state: State):
+        return (((0,),),)
+
+    def encode_action(self, move: Action) -> Action:
+        return move
+
+    def decode_action(self, action: Action) -> Action:
+        return action
+
+    @property
+    def policy_shape(self) -> tuple[int, ...]:
+        return (1,)
+
+    @property
+    def input_planes(self) -> int:
+        return 1
+
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        return (1, 1)
+
 
 class ThreePlayerGame(_StubGame):
     """Breaches the envelope: declares three players (N-player is the M7 seam)."""

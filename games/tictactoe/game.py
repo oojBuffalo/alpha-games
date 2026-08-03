@@ -87,6 +87,41 @@ class TicTacToe(_Game):
                 return v
         return None
 
+    # --- encoding surface (M2 backfill; abstract since the §6.1 promotion) -------
+
+    def encode_state(self, state: State):
+        """Encode ``state`` as 2 mover-relative 3×3 occupancy planes (own, opponent).
+
+        Nested 3×3 tuples over {0, 1} — stdlib-only; the training boundary
+        converts with ``numpy.asarray``. Mover-relative per §5.2's own/opponent
+        convention: no side-to-move plane.
+        """
+        board, to_play = state
+        return tuple(
+            tuple(tuple(1 if board[r * 3 + c] == player else 0 for c in range(3)) for r in range(3))
+            for player in (to_play, 1 - to_play)
+        )
+
+    def encode_action(self, move: Action) -> Action:
+        """Identity codec: moves already are flat cell ids ``0..8``."""
+        return move
+
+    def decode_action(self, action: Action) -> Action:
+        """Identity codec: action ids decode to themselves (flat cell ids)."""
+        return action
+
+    @property
+    def policy_shape(self) -> tuple[int, ...]:
+        return (9,)
+
+    @property
+    def input_planes(self) -> int:
+        return 2
+
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        return (3, 3)
+
     # --- test convenience ------------------------------------------------------
 
     def from_grid(self, rows: Sequence[str], to_play: PlayerId) -> State:
