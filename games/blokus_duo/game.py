@@ -19,10 +19,40 @@ from typing import Any
 from core.game import Action, Game, PlayerId, State, SymmetryElement, ValueTargetSpec
 from games.blokus_duo.actions import BOARD_SIZE, NUM_ORIENTATIONS, action_cells, encode_cells
 from games.blokus_duo.bitboard import BitboardEngine
+from games.blokus_duo.pieces import BASE_PIECES
 from games.blokus_duo.symmetry import GROUP_NAMES, full_permutation, plane_transform_placeholder
 from games.blokus_duo.targets import value_target_spec, value_targets
 
 _TO_PLAY, _TERMINAL = 6, 7
+_NUM_PIECES = len(BASE_PIECES)  # 21
+
+# Constant broadcast planes for the inventory/flag channels (D3) — immutable,
+# so the shared tuples are safely reused across every encoded state.
+_ZEROS = tuple((0,) * BOARD_SIZE for _ in range(BOARD_SIZE))
+_ONES = tuple((1,) * BOARD_SIZE for _ in range(BOARD_SIZE))
+
+
+def _occupancy_plane(occ):
+    """Project one occupancy onto a 14×14 plane of ``{0, 1}``.
+
+    Handles both engine representations — 196-bit ints (bitboard, bit
+    ``r*14 + c``) and frozensets of ``(r, c)`` cells (oracle) — the same dual
+    dispatch as ``symmetry.state_transform``.
+
+    Args:
+        occ: One player's occupancy from the shared engine state tuple.
+
+    Returns:
+        Nested 14×14 tuples over ``{0, 1}``.
+    """
+    if isinstance(occ, int):
+        return tuple(
+            tuple(occ >> (r * BOARD_SIZE + c) & 1 for c in range(BOARD_SIZE))
+            for r in range(BOARD_SIZE)
+        )
+    return tuple(
+        tuple(1 if (r, c) in occ else 0 for c in range(BOARD_SIZE)) for r in range(BOARD_SIZE)
+    )
 
 
 class BlokusDuo(Game):
@@ -106,7 +136,33 @@ class BlokusDuo(Game):
         z, _ = value_targets(scores[player_id], scores[1 - player_id])
         return float(z)
 
-    # --- encoding surface (action side owned by M1; planes arrive at M2) ------------
+    # --- encoding surface (action side owned by M1; plane side by M2) ---------------
+
+    def encode_state(self, state: State):
+        """Encode ``state`` as the 46 D3 planes (§5.2), mover-relative.
+
+        Plane order (pinned by D3/§5.2): own occupancy, opponent occupancy,
+        21 own-inventory planes, 21 opponent-inventory planes (piece order
+        fixed by ``pieces.BASE_PIECES``, §5.1), own monomino-last flag,
+        opponent monomino-last flag. Inventory and flag planes are constant
+        broadcast planes (all 1s iff the piece is in inventory / the flag is
+        set). "Own" is the side to move — no side-to-move plane (§5.2).
+
+        Args:
+            state: Engine state tuple; occupancies as 196-bit ints (bitboard)
+                or frozensets of cells (oracle) — both handled.
+
+        Returns:
+            46 nested 14×14 tuples over ``{0, 1}`` — stdlib-pure; the
+            training boundary converts with ``numpy.asarray``.
+        """
+        mover = state[_TO_PLAY]
+        planes = [_occupancy_plane(state[p]) for p in (mover, 1 - mover)]
+        for p in (mover, 1 - mover):
+            inv = state[2 + p]
+            planes.extend(_ONES if piece in inv else _ZEROS for piece in range(_NUM_PIECES))
+        planes.extend(_ONES if state[4 + p] else _ZEROS for p in (mover, 1 - mover))
+        return tuple(planes)
 
     def encode_action(self, move: Any) -> Action:
         """Encode absolute placement cells as a flat action id."""
@@ -119,3 +175,12 @@ class BlokusDuo(Game):
     @property
     def policy_shape(self) -> tuple[int, ...]:
         return (BOARD_SIZE, BOARD_SIZE, NUM_ORIENTATIONS)
+
+    @property
+    def input_planes(self) -> int:
+        # D3: 2 occupancy + 21 own inventory + 21 opponent inventory + 2 flags.
+        return 46
+
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        return (BOARD_SIZE, BOARD_SIZE)

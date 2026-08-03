@@ -154,6 +154,12 @@ class Othello(_Game):
     def input_planes(self) -> int:
         return 2
 
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        # M2 contract-addition backfill (§6.1): the M1.5-carried encoding
+        # predates the property; the flat (65,) head can't supply (H, W).
+        return (BOARD_SIZE, BOARD_SIZE)
+
     # --- test convenience ------------------------------------------------------
 
     def from_grid(self, rows: Sequence[str], to_play: PlayerId) -> State:
