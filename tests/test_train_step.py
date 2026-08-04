@@ -19,6 +19,7 @@ import random
 import pytest
 import torch
 
+from core.game import EnvelopeError
 from core.losses import PAD_ID, pad_sparse_targets
 from core.network import Network, NetworkConfig
 from core.train import (
@@ -150,6 +151,18 @@ def test_collate_rejects_planes_off_the_declared_shape():
     mixed = [(o[0], pi, z, a) for o, (_, pi, z, a) in zip(othello, blokus, strict=True)]
     with pytest.raises(ValueError):
         collate(BLOKUS, mixed)
+
+
+def test_collate_asserts_the_v1_envelope():
+    # collate is a core boundary (§2: scope asserted in code, not just
+    # prose) — a mis-declared adapter must fail the envelope assertion, not
+    # feed a batch into training.
+    from tests.fixtures.bad_adapters import ImperfectInfoGame, StochasticGame, ThreePlayerGame
+
+    sample = [([[0.0]], [(0, 1)], 0.0)]
+    for bad in (ThreePlayerGame(), StochasticGame(), ImperfectInfoGame()):
+        with pytest.raises(EnvelopeError):
+            collate(bad, sample)
 
 
 # --- D5 constants and optimizer ------------------------------------------------------

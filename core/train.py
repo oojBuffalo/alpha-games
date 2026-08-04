@@ -31,8 +31,17 @@ from typing import Any
 import numpy as np
 import torch
 
-from core.game import Game
+from core.game import Game, assert_v1_envelope
 from core.losses import LossBreakdown, composite_loss, pad_sparse_targets, sparse_policy_loss
+
+# torch.amp.GradScaler is the 2.3+ AMP surface (2.2's torch.amp exposes
+# autocast only) — this matches the pyproject lower bound; fail at import
+# with a clear message rather than an AttributeError mid-train-step on an
+# out-of-date install.
+if not hasattr(torch.amp, "GradScaler"):
+    raise ImportError(
+        f"core.train requires torch >= 2.3 (torch.amp.GradScaler); found {torch.__version__}"
+    )
 
 # D5 default batch size (§7: "Batch 256 (benchmark 128/256/512)") — an explicit
 # constant the M3 loop consumes, not an implicit property of whatever batch a
@@ -118,12 +127,16 @@ def collate(game: Game, samples: Sequence[Sequence[Any]]) -> Batch:
         aux heads.
 
     Raises:
+        EnvelopeError: If ``game`` breaches the v1 engine envelope (§2 —
+            "asserted in code, not just prose"): collate is a core boundary
+            and asserts it exactly as the search engine does.
         ValueError: If the batch is empty, a sample's arity disagrees with
             the spec (an aux slot on a no-aux game, or a missing or mis-sized
             one on an aux game), the planes cannot be stacked, or the stacked
             shape disagrees with the game's declared
             ``(input_planes, *input_shape)``.
     """
+    assert_v1_envelope(game)
     spec = game.value_targets
     num_aux = len(spec.aux_names)
     rows = list(samples)
