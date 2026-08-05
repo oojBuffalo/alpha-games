@@ -4,10 +4,12 @@ The benchmark proper is a manual GPU task — the acceptance artifact
 ``docs/bench/m2-train-step.md`` is produced on the 4060 Ti, and CI (CPU-only)
 never runs it. What is testable here: the loud-failure contract (no silent
 CPU benchmark — nonzero exit, error on stderr, no report on stdout), the
-seeded synthetic batch generator feeding the real collate boundary
-(Blokus-shaped planes, in-bounds sparse π with ΣN = 512, D1-consistent
-z/aux, seed determinism), and the mechanical batch-256 verdict rule the
-committed artifact's one-line verdict follows.
+canonical-artifact gates (``--out`` demands the exact 128/256/512 sweep and
+the 4060 Ti 16 GB; exploratory reports label themselves), the seeded
+synthetic batch generator feeding the real collate boundary (Blokus-shaped
+planes, in-bounds sparse π with ΣN = 512, D1-consistent z/aux, seed
+determinism), and the observational batch-256 summary line — measurements
+only, no pass/fail verdict (D5 is pinned; re-pins are doc-first).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -90,7 +93,7 @@ def test_synthetic_batch_is_blokus_shaped_and_seeded():
 
 
 def result(batch_size, positions_per_s, peak_alloc_gib):
-    """A fabricated BenchResult for verdict-rule tests (timing fields inert)."""
+    """A fabricated BenchResult for summary/report tests (timing fields inert)."""
     return BENCH.BenchResult(
         batch_size=batch_size,
         mean_ms=1.0,
@@ -103,25 +106,25 @@ def result(batch_size, positions_per_s, peak_alloc_gib):
     )
 
 
-def test_verdict_rule():
-    """The mechanical verdict: confirmed iff 256 fits (≤80%) and keeps ≥90% throughput."""
+def test_summary_is_observational():
+    """The summary restates measurements — fractions, no pass/fail verdict words."""
     total = 16 * 2**30
-    confirmed = BENCH.d5_verdict(
+    summary = BENCH.d5_summary(
         [result(128, 5000, 2.0), result(256, 6000, 4.0), result(512, 6200, 8.0)], total
     )
-    assert "confirmed" in confirmed and "NOT" not in confirmed
-    too_slow = BENCH.d5_verdict(
-        [result(128, 5000, 2.0), result(256, 5000, 4.0), result(512, 9000, 8.0)], total
-    )
-    assert "NOT confirmed" in too_slow
-    too_big = BENCH.d5_verdict([result(256, 6000, 14.0), result(128, 5000, 2.0)], total)
-    assert "NOT confirmed" in too_big
-    assert "No D5 verdict" in BENCH.d5_verdict([result(128, 5000, 2.0)], total)
+    assert "25%" in summary  # 4 of 16 GiB
+    assert "97%" in summary  # 6000 of 6200 positions/s
+    assert "batch 512" in summary  # the best measured size is named
+    # No mechanical acceptance verdict: the pin is D5's, re-pins are doc-first.
+    assert "confirmed" not in summary
+    assert "doc-first" in summary
+    no_256 = BENCH.d5_summary([result(128, 5000, 2.0)], total)
+    assert "not among the measured sizes" in no_256
 
 
-def test_report_contains_table_and_verdict():
-    """The rendered artifact carries the header facts, all rows, and the verdict line."""
-    meta = BENCH.RunMeta(
+def make_meta(**overrides):
+    """A plausible RunMeta for report tests, with keyword overrides."""
+    fields = dict(
         gpu_name="NVIDIA GeForce RTX 4060 Ti",
         total_memory_bytes=16 * 2**30,
         torch_version="2.9.0",
@@ -133,11 +136,75 @@ def test_report_contains_table_and_verdict():
         pool=(828, 828, 400, 63, 2),
         date="2026-01-01",
     )
+    fields.update(overrides)
+    return BENCH.RunMeta(**fields)
+
+
+def test_report_contains_table_and_summary():
+    """The canonical artifact carries the header facts, all rows, and the summary."""
     rows = [result(128, 5000, 2.0), result(256, 6000, 4.0), result(512, 6200, 8.0)]
-    report = BENCH.build_report(meta, rows)
+    report = BENCH.build_report(make_meta(), rows)
+    assert "D5 batches 128/256/512" in report
     assert "RTX 4060 Ti" in report
     assert "torch:** 2.9.0 (CUDA 12.8)" in report
     for row in rows:
         assert f"\n| {row.batch_size} | " in report
-    assert "**Verdict:**" in report
-    assert "confirmed" in report
+    assert "**Summary:**" in report
+    assert "Exploratory" not in report  # the exact D5 sweep is the canonical artifact
+
+
+def test_non_canonical_report_labels_itself_exploratory():
+    """A partial sweep or non-canonical hardware is headed as exploratory."""
+    report = BENCH.build_report(make_meta(), [result(256, 6000, 4.0)])
+    assert "D5 batches 256" in report
+    assert "Exploratory sweep" in report
+    assert "measurement behind that pin" not in report
+    # The full sweep on the wrong GPU must not claim canonical provenance either.
+    rows = [result(128, 5000, 2.0), result(256, 6000, 4.0), result(512, 6200, 8.0)]
+    wrong_gpu = BENCH.build_report(
+        make_meta(gpu_name="NVIDIA GeForce RTX 4090", total_memory_bytes=24 * 2**30), rows
+    )
+    assert "Exploratory sweep" in wrong_gpu
+    assert "--out docs/bench" not in wrong_gpu  # no false produced-by line
+
+
+def test_out_requires_the_canonical_sweep():
+    """--out demands exactly 128/256/512 in order; stdout runs take any sweep."""
+    for sweep in (["256"], ["512", "256", "128"], ["128", "256", "256", "512"]):
+        with pytest.raises(SystemExit):
+            BENCH.parse_args(["--batch-sizes", *sweep, "--out", "docs/bench/m2-train-step.md"])
+    args = BENCH.parse_args(["--batch-sizes", "256"])  # exploratory: any sizes
+    assert args.batch_sizes == [256] and args.out is None
+    args = BENCH.parse_args(["--out", "docs/bench/m2-train-step.md"])  # default sweep is canonical
+    assert tuple(args.batch_sizes) == BENCH.CANONICAL_BATCH_SIZES
+
+
+def test_canonical_hardware_gate():
+    """--out accepts only the 4060 Ti 16 GB — not other GPUs, not the 8 GB variant."""
+    BENCH.require_canonical_hardware("NVIDIA GeForce RTX 4060 Ti", 16 * 2**30)
+    with pytest.raises(SystemExit, match="4090"):
+        BENCH.require_canonical_hardware("NVIDIA GeForce RTX 4090", 24 * 10**9)
+    with pytest.raises(SystemExit, match="8.0 GiB"):
+        BENCH.require_canonical_hardware("NVIDIA GeForce RTX 4060 Ti", 8 * 2**30)
+
+
+def test_main_gates_out_runs_on_hardware(monkeypatch, tmp_path):
+    """main() itself fires the hardware gate on --out, before any benching.
+
+    Wiring test for the gate's one production call site: with CUDA faked
+    present on a faked 4090, a --out run must exit on the hardware check —
+    if a refactor drops the ``main()`` call, this fails.
+    """
+    monkeypatch.setattr(BENCH.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        BENCH.torch.cuda, "get_device_name", lambda device: "NVIDIA GeForce RTX 4090"
+    )
+    monkeypatch.setattr(
+        BENCH.torch.cuda,
+        "get_device_properties",
+        lambda device: types.SimpleNamespace(total_memory=24 * 2**30),
+    )
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--out", str(tmp_path / "report.md")])
+    with pytest.raises(SystemExit, match="4090"):
+        BENCH.main()
+    assert not (tmp_path / "report.md").exists()  # exited before any report

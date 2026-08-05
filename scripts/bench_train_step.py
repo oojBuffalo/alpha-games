@@ -19,12 +19,16 @@ batch stay counted; warmup-only allocator churn does not).
 **Manual GPU task:** CI is CPU-only and never runs this. Without CUDA the
 script exits loudly — it never degrades to a silent CPU benchmark.
 
-The one-line verdict in the report is mechanical so the committed artifact
-is reproducible from its own table: batch 256 "fits comfortably" iff its
-peak allocation stays within ``COMFORT_VRAM_FRACTION`` of device memory,
-and is "throughput-reasonable" iff its positions/sec reaches
-``THROUGHPUT_FRACTION`` of the best measured batch size. Either way the raw
-numbers are what M3 argues from.
+The benchmark is observational: the report ends with a one-line summary of
+batch 256's measured VRAM and throughput, stated as raw fractions with no
+pass/fail gate — the batch-size decision is D5's, already pinned, and any
+re-pin is doc-first (§10). M3 argues from the numbers.
+
+Canonical vs. exploratory runs: ``--out`` writes the acceptance artifact and
+therefore demands the documented contract — the exact 128/256/512 sweep on
+the RTX 4060 Ti 16 GB — and exits loudly otherwise. Runs without ``--out``
+are exploratory: any CUDA GPU, any sizes, stdout only — and the report heads
+itself as exploratory unless both the sweep and the hardware are canonical.
 
 Usage (on the 4060 Ti box; writes the acceptance artifact):
     python3 scripts/bench_train_step.py --out docs/bench/m2-train-step.md
@@ -55,11 +59,12 @@ from games.blokus_duo.targets import MAX_SCORE_DIFF  # noqa: E402
 # counts use the boosted budget.
 SIMULATIONS = 512
 
-# Operational reading of the task's verdict ("fits comfortably",
-# "throughput-reasonable") — mechanical so the artifact's one-line verdict is
-# reproducible from its own table. M3 argues from the raw numbers either way.
-COMFORT_VRAM_FRACTION = 0.8
-THROUGHPUT_FRACTION = 0.9
+# The canonical-artifact contract (issue #30 / §7): the exact D5 sweep on the
+# 4060 Ti 16 GB. The VRAM floor tells the 16 GB card apart from the 8 GB
+# variant, which reports the same device name.
+CANONICAL_BATCH_SIZES = (128, 256, 512)
+CANONICAL_GPU_SUBSTRING = "4060 Ti"
+CANONICAL_MIN_VRAM_GIB = 15.0
 
 
 @dataclass(frozen=True)
@@ -95,7 +100,8 @@ class RunMeta:
 
     Attributes:
         gpu_name: ``torch.cuda.get_device_name`` of the benchmarked device.
-        total_memory_bytes: Device memory, the denominator of the VRAM verdict.
+        total_memory_bytes: Device memory, the denominator of the summary's
+            VRAM fraction.
         torch_version: ``torch.__version__``.
         cuda_version: ``torch.version.cuda``.
         seed: Root seed for playouts and batch synthesis.
@@ -133,6 +139,48 @@ def require_cuda() -> None:
         "(§7: batch 256, benchmark 128/256/512, on the RTX 4060 Ti 16 GB). "
         "A CPU timing would be meaningless for the decision, so there is no "
         "CPU fallback; run this on the GPU box."
+    )
+
+
+def is_canonical_hardware(gpu_name: str, total_memory_bytes: int) -> bool:
+    """Whether the device is the documented 4060 Ti 16 GB.
+
+    Args:
+        gpu_name: ``torch.cuda.get_device_name`` of the benchmarked device.
+        total_memory_bytes: Device memory; the floor distinguishes the 8 GB
+            4060 Ti variant, which reports the same name.
+
+    Returns:
+        True iff the name and memory match the canonical-artifact contract.
+    """
+    return (
+        CANONICAL_GPU_SUBSTRING in gpu_name and _gib(total_memory_bytes) >= CANONICAL_MIN_VRAM_GIB
+    )
+
+
+def require_canonical_hardware(gpu_name: str, total_memory_bytes: int) -> None:
+    """Exit loudly when the device is not the documented 4060 Ti 16 GB.
+
+    Guards canonical (``--out``) runs only: the committed artifact's contract
+    is 4060 Ti 16 GB, and a faster card would silently produce an
+    apparently-authoritative report. Exploratory runs accept any CUDA device.
+
+    Args:
+        gpu_name: ``torch.cuda.get_device_name`` of the benchmarked device.
+        total_memory_bytes: Device memory; also distinguishes the 8 GB
+            4060 Ti variant, which reports the same name.
+
+    Raises:
+        SystemExit: When the name lacks ``CANONICAL_GPU_SUBSTRING`` or the
+            memory is below ``CANONICAL_MIN_VRAM_GIB``.
+    """
+    if is_canonical_hardware(gpu_name, total_memory_bytes):
+        return
+    sys.exit(
+        f"ERROR: --out writes the canonical D5 artifact, whose contract is the RTX "
+        f"{CANONICAL_GPU_SUBSTRING} 16 GB; this device is {gpu_name} "
+        f"({_gib(total_memory_bytes):.1f} GiB). Rerun without --out for an "
+        "exploratory (stdout-only) sweep on this hardware."
     )
 
 
@@ -281,65 +329,76 @@ def _gib(n_bytes: int) -> float:
     return n_bytes / 2**30
 
 
-def d5_verdict(results: list[BenchResult], total_memory_bytes: int) -> str:
-    """Compose the one-line batch-256 verdict from the measured table.
+def d5_summary(results: list[BenchResult], total_memory_bytes: int) -> str:
+    """Compose the one-line observational batch-256 summary from the table.
+
+    Measurements only — no pass/fail gate. D5's batch-256 pin is not decided
+    here, and no acceptance thresholds exist in the design doc; if these
+    numbers argue for a different batch size, that is a doc-first re-pin
+    (§10), argued by a human at M3.
 
     Args:
         results: One ``BenchResult`` per measured batch size.
         total_memory_bytes: Device memory (VRAM-fraction denominator).
 
     Returns:
-        One line: whether batch 256 fits comfortably (peak allocation within
-        ``COMFORT_VRAM_FRACTION`` of device memory) and is
-        throughput-reasonable (within ``THROUGHPUT_FRACTION`` of the best
-        measured positions/sec) — or a no-verdict note when 256 was not among
-        the measured sizes.
+        One line restating batch 256's peak VRAM as a fraction of device
+        memory and its throughput as a fraction of the best measured size —
+        or a note when 256 was not among the measured sizes.
     """
     by_batch = {r.batch_size: r for r in results}
     r256 = by_batch.get(256)
     if r256 is None:
-        return "No D5 verdict: batch 256 was not among the measured sizes."
+        return "Batch 256 (the D5 pin) was not among the measured sizes."
     best = max(results, key=lambda r: r.positions_per_s)
     vram_frac = r256.peak_alloc_bytes / total_memory_bytes
     thr_frac = r256.positions_per_s / best.positions_per_s
-    fits = vram_frac <= COMFORT_VRAM_FRACTION
-    reasonable = thr_frac >= THROUGHPUT_FRACTION
-    fits_clause = (
-        f"{'fits comfortably' if fits else 'does NOT fit comfortably'} "
-        f"({_gib(r256.peak_alloc_bytes):.2f} of {_gib(total_memory_bytes):.1f} GiB peak-allocated"
-        f" = {vram_frac:.0%}; comfortable <= {COMFORT_VRAM_FRACTION:.0%})"
+    return (
+        f"Batch 256 (the D5 pin) peak-allocated {_gib(r256.peak_alloc_bytes):.2f} of "
+        f"{_gib(total_memory_bytes):.1f} GiB device memory ({vram_frac:.0%}) and sustained "
+        f"{r256.positions_per_s:,.0f} positions/s ({thr_frac:.0%} of the best measured, "
+        f"{best.positions_per_s:,.0f} at batch {best.batch_size}). "
+        "D5 stays pinned; M3 argues from these numbers (any re-pin is doc-first)."
     )
-    thr_clause = (
-        f"{'is' if reasonable else 'is NOT'} the throughput-reasonable choice "
-        f"({r256.positions_per_s:,.0f} positions/s = {thr_frac:.0%} of the best, "
-        f"{best.positions_per_s:,.0f} at batch {best.batch_size}; "
-        f"reasonable >= {THROUGHPUT_FRACTION:.0%})"
-    )
-    outcome = (
-        "D5 batch 256 confirmed"
-        if fits and reasonable
-        else "D5 batch 256 NOT confirmed — take these numbers to M3"
-    )
-    return f"Batch 256 {fits_clause} and {thr_clause}: {outcome}."
 
 
 def build_report(meta: RunMeta, results: list[BenchResult]) -> str:
-    """Render the markdown artifact (committed as ``docs/bench/m2-train-step.md``).
+    """Render the markdown report; canonical runs commit it as the artifact.
+
+    The title and intro come from the run itself: only the exact
+    ``CANONICAL_BATCH_SIZES`` sweep measured on canonical hardware labels
+    itself as the D5 acceptance artifact; anything else — other sizes, other
+    order, or another GPU — is headed as an exploratory sweep.
 
     Args:
         meta: Run header facts.
         results: One ``BenchResult`` per measured batch size, in run order.
 
     Returns:
-        The complete markdown report, verdict line included.
+        The complete markdown report, summary line included.
     """
     pool = sorted(meta.pool)
+    sizes = [r.batch_size for r in results]
+    canonical = tuple(sizes) == CANONICAL_BATCH_SIZES and is_canonical_hardware(
+        meta.gpu_name, meta.total_memory_bytes
+    )
+    sweep = "/".join(str(s) for s in sizes)
+    intro = (
+        [
+            'D5 pins "batch 256 (benchmark 128/256/512)" (§7) on the RTX 4060 Ti 16 GB; this',
+            "artifact is the measurement behind that pin. Produced by",
+            "`python3 scripts/bench_train_step.py --out docs/bench/m2-train-step.md`.",
+        ]
+        if canonical
+        else [
+            "**Exploratory sweep** — not the canonical 128/256/512 D5 acceptance artifact",
+            "(`docs/bench/m2-train-step.md`); produced by `scripts/bench_train_step.py`.",
+        ]
+    )
     lines = [
-        "# M2 train-step benchmark — D5 batches 128/256/512",
+        f"# M2 train-step benchmark — D5 batches {sweep}",
         "",
-        'D5 pins "batch 256 (benchmark 128/256/512)" (§7) on the RTX 4060 Ti 16 GB; this',
-        "artifact is the measurement behind that pin. Produced by",
-        "`python3 scripts/bench_train_step.py --out docs/bench/m2-train-step.md`.",
+        *intro,
         "",
         f"- **GPU:** {meta.gpu_name}, {_gib(meta.total_memory_bytes):.1f} GiB",
         f"- **torch:** {meta.torch_version} (CUDA {meta.cuda_version})",
@@ -368,7 +427,7 @@ def build_report(meta: RunMeta, results: list[BenchResult]) -> str:
         " VRAM from `torch.cuda.max_memory_allocated` after a post-warmup"
         " `reset_peak_memory_stats` (resident params/batch stay counted).",
         "",
-        f"**Verdict:** {d5_verdict(results, meta.total_memory_bytes)}",
+        f"**Summary:** {d5_summary(results, meta.total_memory_bytes)}",
         "",
     ]
     return "\n".join(lines)
@@ -385,7 +444,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     Raises:
         SystemExit: On invalid arguments (nonpositive sizes/steps/playouts,
-            negative warmup), via ``argparse`` error handling.
+            negative warmup, or ``--out`` with a sweep other than the exact
+            canonical 128/256/512), via ``argparse`` error handling.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -405,13 +465,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         type=Path,
         default=None,
-        help="also write the report here (docs/bench/m2-train-step.md for the committed artifact)",
+        help="also write the report here (docs/bench/m2-train-step.md for the committed"
+        " artifact; requires the exact 128/256/512 sweep on the 4060 Ti 16 GB)",
     )
     args = parser.parse_args(argv)
     if any(b < 1 for b in args.batch_sizes) or args.steps < 1 or args.playouts < 1:
         parser.error("batch sizes, steps, and playouts must all be >= 1")
     if args.warmup < 0:
         parser.error("warmup must be >= 0")
+    if args.out is not None and tuple(args.batch_sizes) != CANONICAL_BATCH_SIZES:
+        parser.error(
+            "--out writes the canonical D5 artifact and requires exactly the "
+            f"{'/'.join(str(s) for s in CANONICAL_BATCH_SIZES)} sweep, in that order, "
+            "so regenerated artifacts stay byte-comparable "
+            f"(got {args.batch_sizes}); drop --out for an exploratory stdout-only run"
+        )
     return args
 
 
@@ -420,6 +488,11 @@ def main() -> None:
     args = parse_args()
     require_cuda()
     device = torch.device("cuda")
+    if args.out is not None:
+        require_canonical_hardware(
+            torch.cuda.get_device_name(device),
+            torch.cuda.get_device_properties(device).total_memory,
+        )
     game = BlokusDuo()
     pool = legal_size_pool(game, args.seed, args.playouts)
     print(
