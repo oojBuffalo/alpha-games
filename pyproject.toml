@@ -26,7 +26,7 @@ include = ["core*", "games*"]
 pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
-    "slow: high-sim search tests; deselect with '-m \"not slow\"'.",
+    "slow: high-sim search / heavy training tests; deselect with '-m \"not slow\"'.",
 ]
 
 [tool.ruff]
