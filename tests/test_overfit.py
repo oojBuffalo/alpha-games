@@ -13,17 +13,25 @@ Everything is seeded and CPU-only, full precision by construction: on CPU
 ``train_step``'s autocast is disabled and the GradScaler is a no-op
 (determinism beats speed here; AMP-for-real is the M2 GPU benchmark's job).
 100 steps at the D5 base LR suffice — observed convergence is total ≈ 1e-4
-with 12/12 policy argmax and |v − z| ≤ 0.01, so the asserted thresholds carry
-two orders of magnitude of cross-platform slack — and keep the runtime in
-tens of seconds on CPU, which is why the module is ``slow``-marked.
+with 12/12 policy argmax, |v − z| ≤ 0.01, and aux MSE ≈ 2.5e-5, so the
+asserted thresholds carry roughly two orders of magnitude of cross-platform
+slack — and keep the runtime in tens of seconds on CPU, which is why the
+module is ``slow``-marked.
+
+All three heads are asserted independently in eval mode. The composite loss
+alone cannot vouch for the aux head: at λ_aux = 0.25 and this fixture's
+±10/109 targets, a dead constant-zero aux head costs only
+``0.25 · (10/109)² ≈ 2e-3`` — invisible under ``LOSS_THRESHOLD``.
 """
 
 from __future__ import annotations
 
 import random
+from typing import NamedTuple
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from core.network import Network, NetworkConfig
 from core.train import collate, make_optimizer, make_scaler, train_step
@@ -51,6 +59,30 @@ VISITS = 256
 LOSS_THRESHOLD = 0.05
 MIN_POLICY_ACCURACY = 0.9
 VALUE_TOLERANCE = 0.25
+
+# Unweighted aux-MSE threshold, calibrated on this fixture: converged
+# ≈ 2.5e-5, a dead constant-zero head ≈ (10/109)² ≈ 8.4e-3 — the threshold
+# sits 80× above the former and 4× below the latter, so a head that predicts
+# nothing fails even though λ_aux hides it inside the composite loss.
+AUX_MSE_THRESHOLD = 0.002
+
+
+class _PlayoutPly(NamedTuple):
+    """One recorded ply of the seeded playout — the batch's raw material.
+
+    Attributes:
+        state: The position before the action was played.
+        mover: ``current_player`` at that position; the perspective
+            ``value_targets`` is computed from.
+        action: The uniform-random action the playout took — the trained-on
+            π target and the assertion-side ground truth.
+        legal: The legal action ids at the position, in adapter order.
+    """
+
+    state: object
+    mover: int
+    action: int
+    legal: list[int]
 
 
 def playout_batch(game, engine, rng, n_positions):
@@ -83,16 +115,16 @@ def playout_batch(game, engine, rng, n_positions):
     while not game.is_terminal(state):
         legal = list(game.legal_moves(state))
         action = rng.choice(legal)
-        trail.append((state, game.current_player(state), action, legal))
+        trail.append(_PlayoutPly(state, game.current_player(state), action, legal))
         state = game.apply(state, action)
     scores = engine.scores(state)
     samples, played = [], []
-    for ply in sorted(rng.sample(range(len(trail)), n_positions)):
-        pos, mover, action, legal = trail[ply]
-        z, aux = value_targets(scores[mover], scores[1 - mover])
-        pairs = [(a, VISITS if a == action else 0) for a in legal]
-        samples.append((game.encode_state(pos), pairs, float(z), (aux,)))
-        played.append(action)
+    for index in sorted(rng.sample(range(len(trail)), n_positions)):
+        ply = trail[index]
+        z, aux = value_targets(scores[ply.mover], scores[1 - ply.mover])
+        pairs = [(a, VISITS if a == ply.action else 0) for a in ply.legal]
+        samples.append((game.encode_state(ply.state), pairs, float(z), (aux,)))
+        played.append(ply.action)
     return samples, played
 
 
@@ -122,7 +154,7 @@ def test_overfit_one_batch():
 
     net.eval()
     with torch.no_grad():
-        logits, value, _ = net(batch.planes)
+        logits, value, aux_pred = net(batch.planes)
     # Argmax over each position's legal set (illegal logits never enter the
     # loss and mean nothing) against the *played* action, not the trained-on
     # pairs — so sabotaged policy targets cannot re-green this assertion.
@@ -133,3 +165,7 @@ def test_overfit_one_batch():
     accuracy = (predicted == torch.tensor(played)).float().mean().item()
     assert accuracy >= MIN_POLICY_ACCURACY
     assert (value - batch.z).abs().max().item() <= VALUE_TOLERANCE
+    # The aux head must memorize too, judged unweighted: inside the composite,
+    # λ_aux and the small ±10/109 targets make a dead zero head cost ≈ 2e-3 —
+    # under LOSS_THRESHOLD — so only this direct MSE check can catch it.
+    assert F.mse_loss(aux_pred, batch.aux).item() < AUX_MSE_THRESHOLD
