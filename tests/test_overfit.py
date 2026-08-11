@@ -22,6 +22,17 @@ All three heads are asserted independently in eval mode. The composite loss
 alone cannot vouch for the aux head: at λ_aux = 0.25 and this fixture's
 ±10/109 targets, a dead constant-zero aux head costs only
 ``0.25 · (10/109)² ≈ 2e-3`` — invisible under ``LOSS_THRESHOLD``.
+
+What the aux assertion does and does not prove: this batch comes from a single
+decisive playout, so its aux targets are exactly ``z · 10/109`` — perfectly
+correlated with the value targets. Memorizing ``score_diff`` and merely
+rescaling the value signal are therefore indistinguishable *on this fixture*,
+and no assertion over it could separate them. What the check does prove is
+that the head is neither dead nor constant: the targets' own variance puts
+every constant predictor (including the batch mean, MSE ≈ 8.2e-3) above
+``AUX_MSE_THRESHOLD``. Separating the two would need a fixture spanning
+several playouts with differing score margins at equal z — a discrimination
+this exit test does not claim.
 """
 
 from __future__ import annotations
