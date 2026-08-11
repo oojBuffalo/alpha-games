@@ -39,6 +39,18 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 - Scoring: −1 per unplaced square; +15 all placed; +5 if monomino placed last (needs the explicit flag — *not* recoverable from occupancy+inventory). Score/player ∈ [−89, +20]; diff ∈ [−109, +109]; draws exist (z = 0).
 - Symmetry: **Klein four-group** {identity, 180°, main diagonal, anti-diagonal} — the set-stabilizer of the start squares, no own/opponent relabeling. Full D4 deferred: 90°-class images are rule-consistent but off-support (no start square covered).
 
+## Micro-Blokus golden constants (M2.5; design doc §5.3 — pinned, independently enumerated)
+
+The **same** `games/blokus_duo/` package parameterized over a game config — *not* a new game package. Verify with `python3 scripts/enumerate_micro_config.py` (standalone, deterministic).
+
+- Board **5×5**; pieces = all free polyominoes of order ≤ 3 (**4**: monomino, domino, I-tromino, V-tromino); start squares **(1,1)** and **(3,3)** 0-indexed.
+- Orientations per piece {1, 2, 2, 4} = **9**; `policy_shape` **(5,5,9)** = **225** raw actions; **159** in-bounds placements; **21** openings per start square → **42** legal openings.
+- Input **12 planes** = 2 occupancy + 2×4 inventory + 2 monomino-last flags (the §5.2 formula, not a constant).
+- 9 squares/set; score/player ∈ **[−9, +20]**; max |score_diff| = **29** (the aux divisor; D1's /109 analogue).
+- `symmetry_group` = **Klein-4** — *computed* as the D4 set-stabilizer of the micro start squares, not hardcoded.
+- Orientation ids are **re-derived within the subset** (invariant 4), never the full table restricted → the micro instance carries its **own** orientation hash `78ea621a…`.
+- Trunk stays **D5 8×128** (a pinned decision, §5.3 — keeps the throughput number transferable).
+
 ## Pinned decisions digest (rationale: design doc §10)
 
 - **D1** value target `z = sign(score_diff)`; aux head predicts `score_diff/109`.
