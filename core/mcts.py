@@ -17,17 +17,23 @@ Key invariants (never violated):
   * Virtual loss is applied on descent and removed on backup, so a completed search
     leaves zero residue; it exists so batched selection (M5) never re-picks an
     in-flight leaf.
+  * Root Dirichlet noise (D7) is an *option*, off by default: it is exploration for
+    self-play only, so every evaluation path runs the undisturbed priors.
 """
 
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Callable, Sequence
 
 from core.game import Action, Game, PlayerId, State, assert_v1_envelope
 
 # evaluate(game, state) -> (value_from_movers_perspective, priors_by_action_id | None)
 Evaluator = Callable[[Game, State], tuple[float, "dict[Action, float] | None"]]
+
+# root_noise = (eps, alpha_numerator, rng); alpha = alpha_numerator / #legal (D7).
+RootNoise = tuple[float, float, random.Random]
 
 
 class _Node:
@@ -80,9 +86,16 @@ class MCTS:
         uniform_prior: If True, ignore any evaluator-provided priors and use uniform
             priors over legal actions (ladder rung 6). The evaluator's *value* is kept.
         virtual_loss: Virtual-loss magnitude applied per in-flight edge (default 1).
+        root_noise: Optional ``(eps, alpha_numerator, rng)`` enabling D7 root Dirichlet
+            noise — ``P' = (1-eps)·P + eps·Dir(alpha)`` with ``alpha = alpha_numerator /
+            #legal`` over the root's legal actions only. Self-play sets ``(0.25, 10.8,
+            rng)``; ``None`` (default) leaves the search bit-identical to the noiseless
+            engine, which is what every evaluation path wants.
 
     Raises:
         EnvelopeError: If ``game`` declares capabilities outside the v1 envelope.
+        ValueError: If ``root_noise`` carries an ``eps`` outside ``[0, 1]`` or a
+            non-positive ``alpha_numerator``.
     """
 
     def __init__(
@@ -94,21 +107,36 @@ class MCTS:
         evaluate: Evaluator | None = None,
         uniform_prior: bool = False,
         virtual_loss: int = 1,
+        root_noise: RootNoise | None = None,
     ):
         assert_v1_envelope(game)
+        if root_noise is not None:
+            eps, alpha_numerator, _ = root_noise
+            if not 0.0 <= eps <= 1.0:
+                raise ValueError(f"root-noise eps must lie in [0, 1]; got {eps}")
+            if alpha_numerator <= 0.0:
+                raise ValueError(
+                    f"root-noise alpha_numerator must be positive; got {alpha_numerator}"
+                )
         self.game = game
         self.c_init = c_init
         self.c_base = c_base
         self.evaluate = evaluate
         self.uniform_prior = uniform_prior
         self.virtual_loss = virtual_loss
+        self.root_noise = root_noise
         self.root: _Node | None = None
+        # A root "incarnation" counter: bumped every time a node *becomes* the root, so
+        # noise is re-drawn per incarnation (D7) — once, not on every run() call.
+        self._root_epoch = 0
+        self._noised_epoch = -1
 
     # --- public API ------------------------------------------------------------
 
     def set_root(self, state: State) -> None:
         """Start a fresh search tree rooted at ``state`` (discards any prior tree)."""
         self.root = self._make_node(state)
+        self._root_epoch += 1
 
     def run(self, num_simulations: int, root_state: State | None = None) -> _Node:
         """Run ``num_simulations`` simulations from the root and return the root node.
@@ -126,6 +154,7 @@ class MCTS:
         if self.root is None:
             raise ValueError("no root set; pass root_state or call set_root first")
         for _ in range(num_simulations):
+            self._maybe_noise_root()
             path, leaf, leaf_value = self._descend(apply_vloss=True)
             ref_player, value = self._leaf_value(leaf, path, leaf_value)
             self._backup(path, ref_player, value)
@@ -136,7 +165,9 @@ class MCTS:
 
         The retained child keeps its accumulated statistics; the rest of the tree is
         dropped. If the child was never materialized, a fresh node is created for the
-        resulting state (no statistics to reuse).
+        resulting state (no statistics to reuse). The promoted node is a *new* root
+        incarnation, so the next :meth:`run` re-draws root noise onto its priors (D7) —
+        the retained priors carry the previous root's noise, if any, only until then.
 
         Args:
             action: The action id played from the current root.
@@ -152,6 +183,7 @@ class MCTS:
             if action not in self.game.legal_moves(self.root.state):
                 raise ValueError(f"action {action} is not legal at the current root")
             self.root = self._make_node(self.game.apply(self.root.state, action))
+            self._root_epoch += 1
             return
         try:
             i = self.root.actions.index(action)
@@ -161,6 +193,7 @@ class MCTS:
         if child is None:
             child = self._make_node(self.game.apply(self.root.state, action))
         self.root = child
+        self._root_epoch += 1
 
     def action_visit_counts(self, node: _Node | None = None) -> dict[Action, int]:
         """Return ``{action_id: visit_count}`` for the node's edges (default: root)."""
@@ -258,6 +291,50 @@ class MCTS:
         exps = [math.exp(z - m) for z in logits]
         s = sum(exps)
         return [e / s for e in exps]
+
+    def _maybe_noise_root(self) -> None:
+        """Mix D7 Dirichlet noise into the current root's priors, once per root incarnation.
+
+        A no-op unless ``root_noise`` is configured. Root priors only exist once the root is
+        expanded, and a fresh root is expanded by its own first simulation — so this runs
+        before every simulation and fires on the first one that finds expanded priors (that
+        simulation's descent stops at the root, before any prior is read). Because the guard
+        is the root *epoch*, a subtree promoted by :meth:`advance` gets fresh noise on the
+        next search, while repeated :meth:`run` calls on one root never re-mix.
+        """
+        if self.root_noise is None or self._noised_epoch == self._root_epoch:
+            return
+        root = self.root
+        if root is None or not root.is_expanded or not root.actions:
+            return
+        eps, alpha_numerator, rng = self.root_noise
+        noise = self._dirichlet(len(root.actions), alpha_numerator / len(root.actions), rng)
+        root.P = [(1.0 - eps) * p + eps * d for p, d in zip(root.P, noise, strict=True)]
+        self._noised_epoch = self._root_epoch
+
+    @staticmethod
+    def _dirichlet(n: int, alpha: float, rng: random.Random) -> list[float]:
+        """Return one symmetric ``Dir(alpha)`` sample of length ``n`` drawn from ``rng``.
+
+        Stdlib-only construction (``core/`` stays NumPy-free here): draw ``Gamma(alpha, 1)``
+        per component and normalize.
+
+        Args:
+            n: Number of components (the root's legal-action count).
+            alpha: The symmetric concentration parameter (D7: ``10.8 / n``).
+            rng: The Dirichlet stream — its own purpose-keyed ``random.Random``.
+
+        Returns:
+            ``n`` non-negative weights summing to 1.
+        """
+        draws = [rng.gammavariate(alpha, 1.0) for _ in range(n)]
+        total = sum(draws)
+        if total <= 0.0:
+            # alpha ≈ 0.013 at an 828-wide Blokus root, so every gamma draw underflowing to
+            # 0.0 is representable-in-principle; fall back to the Dirichlet mean, never a
+            # division by zero.
+            return [1.0 / n] * n
+        return [d / total for d in draws]
 
     def _select_edge(self, node: _Node) -> int:
         """Return the local edge index maximizing ``Q + U`` (ties: lowest index).
