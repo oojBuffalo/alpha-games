@@ -6,6 +6,14 @@ base-piece data and the action-encoding surface with the bitboard engine — it
 runs its **own** D4 transforms (different rotation/reflection code from
 ``pieces.py``), its own legality scan, and its own scoring.
 
+Parameterizing it over a config (M2.5, §5.3) does not weaken that contract: the
+engine takes board dims, start squares and the config's *selected base pieces*
+only, and still generates its own orientations from them. It never reads the
+production orientation table — it touches the shared :class:`ActionCodec` only
+to translate its independently enumerated placements into ids at the comparison
+boundary, which is exactly what makes the differential battery meaningful (two
+implementations agreeing, not one table quoted twice).
+
 State layout (shared tuple convention across engines and the adapter):
 ``(occ0, occ1, inv0, inv1, mono_last0, mono_last1, to_play, terminal)`` where
 ``occ`` are frozensets of cells, ``inv`` frozensets of piece indices. Engines
@@ -15,14 +23,9 @@ pass-invariant normalization (§6.1).
 
 from __future__ import annotations
 
-from games.blokus_duo.actions import (
-    BOARD_SIZE,
-    START_SQUARES,
-    action_cells,
-    decode,
-    encode_cells,
-)
-from games.blokus_duo.pieces import BASE_PIECES, ORIENTATION_PIECE
+from games.blokus_duo.actions import action_codec
+from games.blokus_duo.config import FULL_CONFIG, BlokusConfig
+from games.blokus_duo.pieces import build_pieces
 
 # The size-1 piece sorts first (§5.1 piece order), so the monomino is index 0.
 MONOMINO = 0
@@ -32,10 +35,27 @@ _DIAG = ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
 class OracleEngine:
-    """Exhaustive cell-grid rules engine; the reference the bitboard is fuzzed against."""
+    """Exhaustive cell-grid rules engine; the reference the bitboard is fuzzed against.
 
-    def __init__(self):
-        self._piece_shapes = [self._own_orientations(p) for p in BASE_PIECES]
+    Args:
+        config: The instance config; defaults to the full 14×14 game. Only the
+            board dims, start squares and selected base pieces are read from it
+            — the orientations below are the oracle's own.
+
+    Attributes:
+        config: The config this engine plays.
+    """
+
+    def __init__(self, config: BlokusConfig = FULL_CONFIG):
+        self.config = config
+        self._board_size = config.board_size
+        self._start_squares = config.start_squares
+        self._base_pieces = build_pieces(config)[0]
+        self._piece_shapes = [self._own_orientations(p) for p in self._base_pieces]
+        # Piece index of the monomino, or None if this instance has no size-1
+        # piece (pieces sort by size, so it can only be index 0).
+        self._monomino = MONOMINO if len(self._base_pieces[0]) == 1 else None
+        self._codec = action_codec(config)
 
     @staticmethod
     def _own_orientations(cells) -> list[frozenset[tuple[int, int]]]:
@@ -66,7 +86,7 @@ class OracleEngine:
 
     def initial_state(self):
         """Return the Blokus Duo start state (empty board, full inventories, P1 to move)."""
-        full = frozenset(range(len(BASE_PIECES)))
+        full = frozenset(range(len(self._base_pieces)))
         return (frozenset(), frozenset(), full, full, False, False, 0, False)
 
     def legal_actions(self, state, player: int) -> list[int]:
@@ -88,14 +108,14 @@ class OracleEngine:
         opp = state[1 - player]
         occupied = own | opp
         opening = not own
-        targets = [sq for sq in START_SQUARES if sq not in opp] if opening else ()
+        targets = [sq for sq in self._start_squares if sq not in opp] if opening else ()
         out = []
         for piece in state[2 + player]:
             for shape in self._piece_shapes[piece]:
                 h = 1 + max(r for r, _ in shape)
                 w = 1 + max(c for _, c in shape)
-                for ar in range(BOARD_SIZE - h + 1):
-                    for ac in range(BOARD_SIZE - w + 1):
+                for ar in range(self._board_size - h + 1):
+                    for ac in range(self._board_size - w + 1):
                         cells = {(ar + r, ac + c) for r, c in shape}
                         if cells & occupied:
                             continue
@@ -109,7 +129,7 @@ class OracleEngine:
                                 (r + dr, c + dc) in own for r, c in cells for dr, dc in _DIAG
                             ):
                                 continue
-                        out.append(encode_cells(cells))
+                        out.append(self._codec.encode_cells(cells))
         return sorted(out)
 
     def place(self, state, action: int):
@@ -129,10 +149,10 @@ class OracleEngine:
             carried unchanged (the adapter normalizes them).
         """
         player = state[6]
-        piece = ORIENTATION_PIECE[decode(action)[2]]
-        own = state[player] | frozenset(action_cells(action))
+        piece = self._codec.action_piece(action)
+        own = state[player] | frozenset(self._codec.action_cells(action))
         inv = state[2 + player] - {piece}
-        mono_last = piece == MONOMINO and not inv
+        mono_last = piece == self._monomino and not inv
         parts = list(state)
         parts[player] = own
         parts[2 + player] = inv
@@ -142,8 +162,8 @@ class OracleEngine:
     def scores(self, state) -> tuple[int, int]:
         """Return the official scores ``(score_p0, score_p1)`` (§4).
 
-        −1 per unplaced square; +15 if all 21 pieces placed; +5 more if the
-        monomino-last flag is set (only reachable with all placed).
+        −1 per unplaced square; +15 if every piece of the set is placed; +5 more
+        if the monomino-last flag is set (only reachable with all placed).
 
         Args:
             state: Engine state tuple.
@@ -155,7 +175,7 @@ class OracleEngine:
         for p in (0, 1):
             inv = state[2 + p]
             if inv:
-                out.append(-sum(len(BASE_PIECES[i]) for i in inv))
+                out.append(-sum(len(self._base_pieces[i]) for i in inv))
             else:
                 out.append(20 if state[4 + p] else 15)
         return tuple(out)

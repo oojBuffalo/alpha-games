@@ -2,13 +2,18 @@
 
 The adapter owns the §6.1 pass-invariant normalization — engines only place
 pieces and report legality/scores. Forced passes are realized by *skipping* the
-blocked player (no pass action in the 14×14×91 head): ``apply`` hands the move
+blocked player (no pass action in the ``H×W×K`` head): ``apply`` hands the move
 to the first of [opponent, mover] with a legal action, else marks the state
 terminal. Blocking is monotone in Blokus, but that is an adapter-level fact —
 core never assumes it.
 
 The engine (oracle or bitboard) is injected so the whole contract battery and
-the differential fuzz can run against either implementation [F8].
+the differential fuzz can run against either implementation [F8]. Since M2.5 the
+adapter also takes a :class:`~games.blokus_duo.config.BlokusConfig`, defaulting
+to the full 14×14 game: ``policy_shape``, ``input_planes``, ``input_shape`` and
+the ``encode_state`` plane layout are all derived from it (§5.2's plane count is
+a formula, not a constant), so the §5.3 micro instance is a construction
+argument rather than a fork.
 """
 
 from __future__ import annotations
@@ -17,56 +22,59 @@ from collections.abc import Sequence
 from typing import Any
 
 from core.game import Action, Game, PlayerId, State, SymmetryElement, ValueTargetSpec
-from games.blokus_duo.actions import BOARD_SIZE, NUM_ORIENTATIONS, action_cells, encode_cells
+from games.blokus_duo.actions import action_codec
 from games.blokus_duo.bitboard import BitboardEngine
-from games.blokus_duo.pieces import BASE_PIECES
+from games.blokus_duo.config import FULL_CONFIG, BlokusConfig
+from games.blokus_duo.pieces import build_pieces
 from games.blokus_duo.symmetry import GROUP_NAMES, full_permutation, plane_transform
 from games.blokus_duo.targets import value_target_spec, value_targets
 
 _TO_PLAY, _TERMINAL = 6, 7
-_NUM_PIECES = len(BASE_PIECES)  # 21
-
-# Constant broadcast planes for the inventory/flag channels (D3) — immutable,
-# so the shared tuples are safely reused across every encoded state.
-_ZEROS = tuple((0,) * BOARD_SIZE for _ in range(BOARD_SIZE))
-_ONES = tuple((1,) * BOARD_SIZE for _ in range(BOARD_SIZE))
-
-
-def _occupancy_plane(occ):
-    """Project one occupancy onto a 14×14 plane of ``{0, 1}``.
-
-    Handles both engine representations — 196-bit ints (bitboard, bit
-    ``r*14 + c``) and frozensets of ``(r, c)`` cells (oracle) — the same dual
-    dispatch as ``symmetry.state_transform``.
-
-    Args:
-        occ: One player's occupancy from the shared engine state tuple.
-
-    Returns:
-        Nested 14×14 tuples over ``{0, 1}``.
-    """
-    if isinstance(occ, int):
-        return tuple(
-            tuple(occ >> (r * BOARD_SIZE + c) & 1 for c in range(BOARD_SIZE))
-            for r in range(BOARD_SIZE)
-        )
-    return tuple(
-        tuple(1 if (r, c) in occ else 0 for c in range(BOARD_SIZE)) for r in range(BOARD_SIZE)
-    )
 
 
 class BlokusDuo(Game):
-    """Blokus Duo (14×14, 2-player) behind the generic ``Game`` interface.
+    """Blokus Duo (2-player) behind the generic ``Game`` interface.
 
     Args:
         engine: Rules engine providing ``initial_state`` / ``legal_actions`` /
             ``place`` / ``scores`` over the shared state tuple. Defaults to the
-            production bitboard engine (~9x faster search); reference tests
-            inject the cell-grid oracle explicitly.
+            production bitboard engine (~9x faster search) for ``config``;
+            reference tests inject the cell-grid oracle explicitly.
+        config: The instance to play; defaults to the injected engine's config,
+            or the full 14×14 game when no engine is given.
+
+    Raises:
+        ValueError: If both an engine and a config are given and they disagree —
+            a mismatched pair would silently mix two action spaces.
     """
 
-    def __init__(self, engine=None):
-        self._engine = engine if engine is not None else BitboardEngine()
+    def __init__(self, engine=None, config: BlokusConfig | None = None):
+        engine_config = getattr(engine, "config", None)
+        if config is None:
+            config = engine_config if engine_config is not None else FULL_CONFIG
+        elif engine_config is not None and engine_config != config:
+            raise ValueError(
+                f"engine config {engine_config} does not match adapter config {config}"
+            )
+        self._config = config
+        self._engine = engine if engine is not None else BitboardEngine(config)
+        self._codec = action_codec(config)
+        self._board_size = config.board_size
+        pieces = build_pieces(config)[0]
+        self._num_pieces = len(pieces)
+        # §5.2: the two monomino-last completion planes exist only if this
+        # instance's piece set contains the monomino (pieces sort by size).
+        self._has_monomino = len(pieces[0]) == 1
+        # Constant broadcast planes for the inventory/flag channels (D3) —
+        # immutable, so the shared tuples are safely reused across every
+        # encoded state.
+        self._zeros = tuple((0,) * self._board_size for _ in range(self._board_size))
+        self._ones = tuple((1,) * self._board_size for _ in range(self._board_size))
+
+    @property
+    def config(self) -> BlokusConfig:
+        """The Blokus instance this adapter plays."""
+        return self._config
 
     # --- declared capabilities ---------------------------------------------------
 
@@ -87,12 +95,20 @@ class BlokusDuo(Game):
         # Klein four-group (§8, D9): the plane transform over the 46-plane
         # encode_state output, plus the full 17,836-length head permutation
         # with identity filler on off-support ids [F6, revised per PR #2
-        # review].
+        # review]. Still full-game-only: per-config symmetry (the D4
+        # set-stabilizer of the instance's start squares, with per-config
+        # (g,a)->a' tables) is M2.5 task 4, so a reduced instance fails loudly
+        # here rather than declaring the wrong group.
+        if self._config != FULL_CONFIG:
+            raise NotImplementedError(
+                "per-config symmetry is not built yet (M2.5 task 4); "
+                f"symmetry_group is full-game-only, got config {self._config}"
+            )
         return tuple((plane_transform(g), full_permutation(g)) for g in GROUP_NAMES)
 
     @property
     def value_targets(self) -> ValueTargetSpec:
-        return value_target_spec()
+        return value_target_spec(self._config)
 
     # --- core contract -------------------------------------------------------------
 
@@ -133,54 +149,78 @@ class BlokusDuo(Game):
 
     def terminal_utility(self, state: State, player_id: PlayerId) -> float:
         scores = self._engine.scores(state)
-        z, _ = value_targets(scores[player_id], scores[1 - player_id])
+        z, _ = value_targets(scores[player_id], scores[1 - player_id], self._config)
         return float(z)
 
     # --- encoding surface (action side owned by M1; plane side by M2) ---------------
 
-    def encode_state(self, state: State):
-        """Encode ``state`` as the 46 D3 planes (§5.2), mover-relative.
+    def _occupancy_plane(self, occ):
+        """Project one occupancy onto an ``H×W`` plane of ``{0, 1}``.
 
-        Plane order (pinned by D3/§5.2): own occupancy, opponent occupancy,
-        21 own-inventory planes, 21 opponent-inventory planes (piece order
-        fixed by ``pieces.BASE_PIECES``, §5.1), own monomino-last flag,
-        opponent monomino-last flag. Inventory and flag planes are constant
-        broadcast planes (all 1s iff the piece is in inventory / the flag is
-        set). "Own" is the side to move — no side-to-move plane (§5.2).
+        Handles both engine representations — occupancy ints (bitboard, bit
+        ``r*W + c``) and frozensets of ``(r, c)`` cells (oracle) — the same dual
+        dispatch as ``symmetry.state_transform``.
 
         Args:
-            state: Engine state tuple; occupancies as 196-bit ints (bitboard)
-                or frozensets of cells (oracle) — both handled.
+            occ: One player's occupancy from the shared engine state tuple.
 
         Returns:
-            46 nested 14×14 tuples over ``{0, 1}`` — stdlib-pure; the
-            training boundary converts with ``numpy.asarray``.
+            Nested ``H×W`` tuples over ``{0, 1}``.
+        """
+        size = self._board_size
+        if isinstance(occ, int):
+            return tuple(tuple(occ >> (r * size + c) & 1 for c in range(size)) for r in range(size))
+        return tuple(tuple(1 if (r, c) in occ else 0 for c in range(size)) for r in range(size))
+
+    def encode_state(self, state: State):
+        """Encode ``state`` as the D3 planes (§5.2), mover-relative.
+
+        Plane order (pinned by D3/§5.2): own occupancy, opponent occupancy, one
+        own-inventory plane per piece, one opponent-inventory plane per piece
+        (piece order fixed by the config's piece set, §5.1), then — iff the
+        instance has a monomino — own and opponent monomino-last flags.
+        Inventory and flag planes are constant broadcast planes (all 1s iff the
+        piece is in inventory / the flag is set). "Own" is the side to move —
+        no side-to-move plane (§5.2). The full game instantiates the formula at
+        46 planes, the §5.3 micro instance at 12.
+
+        Args:
+            state: Engine state tuple; occupancies as ints (bitboard) or
+                frozensets of cells (oracle) — both handled.
+
+        Returns:
+            ``input_planes`` nested ``H×W`` tuples over ``{0, 1}`` — stdlib-pure;
+            the training boundary converts with ``numpy.asarray``.
         """
         mover = state[_TO_PLAY]
-        planes = [_occupancy_plane(state[p]) for p in (mover, 1 - mover)]
+        planes = [self._occupancy_plane(state[p]) for p in (mover, 1 - mover)]
         for p in (mover, 1 - mover):
             inv = state[2 + p]
-            planes.extend(_ONES if piece in inv else _ZEROS for piece in range(_NUM_PIECES))
-        planes.extend(_ONES if state[4 + p] else _ZEROS for p in (mover, 1 - mover))
+            planes.extend(
+                self._ones if piece in inv else self._zeros for piece in range(self._num_pieces)
+            )
+        if self._has_monomino:
+            planes.extend(self._ones if state[4 + p] else self._zeros for p in (mover, 1 - mover))
         return tuple(planes)
 
     def encode_action(self, move: Any) -> Action:
         """Encode absolute placement cells as a flat action id."""
-        return encode_cells(move)
+        return self._codec.encode_cells(move)
 
     def decode_action(self, action: Action) -> Any:
         """Decode a flat action id into its absolute placement cells."""
-        return action_cells(action)
+        return self._codec.action_cells(action)
 
     @property
     def policy_shape(self) -> tuple[int, ...]:
-        return (BOARD_SIZE, BOARD_SIZE, NUM_ORIENTATIONS)
+        return (self._board_size, self._board_size, self._codec.num_orientations)
 
     @property
     def input_planes(self) -> int:
-        # D3: 2 occupancy + 21 own inventory + 21 opponent inventory + 2 flags.
-        return 46
+        # §5.2 formula: 2 occupancy + 2 x #pieces inventory + 2 monomino-last
+        # flags iff the monomino is in the set. Full game: 46 (D3); micro: 12.
+        return 2 + 2 * self._num_pieces + (2 if self._has_monomino else 0)
 
     @property
     def input_shape(self) -> tuple[int, int]:
-        return (BOARD_SIZE, BOARD_SIZE)
+        return (self._board_size, self._board_size)
