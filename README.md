@@ -99,9 +99,9 @@ python3 scripts/bench_train_step.py --out docs/bench/m2-train-step.md
 
 ## Contributing
 
-Follow `CLAUDE.md` for the full operating contract (per-task worktrees, milestone process,
-invariants). At minimum, both of these must pass before opening a PR — CI re-runs the full
-battery (without `-m "not slow"`):
+Follow `CLAUDE.md` — the project's compressed operational digest (working principles,
+milestone process, invariants). At minimum, both of these must pass before opening a PR — CI
+re-runs the full battery (without `-m "not slow"`):
 
 ```sh
 python3 -m pytest -m "not slow"
