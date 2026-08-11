@@ -130,20 +130,22 @@ def test_equivariant_move_gen_on_random_states(fixture_table):
 
 
 def test_adapter_symmetry_group_shape():
-    # [F6, revised per PR #2 review] first slot: core documents it as a
-    # *plane* transform, which only exists once M2 lands encode_state — until
-    # then it must raise rather than advertise the engine-state representation;
-    # second slot: full 17,836 permutation with identity filler on
-    # off-support ids.
+    # [F6, revised per PR #2 review] first slot: the real plane transform over
+    # the 46-plane encode_state output (a raising sentinel until M2 landed the
+    # plane encoding); second slot: full 17,836 permutation with identity
+    # filler on off-support ids.
     game = BlokusDuo()
     group = game.symmetry_group
     assert len(group) == 4
     maps = build_action_maps()
     in_bounds = set(IN_BOUNDS_ACTIONS)
-    s0 = game.initial_state()
+    planes0 = game.encode_state(game.initial_state())
     for name, (plane_t, perm) in zip(GROUP_NAMES, group, strict=True):
-        with pytest.raises(NotImplementedError, match="M2"):
-            plane_t(s0)
+        transformed = plane_t(planes0)
+        assert len(transformed) == 46
+        # Every initial-state plane is a constant broadcast, so all 4 elements
+        # fix it (equivariance on asymmetric states: test_blokus_encoding).
+        assert transformed == planes0
         assert len(perm) == NUM_ACTIONS
         for a in IN_BOUNDS_ACTIONS:
             assert perm[a] == maps[name][a]

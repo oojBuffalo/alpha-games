@@ -145,42 +145,42 @@ class Game(ABC):
         per-player utility vector.
         """
 
-    # --- encoding surface (arrives at M2; declared here for the full contract) ---
-    # These are promoted to abstract methods at M2, when the network lands. M0 search
-    # never touches them (no network → no state/action tensors), so the reference
-    # games leave them unimplemented.
+    # --- encoding surface (abstract since M2, per the M0 seam note) --------------
+    # M0 declared these as concrete NotImplementedError stubs (no network → no
+    # tensors); with the network landed, every game entering the training stack
+    # must encode, so a missing surface now fails at instantiation, not first use.
 
+    @abstractmethod
     def encode_state(self, state: State):
-        """Encode ``state`` as a plane tensor (M2)."""
-        raise NotImplementedError("encode_state arrives at M2 (encoding + network)")
+        """Encode ``state`` as a plane tensor of shape ``(input_planes, *input_shape)``."""
 
+    @abstractmethod
     def encode_action(self, move: Any) -> Action:
-        """Map a move to its action id (M2 / M1 for Blokus)."""
-        raise NotImplementedError("encode_action arrives at M2 (M1 for Blokus)")
+        """Map a move to its action id."""
 
+    @abstractmethod
     def decode_action(self, action: Action) -> Any:
-        """Map an action id back to a move (M2 / M1 for Blokus)."""
-        raise NotImplementedError("decode_action arrives at M2 (M1 for Blokus)")
+        """Map an action id back to a move."""
 
     @property
+    @abstractmethod
     def policy_shape(self) -> tuple[int, ...]:
-        """Shape of the policy head (M2)."""
-        raise NotImplementedError("policy_shape arrives at M2 (encoding + network)")
+        """Shape of the policy head."""
 
     @property
+    @abstractmethod
     def input_planes(self) -> int:
-        """Number of input planes (M2)."""
-        raise NotImplementedError("input_planes arrives at M2 (encoding + network)")
+        """Number of input planes."""
 
     @property
+    @abstractmethod
     def input_shape(self) -> tuple[int, int]:
-        """``(height, width)`` of every input plane (M2).
+        """``(height, width)`` of every input plane.
 
         The full input tensor is ``(input_planes, *input_shape)``. Declared, not
         derived: a flat policy head (Othello's ``(65,)``) carries no board
         geometry to recover ``(H, W)`` from.
         """
-        raise NotImplementedError("input_shape arrives at M2 (encoding + network)")
 
 
 def assert_v1_envelope(game: Game) -> None:
