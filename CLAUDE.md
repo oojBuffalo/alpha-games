@@ -21,6 +21,8 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 
 **Rule: adding a game touches only `games/` + `configs/`.** M1.5 (Othello) enforces this with a zero-`core/`-diff acceptance test.
 
+**Named game configs are adapter-declared** (M2.5). A run config's `game` field is the adapter package directory name under `games/`; `game_config` is a key in that package's module-level `GAME_CONFIGS` mapping (`name → instance-config object`), exposed at the package top level in `games/<game>/__init__.py` (Blokus declares its in `games/blokus_duo/config.py` and re-exports it). `core/runconfig.py` resolves the pair generically — match `game` against the packages discovered under `games/`, import only that package, read the fixed `GAME_CONFIGS` attribute, index it with `game_config`. Both JSON strings are only ever set-membership tests or dict keys — never `eval`, never `getattr` on an arbitrary module — and an unknown game, a game declaring no configs, or an unknown config name each raise `ValueError`. Consequence: a new game adds `games/<game>/` (with `GAME_CONFIGS`) plus `configs/<run>.json` and touches **zero** `core/` files; two AST tests in `tests/test_micro_config_file.py` assert it.
+
 ## Invariants — never violate
 
 1. **Pass invariant.** At every nonterminal state, `current_player(state)` returns a player with ≥1 legal action. Adapters realize forced passes either as an explicit pass action (Othello: 64+1 head) or by skipping inactive players (Blokus: no pass action in 14×14×91). `core/` assumes *only* this invariant — never strict alternation, never monotone blocking. (Blokus blocking is monotone — a blocked player never regains a move; Othello passing is not.)
@@ -38,6 +40,18 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 - Input: **46 planes** = 2 occupancy + 21 own inventory + 21 opponent inventory + 2 monomino-last completion flags; **T=1**.
 - Scoring: −1 per unplaced square; +15 all placed; +5 if monomino placed last (needs the explicit flag — *not* recoverable from occupancy+inventory). Score/player ∈ [−89, +20]; diff ∈ [−109, +109]; draws exist (z = 0).
 - Symmetry: **Klein four-group** {identity, 180°, main diagonal, anti-diagonal} — the set-stabilizer of the start squares, no own/opponent relabeling. Full D4 deferred: 90°-class images are rule-consistent but off-support (no start square covered).
+
+## Micro-Blokus golden constants (M2.5; design doc §5.3 — pinned, independently enumerated)
+
+The **same** `games/blokus_duo/` package parameterized over a game config — *not* a new game package. Verify with `python3 scripts/enumerate_micro_config.py` (standalone, deterministic).
+
+- Board **5×5**; pieces = all free polyominoes of order ≤ 3 (**4**: monomino, domino, I-tromino, V-tromino); start squares **(1,1)** and **(3,3)** 0-indexed.
+- Orientations per piece {1, 2, 2, 4} = **9**; `policy_shape` **(5,5,9)** = **225** raw actions; **159** in-bounds placements; **21** openings per start square → **42** legal openings.
+- Input **12 planes** = 2 occupancy + 2×4 inventory + 2 monomino-last flags (the §5.2 formula, not a constant).
+- 9 squares/set; score/player ∈ **[−9, +20]**; max |score_diff| = **29** (the aux divisor; D1's /109 analogue).
+- `symmetry_group` = **Klein-4** — *computed* as the D4 set-stabilizer of the micro start squares, not hardcoded.
+- Orientation ids are **re-derived within the subset** (invariant 4), never the full table restricted → the micro instance carries its **own** orientation hash `78ea621a…`.
+- Trunk stays **D5 8×128** (a pinned decision, §5.3 — keeps the throughput number transferable).
 
 ## Pinned decisions digest (rationale: design doc §10)
 
@@ -95,7 +109,7 @@ Python 3.11+ (dev on 3.12). `core/` is **pure-stdlib through M0**; NumPy/torch a
 - **Tests:** `python3 -m pytest` from the repo root (full battery). Fast subset: `python3 -m pytest -m "not slow"` (the `slow` marker tags high-sim search sweeps).
 - **Lint / format:** `python3 -m ruff check .` · `python3 -m ruff format .` (check-only: add `--check`).
 - **CI:** `.github/workflows/ci.yml` runs lint + format-check + full battery on push/PR.
-- **Fixture generation (M1):** `python3 scripts/gen_blokus_symmetry_table.py` (seconds) · `python3 scripts/gen_blokus_perft.py` (~3 min; perft(3) is bitboard-generated, Klein-4 orbit-reduced). Both write `tests/fixtures/blokus/*.json` with the orientation hash + encoding conventions embedded; regeneration on unchanged code must be **byte-identical**.
+- **Fixture generation (M1, per-instance since M2.5):** `python3 scripts/gen_blokus_symmetry_table.py` (seconds) · `python3 scripts/gen_blokus_perft.py` (~3 min; perft(3) is bitboard-generated, Klein-4 orbit-reduced). Both write one fixture per pinned instance — `tests/fixtures/blokus/*.json` (full) and `tests/fixtures/blokus_micro/*.json` (micro, which also carries the complete pass-aware game tree) — each with **its own** orientation hash + encoding conventions embedded; regeneration on unchanged code must be **byte-identical**. The battery re-runs the micro generators in-process; the full game's ~3 min regeneration is the offline check.
 - **D5 batch benchmark (M2; manual, 4060 Ti only):** `python3 scripts/bench_train_step.py --out docs/bench/m2-train-step.md` — the 128/256/512 sweep behind the D5 batch-256 pin; the report is observational (no pass/fail gate — re-pins are doc-first). Exits loudly without CUDA (no CPU fallback), and `--out` refuses non-4060 Ti-16GB hardware or a non-canonical sweep; CI never runs it.
 
 *(Fill in as tooling lands: training entrypoints, eval harness.)*

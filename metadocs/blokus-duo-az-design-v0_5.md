@@ -89,6 +89,47 @@ The 21 pieces have **91 fixed orientations** (rotations + reflections): 1+2+6+19
 ### 5.2 Input planes — 46, `T=1`
 2 occupancy (own, opponent) + 21 own inventory + 21 opponent inventory + 2 completion-bonus flags (own/opponent "monomino-was-last-when-completed"). `T=1` is sufficient once the flags are added (dynamics/legality are Markov in (occupancy, inventory); the only non-recoverable terminal quantity, +5, is now carried by a bit). Dropped: side-to-move plane (constant under own/opponent relabeling) and ply-count plane (inventory exposes phase).
 
+The plane count is a **formula, not a constant**: `2 occupancy + 2·(#pieces) inventory + (2 monomino-last flags iff the monomino is in the piece set)`. The full game instantiates it at 46; the §5.5 micro instance instantiates the same formula at 12.
+
+### 5.3 Micro-Blokus — the M2.5 reduced instance *(pinned doc-first, M2.5 task 1)*
+
+§12 M2.5 requires a reduced Blokus instance and states that **none of the full-game golden constants carry over**. This section pins that instance and every constant derived from it. All derived numbers were independently enumerated by `scripts/enumerate_micro_config.py` — a standalone script sharing no code with `games/blokus_duo/` (its own polyomino growth, its own D4 transforms, its own placement enumeration) — **before** being written here, per the "verify load-bearing claims independently" principle. The script is deterministic; re-running it must reproduce this table byte-for-byte.
+
+**The instance is not a new game package.** It is `games/blokus_duo/` parameterized over a config object, so "adding a game touches only `games/` + `configs/`" holds trivially and no `core/` file changes for it.
+
+#### Pinned config (the choice)
+
+| | |
+|---|---|
+| Board | **5×5** |
+| Piece set | **all free polyominoes of order ≤ 3** — monomino, domino, I-tromino, V-tromino (**4 pieces**) |
+| Start squares (**0-indexed**, §5.1 operational convention) | **(1,1)** and **(3,3)** |
+| Start squares (1-indexed *display* only, §4 convention) | (2,2) and (4,4) |
+
+*Why this instance.* Small enough to be cheap (mean ≈ 6.2 plies, mean branching ≈ 13 under random play) and large enough to be a real game: the corner-touch/edge-avoid rules bind, blocking dynamics occur, and — critically — the **all-placed +15 bonus is reachable but not automatic** (random play places all four pieces only ≈ 23% of the time), so the score→z→aux path and the monomino-last flag are exercised end to end rather than being structurally dead. Start squares sit on the main diagonal, symmetric about the centre, exactly as the full game's do, so the D4 set-stabilizer is nonempty and the micro `symmetry_group` is *computed* from the same rule that yields Klein-4 at 14×14.
+
+#### Derived constants (enumerated — hardcode tests against these)
+
+| Quantity | Value |
+|---|---|
+| Fixed orientations per piece | **{1, 2, 2, 4}** |
+| `num_orientations` | **9** |
+| `policy_shape` | **(5, 5, 9)** → **225** raw actions |
+| In-bounds placements | **159** |
+| Openings covering each start square | **21** each → **42** legal opening actions |
+| `input_planes` (§5.2 formula) | **12** = 2 occupancy + 2×4 inventory + 2 monomino-last flags |
+| Squares per set | **9** (orders 1+2+3+3) |
+| Per-player score range | **[−9, +20]** |
+| Max \|score_diff\| — the **aux divisor** (D1's `/109` analogue) | **29** |
+| `symmetry_group` (D4 set-stabilizer of the start squares) | **Klein-4** {identity, rot180, diag, antidiag} |
+| Orientation-table hash | `78ea621ae2d1e27e239ecffa5ff44c793ef15f2884198a0394d394083d3e37e4` |
+
+**Scoring** carries over unchanged in *form* (§4): −1 per unplaced square, **+15** if all pieces are placed, **+5** more if the monomino was placed last. Both bonuses are reachable under this subset, so both are live. The score range mirrors the full game's convention: −9 is the all-unplaced bound (unreachable in play — as −89 is at 14×14 — but it is the pinned bound, and 29 = 20 − (−9) is therefore the pinned aux divisor).
+
+**Orientation IDs are re-derived, not restricted.** Per invariant 4, micro orientation ids are assigned by sorting canonical cell tuples *within the subset* and renumbering from 0 — they are **not** the full table's ids filtered. The micro instance therefore carries its **own** orientation-table hash (above), and every micro fixture, checkpoint and replay dataset is version-bound to it.
+
+**Network shape is a decision, not a default:** the micro loop reuses the **D5 8×128 trunk unchanged**. Re-pinning a smaller trunk was considered and rejected — keeping D5 makes the M2.5 throughput number directly transferable to M3 (only board area, plane count and action space differ between micro and full, and those ratios are recorded in the M2.5 throughput report), and the micro board makes the trunk cheap anyway.
+
 ---
 
 ## 6. Engine architecture *(game-generic)*
@@ -264,7 +305,16 @@ The list is a topological order, not a strict serial chain; two branches run off
   - **Network build (D5) — explicit deliverable (new):** the overfit-one-batch test presupposes the whole model, so name it. 8×128 residual trunk; three heads (policy 91 spatial channels, scalar `tanh` value, normalized score-diff aux); the composite loss `l` (§7) with the aux term; SGD-momentum + AMP optimizer; one train step. *(`λ_aux` pinned doc-first in §7: **0.25**; the overfit test consumes it.)*
 
 - **M2.5 — Micro-Blokus:** end-to-end learning on a **reduced Blokus instance** to validate the loop cheaply and as an **early throughput feasibility gate** before the expensive M3 build.
-  - **Reduced config is currently undefined and must be pinned doc-first before M2.5:** none of the full-game golden constants carry over (91 orientations, 46 planes, 13,729 placements, 828 openings, 196-bit board — §5/§6.3). The micro instance needs its own board size / piece subset / start squares, with its orientation table, plane count, and `policy_shape` **derived** from that choice.
+  - **Reduced config — PINNED in §5.3** (was: "currently undefined and must be pinned doc-first before M2.5"). None of the full-game golden constants carry over (91 orientations, 46 planes, 13,729 placements, 828 openings, 196-bit board — §5/§6.3); §5.3 pins the 5×5 / order-≤3 / (1,1)-(3,3) instance and every constant derived from it (9 orientations, `(5,5,9)` head, 159 placements, 42 openings, 12 planes, aux divisor 29, Klein-4 group, its own orientation hash), each independently enumerated before being written down.
+  - **Pre-registered gate protocol (M2.5 task 1).** Both gates below are pass/fail on *persisted* evidence, and every setting that could move after observing results is fixed here, before any run. The micro run config file (`configs/blokus_micro.json`) carries these same scalars and is golden-tested against this section.
+    - **Training protocol:** 2,000 self-play games; **64 sims/move** (fixed — no PCR at M2.5); `k_temp = 4` (D10 sampling ∝ raw N below it, argmax at/after — micro games average ≈ 6.2 plies, so this samples the opening half for replay diversity and plays the placement-critical endgame deterministically); D7 root noise ε = 0.25, α = 10.8/#legal, root-only and self-play-only; batch 32; replay window 3,000 samples (a ring buffer — the window holds ≈ 480 games, so eviction is exercised); pacing **1 learner step per completed game** → 2,000 learner steps; D5 optimizer (SGD momentum 0.9, wd 1e-4) at base LR 0.02 with 200 warmup steps and cosine decay over 2,000; λ_aux = 0.25. Replay ratio lands ≈ 5.2 samples/stored position, above D5's 2–4 — accepted here because the window is micro-scale and D5's ratio is a full-game pin that **M3 enforces properly**. **Run seed = 2500.** The **final** end-of-run checkpoint is the one evaluated.
+    - **Evaluation protocol:** the trained side plays as the **rung-7 agent form** — MCTS with the network supplying both policy priors and value — at **64 eval sims**, with **no Dirichlet noise and deterministic argmax-N move choice**. Opponent: rung 1 (uniform random). **100 mirrored pairs (200 games)** through the M1.6 paired runner with seats swapped, the Blokus start-square opening balancer generalized to the micro start squares, and draws scored 0.5. **Evaluation seed = 97531 — deliberately independent of the run seed**, so the fixed paired set is not coupled to training and changing the training seed leaves the evaluation set unchanged.
+    - **Exit predicates (all three must hold; verdict = PASS iff the conjunction holds):**
+      1. **Win-rate half:** `total_score_a / (2 × n_pairs) ≥ 0.70` against rung 1.
+      2. **Policy-loss half:** `mean(policy_loss over the last 200 recorded learner steps) ≤ 0.70 × mean(policy_loss over the first 200)`.
+      3. **Value-loss half:** `mean(value_loss over the last 200 recorded learner steps) ≤ 0.80 × mean(value_loss over the first 200)`.
+      The loss predicates are **separate** per §12's requirement, are **tail means over pinned step windows** (never a single end-of-run minibatch), and are read from the run record task 6 persists — never recomputed ad hoc. They are stated as *relative* improvement against the same run's head window rather than as absolute nats: the absolute achievable loss on a freshly-pinned game instance is not knowable before the run, and pinning a guessed absolute number is precisely the setting that would move after seeing results. The absolute standard is carried by predicate 1, which a non-learning loop cannot pass; predicates 2–3 establish that the training signal actually descended.
+    - **Throughput go/no-go:** measured on the **RTX 4060 Ti with CUDA + AMP**, batch-1 leaf inference (the known M2.5/M3 configuration — recorded explicitly as the M5 lever, not optimized here). A **dedicated spike run** at the training config above, weights freshly initialized (self-play throughput is weight-independent): **first 50 games are warm-up and excluded**; the measurement interval is the **next 200 games**. Recorded: end-to-end games/hour of the complete loop, sims/sec, net-evals/sec, learner steps/sec, the device, AMP on/off, and the sim count; plus the micro:full ratio table (board area 25:196, planes 12:46, raw actions 225:17,836, mean legal-set size, mean plies/game, and the **measured batch-1 forward-time ratio `r = t_full / t_micro` of the two nets on the same device**). **Mechanical GO predicate:** from the measured micro net-evals/sec `E` and `r`, the projected full-game self-play rate at M3's fixed 128 sims and ≈ 35 plies/game is `games_per_hour_full = 3600 · E / (r · 128 · 35)`; **GO iff `games_per_hour_full ≥ 100`** — the rate at which the 250k-position window (≈ 25k games) fills in ≈ 250 GPU-hours before any M5 optimization. This is a *feasibility floor ahead of batched inference*, deliberately distinct from M5's own numeric throughput target. A **NO-GO routes back to this doc** — sims budget, micro/full config size, or pulling M5 levers forward — before M3 starts.
   - **Correctness safety net (new):** M1's oracle + differential battery is 14×14-specific and does not protect the reduced config — extend the oracle + differential test to be **config-parameterized** so a micro-config legality/scoring bug can't silently corrupt the loop (the §13 top risk, otherwise off the battery).
   - **Falsifiable exit test (new):** "validate the loop" gets a pass condition — micro-config policy/value loss drops below a set threshold **AND** the trained net beats uniform-random at ≥ X% over a fixed paired set (the M1.6 runner mechanism on the micro board). This milestone gates the far more expensive M3, so it must pass/fail objectively.
   - **Throughput spike + go/no-go (new):** measure end-to-end games/GPU-hour on the micro loop and record a go/no-go before committing the full M3 build — throughput is §3's binding constraint and must not be first verified only at M5.

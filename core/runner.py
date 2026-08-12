@@ -143,6 +143,12 @@ class _OpeningRestricted(Game):
     def terminal_utility(self, state, player_id):
         return self._inner.terminal_utility(state, player_id)
 
+    def training_targets(self, state, player_id):
+        # Concrete on the ABC (default = no aux), so an inherited version would
+        # silently *drop* the inner game's declared aux targets rather than
+        # fail — delegate explicitly, like every other member here.
+        return self._inner.training_targets(state, player_id)
+
     # Encoding surface: abstract since M2 (so the wrapper must implement it),
     # and agents may key on it (e.g. Blokus's rung 2 sizes moves via
     # decode_action) — delegate every member unchanged.
