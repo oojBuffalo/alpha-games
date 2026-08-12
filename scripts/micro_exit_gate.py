@@ -21,12 +21,17 @@ Verdict = PASS iff all three hold. Both loss predicates read the *persisted*
 run record task 6 wrote (``core.selfplay.load_run_record``) — never a number
 recomputed here, and never a single end-of-run minibatch.
 
-**Identity is checked before anything is scored.** The run record's and the
-checkpoint's ``(game, game_config, orientation_hash)`` must agree with each
-other and with the hash re-derived from the config (Invariant 4), and the
-record's embedded config must equal the pinned config file. A gate run against
-a mismatched checkpoint exits ``2`` with a diagnostic rather than quietly
-producing a score for the wrong instance.
+**Identity and completeness are checked before anything is scored.** The run
+record's and the checkpoint's ``(game, game_config, orientation_hash)`` must
+agree with each other and with the hash re-derived from the config (Invariant
+4), and the record's embedded config must equal the pinned config file. The
+evidence must also be a *whole* run of that config: the recorded learner steps
+and self-play games must be the complete contiguous sequences the config's
+``training.learner_steps`` / ``training.games`` pin, and the evaluated
+checkpoint must sit at the configured final step. A gate run against a
+mismatched *or* truncated artifact exits ``2`` with a diagnostic rather than
+quietly producing a score for the wrong instance or for a prefix of the pinned
+protocol — partial evidence is "cannot evaluate", never "FAIL".
 
 Exit codes: ``0`` PASS, ``1`` FAIL, ``2`` the gate could not be evaluated.
 
@@ -499,6 +504,119 @@ def expected_identity(cfg: RunConfig) -> dict[str, str]:
     }
 
 
+def _check_contiguous_ids(
+    entries: Sequence[Any], key: str, expected: int, source: str, what: str
+) -> None:
+    """Assert an entry list is exactly ``expected`` entries with ids ``0..expected-1``.
+
+    Both halves matter. The count catches a truncated record; the ids catch a
+    record of the right *length* whose entries were dropped, duplicated or
+    reordered — a run record is a sequence, and only a complete contiguous one
+    is a whole run.
+
+    Args:
+        entries: The record's ``steps`` / ``games`` list.
+        key: The entry field carrying the zero-based id (``"step"`` /
+            ``"game_index"``).
+        expected: The count the pinned config implies.
+        source: Where ``entries`` came from, for the error message.
+        what: Plural noun for the entries, for the error message.
+
+    Raises:
+        ValueError: If the count differs from ``expected``, or the ids are not
+            exactly ``range(expected)`` in order.
+    """
+    if len(entries) != expected:
+        raise ValueError(
+            f"{source}: {len(entries)} recorded {what}, but the run config pins {expected}; "
+            "the gate evaluates a completed run, and partial evidence is not evaluable"
+        )
+    ids = [entry.get(key) if isinstance(entry, dict) else None for entry in entries]
+    want = list(range(expected))
+    if ids != want:
+        first = next(i for i in range(expected) if ids[i] != want[i])
+        raise ValueError(
+            f"{source}: {what} ids are not the contiguous sequence 0..{expected - 1}; "
+            f"entry {first} carries {key}={ids[first]!r}, expected {want[first]} — a gap, a "
+            "duplicate or a reordering means the evidence is not one whole run"
+        )
+
+
+def check_completeness(record: dict[str, Any], cfg: RunConfig, source: str) -> None:
+    """Assert the run record is the *whole* pinned run, not a prefix of one.
+
+    The pinned protocol is a budget as much as a set of thresholds, so the gate
+    checks the persisted budget against the config it was registered under —
+    every expected value below is read from ``cfg`` (i.e. from
+    ``configs/blokus_micro.json``), never restated here, and there is no flag
+    that relaxes it. A record truncated to a few hundred steps still satisfies
+    the disjoint-window guard in :func:`window_means` and would otherwise be
+    *scored*, producing a verdict for a run that never happened.
+
+    Games are read from the record's ``games`` list, which is authoritative: it
+    gets one entry per finished self-play game, carrying the durable
+    ``game_index`` that game's RNG streams were derived from. The final learner
+    step's ``games_played`` counter is then cross-checked against it, so a
+    record cannot carry a full ``games`` list while its learner steps were paced
+    against a shorter run.
+
+    Args:
+        record: The parsed run record.
+        cfg: The run config the record was registered under (already checked
+            equal to the pre-registered file by :func:`run_gate`).
+        source: Where ``record`` came from, for the error messages.
+
+    Raises:
+        ValueError: If the record carries no ``steps``/``games`` list, either
+            list is not the complete contiguous sequence the config pins, or the
+            final step's ``games_played`` disagrees with ``training.games``.
+    """
+    steps = record.get("steps")
+    if not isinstance(steps, list):
+        raise ValueError(f"{source}: run record carries no 'steps' list")
+    _check_contiguous_ids(steps, "step", cfg.training.learner_steps, source, "learner steps")
+
+    games = record.get("games")
+    if not isinstance(games, list):
+        raise ValueError(f"{source}: run record carries no 'games' list")
+    _check_contiguous_ids(games, "game_index", cfg.training.games, source, "self-play games")
+
+    # Reachable only past the checks above, so the last step is a dict.
+    played = steps[-1].get("games_played")
+    if played != cfg.training.games:
+        raise ValueError(
+            f"{source}: the final learner step reports games_played={played!r}, but the run "
+            f"config pins training.games={cfg.training.games}; the loss series was paced "
+            "against a different amount of self-play than the record claims"
+        )
+
+
+def check_final_step(step: Any, cfg: RunConfig, source: str) -> None:
+    """Assert a checkpoint sits at the configured end of the run.
+
+    ``training.checkpoint_selection`` pins ``"final"``, so the evaluated
+    checkpoint is by definition the one written after the last learner step: its
+    step must equal ``training.learner_steps`` exactly. Weights from mid-run are
+    not the weights the persisted loss series describes.
+
+    Args:
+        step: The checkpoint's recorded step (from the run-record entry, or from
+            the checkpoint blob's own ``step`` field).
+        cfg: The run config.
+        source: Where ``step`` came from, for the error message.
+
+    Raises:
+        ValueError: If ``step`` is not the configured final learner step.
+    """
+    expected = cfg.training.learner_steps
+    if step != expected:
+        raise ValueError(
+            f"{source}: checkpoint step is {step!r}, but the run config pins "
+            f"training.learner_steps={expected}; the gate evaluates the end-of-run checkpoint "
+            "of a completed run"
+        )
+
+
 def select_checkpoint(record: dict[str, Any], kind: str, run_dir: Path) -> tuple[Path, dict]:
     """Return the checkpoint the config selects (``training.checkpoint_selection``).
 
@@ -549,9 +667,10 @@ def load_checkpoint(path: Path, cfg: RunConfig, identity: dict[str, str]) -> dic
 
     Raises:
         ValueError: If the schema tag is unknown, the identity disagrees with
-            the config's, or the checkpoint's own run seed / config disagree
-            with the record's — all of which mean the weights did not come from
-            the run whose losses are being scored.
+            the config's, the checkpoint's own run seed / config disagree with
+            the record's — all of which mean the weights did not come from the
+            run whose losses are being scored — or its own ``step`` is not the
+            configured final learner step.
     """
     blob = torch.load(path, map_location="cpu", weights_only=True)
     if blob.get("schema") != CHECKPOINT_SCHEMA:
@@ -570,6 +689,7 @@ def load_checkpoint(path: Path, cfg: RunConfig, identity: dict[str, str]) -> dic
             f"{path}: the checkpoint's embedded config differs from the run record's; "
             "the weights and the loss series come from different protocols"
         )
+    check_final_step(blob.get("step"), cfg, f"checkpoint {path}")
     return blob
 
 
@@ -676,9 +796,9 @@ def run_gate(
 ) -> Verdict:
     """Evaluate the pre-registered gate against a completed run.
 
-    Order matters: identity and protocol are validated **before** a single game
-    is played, so a mismatched checkpoint costs a diagnostic rather than a
-    meaningless score.
+    Order matters: identity, protocol and completeness are validated **before** a
+    single predicate is evaluated or a single game is played, so a mismatched or
+    truncated artifact costs a diagnostic rather than a meaningless score.
 
     Args:
         run_dir: The run directory holding ``run_record.json`` and the
@@ -694,8 +814,9 @@ def run_gate(
         FileNotFoundError: If the run record or the selected checkpoint is
             missing.
         ValueError: If the record's schema/config, the game identity, the
-            evaluation protocol, or the recorded loss series cannot support the
-            pinned gate.
+            evaluation protocol, the persisted step/game counts and ids, the
+            evaluated checkpoint's step, or the recorded loss series cannot
+            support the pinned gate.
     """
     run_path = Path(run_dir)
     record_path = run_path / RUN_RECORD_NAME
@@ -712,7 +833,13 @@ def run_gate(
 
     identity = expected_identity(cfg)
     check_identity(identity, record.get("game_identity", {}), f"run record {record_path}")
+    check_completeness(record, cfg, f"run record {record_path}")
     checkpoint_path, entry = select_checkpoint(record, cfg.training.checkpoint_selection, run_path)
+    check_final_step(
+        entry.get("step"),
+        cfg,
+        f"run record {record_path} {cfg.training.checkpoint_selection!r} entry",
+    )
     blob = load_checkpoint(checkpoint_path, cfg, identity)
 
     # Losses first: they need no GPU, no games, and a truncated record should

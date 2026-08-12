@@ -42,10 +42,22 @@ windows are required to be disjoint, so a truncated record cannot self-compare i
 vacuous ratio of 1.0; a record shorter than head+tail fails loudly (exit 2) instead of
 scoring.
 
-Integrity checks passed before any game was played: run-record schema, the record's
-embedded config against the pre-registered file, the evaluation protocol against the
-pinned agent forms, and game identity re-derived from the config matching both the
-record's and the checkpoint's `(game, game_config, orientation_hash)`.
+Integrity checks passed before any predicate was evaluated and any game was played:
+run-record schema, the record's embedded config against the pre-registered file, the
+evaluation protocol against the pinned agent forms, and game identity re-derived from
+the config matching both the record's and the checkpoint's
+`(game, game_config, orientation_hash)`.
+
+Completeness checks passed in the same pass, against the counts the config pins rather
+than against the windows: 2,000 recorded learner steps with ids exactly `0..1999`,
+2,000 recorded self-play games with indices exactly `0..1999` (cross-checked against
+the final step's `games_played`), and an evaluated `final` checkpoint at step 2,000 in
+both the record entry and the checkpoint file itself. The disjoint-window guard alone
+is a weaker bar — a record truncated to, say, 400 steps clears 200+200 and would be
+*scored* — so the gate refuses anything that is not the whole pinned 2,000-step /
+2,000-game protocol. Every expected value is read from `configs/blokus_micro.json`;
+truncated or partial evidence is could-not-evaluate (exit 2), never FAIL (exit 1),
+because a run that did not happen is not a run that fell short.
 
 ## What this does and does not establish
 

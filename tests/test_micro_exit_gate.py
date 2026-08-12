@@ -13,9 +13,14 @@ Three layers:
    read back through ``core.selfplay.load_run_record``, including both boundary
    directions (a statistic exactly at the pinned bound **passes**) and the
    truncated-record rejection.
-2. **Verdict logic** — all eight pass/fail quadrants of the three-predicate
+2. **Completeness of the evidence** — synthetic records at the *pinned* 2,000
+   step / 2,000 game scale: the complete one is accepted, and a short one, a
+   broken step-id sequence, a short games list or a checkpoint away from the
+   configured final step are each rejected as not-evaluable (exit 2), before any
+   predicate is scored.
+3. **Verdict logic** — all eight pass/fail quadrants of the three-predicate
    conjunction.
-3. **End-to-end smoke** — a tiny real run (CPU, few games, few sims) driven
+4. **End-to-end smoke** — a tiny real run (CPU, few games, few sims) driven
    through the whole gate: identity checks, the paired set, the written verdict
    record, and the process exit code. It asserts the machinery ran, never that
    the gate passed: the thresholds are pre-registered and a tiny run says
@@ -445,6 +450,223 @@ def test_checkpoint_selection_relocates_a_copied_run_but_not_a_missing_one(tmp_p
         GATE.select_checkpoint(gone, "final", tmp_path)
 
 
+# --- completeness of the persisted evidence -------------------------------------
+
+# The loss levels the committed PASS verdict was computed from
+# (docs/bench/m2_5-exit-gate.md): head/tail window means for each component. The
+# synthetic full-scale record below interpolates between them, so the
+# completeness tests run against realistic evidence rather than toy numbers.
+RECORDED_POLICY_LOSS = (1.7778, 1.0050)
+RECORDED_VALUE_LOSS = (0.4225, 0.1335)
+
+
+def full_run_record(
+    cfg: RunConfig,
+    *,
+    steps: int | None = None,
+    games: int | None = None,
+    checkpoint_step: int | None = None,
+) -> dict:
+    """Build a run record for ``cfg`` at the pinned scale, complete unless told otherwise.
+
+    Identity, embedded config and evaluation protocol are the real ones, so the
+    gate's earlier guards all pass and the completeness check is what is under
+    test. The losses fall linearly between the committed head/tail means.
+
+    Args:
+        cfg: The run config the record claims to have run under.
+        steps: Learner steps to record (default: the configured total).
+        games: Self-play games to record (default: the configured total).
+        checkpoint_step: Step of the recorded ``final`` checkpoint (default: the
+            configured final step).
+
+    Returns:
+        The record, as a plain dict ready to be written.
+    """
+    n_steps = cfg.training.learner_steps if steps is None else steps
+    n_games = cfg.training.games if games is None else games
+    total = max(cfg.training.learner_steps - 1, 1)
+    step_entries = []
+    for i in range(n_steps):
+        fraction = min(i, total) / total
+        policy = RECORDED_POLICY_LOSS[0] + fraction * (
+            RECORDED_POLICY_LOSS[1] - RECORDED_POLICY_LOSS[0]
+        )
+        value = RECORDED_VALUE_LOSS[0] + fraction * (
+            RECORDED_VALUE_LOSS[1] - RECORDED_VALUE_LOSS[0]
+        )
+        step_entries.append(
+            {
+                "step": i,
+                "policy_loss": policy,
+                "value_loss": value,
+                "aux_loss": 0.1,
+                "total_loss": policy + value,
+                "learning_rate": 0.02,
+                "window_size": cfg.training.replay_window,
+                "games_played": min(i + 1, n_games),
+            }
+        )
+    return {
+        "schema": RUN_RECORD_SCHEMA,
+        "run_name": cfg.name,
+        "run_seed": cfg.run_seed,
+        "config": cfg.to_dict(),
+        "game_identity": GATE.expected_identity(cfg),
+        "device": "cpu",
+        "steps": step_entries,
+        "games": [
+            {
+                "game_index": i,
+                "plies": 6,
+                "samples": 6,
+                "utilities": [1.0, -1.0],
+                "moves": [0, 1, 2, 3, 4, 5],
+            }
+            for i in range(n_games)
+        ],
+        "checkpoints": [
+            {
+                "step": cfg.training.learner_steps if checkpoint_step is None else checkpoint_step,
+                "kind": "final",
+                "path": "checkpoint_final.pt",
+            }
+        ],
+        "timing": {},
+    }
+
+
+def write_run_dir(tmp_path: Path, record: dict) -> Path:
+    """Write a record into a run directory the gate can be pointed at.
+
+    Args:
+        tmp_path: Parent directory for the run dir.
+        record: The record to write.
+
+    Returns:
+        The run directory.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    (run_dir / GATE.RUN_RECORD_NAME).write_text(json.dumps(record))
+    return run_dir
+
+
+def gate_exit_code(tmp_path: Path, record: dict) -> int:
+    """Write a record into a run dir and run the gate over it against the pinned config.
+
+    Args:
+        tmp_path: Parent directory for the run dir.
+        record: The record to write.
+
+    Returns:
+        The process exit code ``GATE.main`` would return.
+    """
+    run_dir = write_run_dir(tmp_path, record)
+    code = GATE.main(
+        ["--config", str(MICRO_RUN_CONFIG_PATH), "--run-dir", str(run_dir), "--device", "cpu"]
+    )
+    if code == 2:
+        assert not (run_dir / GATE.VERDICT_NAME).exists()
+    return code
+
+
+def test_completeness_accepts_the_committed_2000_by_2000_run():
+    """The real protocol must survive the check: 2,000 steps, 2,000 games, step 2000."""
+    cfg = load_run_config()
+    record = full_run_record(cfg)
+
+    GATE.check_completeness(record, cfg, "record")  # the complete case is quiet
+    GATE.check_final_step(cfg.training.learner_steps, cfg, "checkpoint")
+    assert len(record["steps"]) == cfg.training.learner_steps == 2000
+    assert len(record["games"]) == cfg.training.games == 2000
+
+    # ...and the loss predicates it feeds still PASS at the recorded levels.
+    for name, bound in (
+        ("policy_loss", cfg.loss_predicates.policy_max_ratio),
+        ("value_loss", cfg.loss_predicates.value_max_ratio),
+    ):
+        predicate = GATE.loss_predicate(
+            record,
+            name,
+            cfg.loss_predicates.head_window_steps,
+            cfg.loss_predicates.tail_window_steps,
+            bound,
+        )
+        assert predicate.passed
+
+
+def test_a_record_truncated_to_400_steps_is_not_evaluable(tmp_path):
+    """The reviewer's reproduction: 400 steps clears head+tail (200+200) but is not the run.
+
+    The rejection is matched by *message*, not merely by exit code: before the
+    completeness check existed the gate scored this record and only later tripped
+    over the missing checkpoint, which also exits 2.
+    """
+    cfg = load_run_config()
+    record = full_run_record(cfg, steps=400, games=400)
+    assert len(record["steps"]) >= (
+        cfg.loss_predicates.head_window_steps + cfg.loss_predicates.tail_window_steps
+    )
+
+    with pytest.raises(ValueError, match="400 recorded learner steps"):
+        GATE.check_completeness(record, cfg, "record")
+    run_dir = write_run_dir(tmp_path, record)
+    with pytest.raises(ValueError, match="400 recorded learner steps"):
+        GATE.run_gate(run_dir, config_path=MICRO_RUN_CONFIG_PATH, device="cpu")
+    assert gate_exit_code(tmp_path, record) == 2
+
+
+def test_a_record_of_the_right_length_with_broken_step_ids_is_not_evaluable(tmp_path):
+    """Right count, wrong sequence: a gap or a duplicate is not one whole run."""
+    cfg = load_run_config()
+    gapped = full_run_record(cfg)
+    gapped["steps"][1500]["step"] = 1501  # duplicate id, and a gap at 1500
+    with pytest.raises(ValueError, match="ids are not the contiguous sequence"):
+        GATE.check_completeness(gapped, cfg, "record")
+    assert gate_exit_code(tmp_path, gapped) == 2
+
+    dropped = full_run_record(cfg)
+    del dropped["steps"][7]  # a hole, refilled by appending a duplicate tail step
+    dropped["steps"].append(dict(dropped["steps"][-1]))
+    assert len(dropped["steps"]) == cfg.training.learner_steps
+    with pytest.raises(ValueError, match="ids are not the contiguous sequence"):
+        GATE.check_completeness(dropped, cfg, "record")
+
+
+def test_a_short_or_missing_games_list_is_not_evaluable(tmp_path):
+    """Self-play games are pinned too — the full step count cannot vouch for them."""
+    cfg = load_run_config()
+    short = full_run_record(cfg, games=1200)
+    with pytest.raises(ValueError, match="1200 recorded self-play games"):
+        GATE.check_completeness(short, cfg, "record")
+    assert gate_exit_code(tmp_path, short) == 2
+
+    absent = full_run_record(cfg)
+    del absent["games"]
+    with pytest.raises(ValueError, match="no 'games' list"):
+        GATE.check_completeness(absent, cfg, "record")
+
+
+def test_a_final_step_that_undercounts_the_games_is_not_evaluable():
+    """The cross-check: a full games list cannot rescue steps paced against a shorter run."""
+    cfg = load_run_config()
+    record = full_run_record(cfg)
+    record["steps"][-1]["games_played"] = cfg.training.games - 1
+    with pytest.raises(ValueError, match="games_played"):
+        GATE.check_completeness(record, cfg, "record")
+
+
+def test_a_checkpoint_step_disagreeing_with_the_config_is_not_evaluable(tmp_path):
+    """A mid-run checkpoint is not the weights the persisted loss series describes."""
+    cfg = load_run_config()
+    GATE.check_final_step(cfg.training.learner_steps, cfg, "checkpoint")  # the match is quiet
+    for wrong in (1000, cfg.training.learner_steps - 1, None):
+        with pytest.raises(ValueError, match="checkpoint step is"):
+            GATE.check_final_step(wrong, cfg, "checkpoint")
+    assert gate_exit_code(tmp_path, full_run_record(cfg, checkpoint_step=1000)) == 2
+
+
 def test_gate_and_driver_agree_on_the_artifact_contract():
     """The reader's schema/name constants are pinned to the writer's."""
     assert GATE.CHECKPOINT_SCHEMA == DRIVER.CHECKPOINT_SCHEMA
@@ -652,6 +874,25 @@ def test_gate_rejects_a_checkpoint_from_another_run(tiny_run, tmp_path):
 
     with pytest.raises(ValueError, match="run_seed"):
         GATE.run_gate(target, config_path=config_path, device="cpu")
+
+
+@pytest.mark.slow
+def test_gate_rejects_a_checkpoint_written_before_the_end_of_the_run(tiny_run, tmp_path):
+    """The blob's own step must be the configured final step, not just the record's entry."""
+    cfg, config_path, _ = tiny_run
+    target = copy_run(tiny_run, tmp_path)
+    torch = pytest.importorskip("torch")
+    checkpoint = target / "checkpoint_final.pt"
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    assert blob["step"] == cfg.training.learner_steps
+    blob["step"] = cfg.training.learner_steps - 1
+    torch.save(blob, checkpoint)
+
+    with pytest.raises(ValueError, match="checkpoint step is"):
+        GATE.run_gate(target, config_path=config_path, device="cpu")
+    code = GATE.main(["--config", str(config_path), "--run-dir", str(target), "--device", "cpu"])
+    assert code == 2
+    assert not (target / GATE.VERDICT_NAME).exists()
 
 
 @pytest.mark.slow
