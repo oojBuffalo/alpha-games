@@ -27,17 +27,31 @@ keys, and wrong types; the dataclasses' ``__post_init__`` enforces ranges and
 cross-field coherence, so a config built in Python is checked exactly as
 strictly as one parsed from disk.
 
-``game_config`` is a *name*, resolved through :data:`GAME_CONFIG_REGISTRY` —
-an explicit allow-list of ``(game, name) -> (module, attribute)`` — never
-``eval`` or ``getattr`` on a caller-supplied string. The import is lazy, so
-``core`` stays game-agnostic at import time (nothing in ``core/`` imports
-``games/``); the registry is the one place a new game's instance configs are
-declared to the runner.
+``game``/``game_config`` are *names*, and resolving them is **adapter-declared,
+not core-declared** — this module contains no per-game names at all, so adding a
+game touches only ``games/`` + ``configs/`` (design doc §Repo layout). The
+convention an adapter must satisfy:
+
+* it is a package directory ``games/<game>/`` — ``<game>`` is exactly the run
+  config's ``game`` field;
+* that package exposes a module-level mapping named :data:`GAME_CONFIGS_ATTR`
+  (``GAME_CONFIGS``), from config name to the instance-config object, at its top
+  level (``games/<game>/__init__.py``, typically re-exported from a submodule).
+
+Resolution is then: check ``game`` against :func:`available_games` (the packages
+that actually exist under ``games/``), import that one package, read the fixed
+``GAME_CONFIGS`` attribute, and index it with ``game_config``. Both strings from
+the JSON file are used only as *dict keys or set membership tests* — never
+``eval``, and never ``getattr`` on an arbitrary module — and an unknown game, a
+game that declares nothing, or an unknown config name each raise ``ValueError``
+loudly. The import is lazy (inside the functions), so ``core`` stays
+game-agnostic at import time: nothing in ``core/`` imports ``games/``.
 """
 
 from __future__ import annotations
 
 import json
+import pkgutil
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from importlib import import_module
@@ -51,16 +65,14 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
 # The pinned M2.5 micro-Blokus run config (§12 M2.5).
 MICRO_RUN_CONFIG_PATH = CONFIG_DIR / "blokus_micro.json"
 
-# Allow-list of instance configs a run may name: ``game -> config name ->
-# (module, attribute)``. Adding a game adds an entry here plus its adapter
-# package; the values are module/attribute *literals*, so resolution never
-# reflects on a string that came from the JSON file.
-GAME_CONFIG_REGISTRY: Mapping[str, Mapping[str, tuple[str, str]]] = {
-    "blokus_duo": {
-        "FULL_CONFIG": ("games.blokus_duo.config", "FULL_CONFIG"),
-        "MICRO_CONFIG": ("games.blokus_duo.config", "MICRO_CONFIG"),
-    },
-}
+# The adapter namespace, and the module-level attribute an adapter package
+# exposes to declare the instance configs a run may name. Both are core-side
+# *literals*: a caller-supplied ``game`` is only ever matched against the
+# packages found under ``games/`` and a caller-supplied ``game_config`` is only
+# ever a key into the adapter's own mapping, so no string from a config file
+# reaches ``getattr``/``import_module`` unchecked.
+GAMES_PACKAGE = "games"
+GAME_CONFIGS_ATTR = "GAME_CONFIGS"
 
 # Checkpoint-selection rules the runner knows how to apply. §12 M2.5 pins
 # "the final end-of-run checkpoint is the one evaluated"; a new rule is a
@@ -72,35 +84,87 @@ CHECKPOINT_SELECTIONS = ("final",)
 MOVE_SELECTIONS = ("argmax_n", "sample_n")
 
 
+def available_games() -> tuple[str, ...]:
+    """Return the adapter package names that exist under ``games/``.
+
+    This is the allow-list a caller-supplied ``game`` field is matched against,
+    derived from the filesystem rather than from a hand-maintained list in
+    ``core/`` — dropping a new adapter package into ``games/`` is enough. Private
+    and non-identifier directory names (``__pycache__`` and friends) are skipped.
+
+    Returns:
+        The discovered package names, sorted.
+    """
+    package = import_module(GAMES_PACKAGE)
+    return tuple(
+        sorted(
+            info.name
+            for info in pkgutil.iter_modules(package.__path__)
+            if info.ispkg and info.name.isidentifier() and not info.name.startswith("_")
+        )
+    )
+
+
+def game_configs(game: str) -> Mapping[str, Any]:
+    """Return the named instance configs an adapter package declares.
+
+    Args:
+        game: Adapter package name, e.g. ``"blokus_duo"``. Matched against
+            :func:`available_games`; only a name that survives that check is
+            turned into an import.
+
+    Returns:
+        The adapter's ``GAME_CONFIGS`` mapping, from config name to config
+        object.
+
+    Raises:
+        ValueError: If no ``games/<game>/`` package exists, or the package
+            exposes no module-level ``GAME_CONFIGS``.
+        TypeError: If the adapter's ``GAME_CONFIGS`` is not a mapping.
+    """
+    known = available_games()
+    if game not in known:
+        raise ValueError(f"unknown game {game!r}; available games are {list(known)}")
+    module = import_module(f"{GAMES_PACKAGE}.{game}")
+    declared = getattr(module, GAME_CONFIGS_ATTR, None)
+    if declared is None:
+        raise ValueError(
+            f"game {game!r} declares no named game configs: {GAMES_PACKAGE}.{game} must "
+            f"expose a module-level {GAME_CONFIGS_ATTR} mapping of name -> config object"
+        )
+    if not isinstance(declared, Mapping):
+        raise TypeError(
+            f"{GAMES_PACKAGE}.{game}.{GAME_CONFIGS_ATTR}: expected a mapping, "
+            f"got {type(declared).__name__}"
+        )
+    return declared
+
+
 def resolve_game_config(game: str, game_config: str) -> Any:
     """Resolve a ``(game, game_config)`` name pair to the adapter's config object.
 
     Args:
         game: Adapter package name, e.g. ``"blokus_duo"``.
-        game_config: Registered instance-config name, e.g. ``"MICRO_CONFIG"``.
+        game_config: A name the adapter declares in its ``GAME_CONFIGS``, e.g.
+            ``"MICRO_CONFIG"``.
 
     Returns:
-        The adapter's config object (for Blokus, a
-        ``games.blokus_duo.config.BlokusConfig``).
+        The adapter's config object — the very object the adapter declared, not
+        a copy.
 
     Raises:
-        ValueError: If ``game`` or ``game_config`` is not in
-            :data:`GAME_CONFIG_REGISTRY`.
+        ValueError: If the game is unknown or declares nothing, or if
+            ``game_config`` is not one of the names it declares.
+        TypeError: If the adapter's ``GAME_CONFIGS`` is not a mapping.
     """
+    configs = game_configs(game)
     try:
-        configs = GAME_CONFIG_REGISTRY[game]
-    except KeyError:
-        raise ValueError(
-            f"unknown game {game!r}; registered games are {sorted(GAME_CONFIG_REGISTRY)}"
-        ) from None
-    try:
-        module_name, attribute = configs[game_config]
+        return configs[game_config]
     except KeyError:
         raise ValueError(
             f"unknown game_config {game_config!r} for game {game!r}; "
-            f"registered configs are {sorted(configs)}"
+            f"declared configs are {sorted(configs)}"
         ) from None
-    return getattr(import_module(module_name), attribute)
 
 
 def _check_keys(raw: Mapping[str, Any], expected: Iterable[str], where: str) -> None:
@@ -520,9 +584,9 @@ class RunConfig:
 
     Attributes:
         name: Run name, e.g. ``"blokus_micro"``.
-        game: Adapter package name; a key of :data:`GAME_CONFIG_REGISTRY`.
-        game_config: Registered instance-config name, resolved by
-            :meth:`resolve_game_config`.
+        game: Adapter package name; one of :func:`available_games`.
+        game_config: A name the adapter declares in its ``GAME_CONFIGS``,
+            resolved by :meth:`resolve_game_config`.
         self_play: The shared self-play sub-shape.
         training: Budget, optimizer schedule, replay window.
         evaluation: The fixed paired-evaluation protocol.
@@ -547,16 +611,18 @@ class RunConfig:
     def __post_init__(self) -> None:
         """Validate the top-level fields, including the game-config names.
 
-        The name pair is checked against :data:`GAME_CONFIG_REGISTRY` here (a
-        dict lookup, no import); :meth:`resolve_game_config` performs the lazy
-        import when a caller actually needs the object.
+        The name pair is checked against the adapter's declared ``GAME_CONFIGS``
+        here, so a config naming a nonexistent instance fails at construction
+        rather than at first use. That check imports the named adapter package
+        (lazily, at call time — ``core.runconfig`` itself imports no adapter).
 
         Raises:
             ValueError: If ``name``/``run_dir`` are blank, ``run_seed`` is
-                negative, or ``game``/``game_config`` is not registered.
+                negative, or ``game``/``game_config`` is not declared by an
+                adapter under ``games/``.
             TypeError: If any sub-config is not the expected dataclass — a raw
                 dict from a hand-built call is rejected rather than silently
-                carried.
+                carried — or if the adapter's ``GAME_CONFIGS`` is not a mapping.
         """
         _non_empty(self.name, "name")
         _non_empty(self.run_dir, "run_dir")
@@ -573,26 +639,22 @@ class RunConfig:
                 raise TypeError(
                     f"{field_name}: expected {expected_type.__name__}, got {type(value).__name__}"
                 )
-        if self.game not in GAME_CONFIG_REGISTRY:
-            raise ValueError(
-                f"unknown game {self.game!r}; registered games are {sorted(GAME_CONFIG_REGISTRY)}"
-            )
-        configs = GAME_CONFIG_REGISTRY[self.game]
+        configs = game_configs(self.game)
         if self.game_config not in configs:
             raise ValueError(
                 f"unknown game_config {self.game_config!r} for game {self.game!r}; "
-                f"registered configs are {sorted(configs)}"
+                f"declared configs are {sorted(configs)}"
             )
 
     def resolve_game_config(self) -> Any:
         """Return the adapter config object this run names.
 
         Returns:
-            The adapter's instance config (for Blokus, a ``BlokusConfig``).
+            The adapter's declared instance-config object.
 
         Raises:
-            ValueError: If the name pair is not registered (unreachable for an
-                instance that passed ``__post_init__``).
+            ValueError: If the name pair is not declared by an adapter
+                (unreachable for an instance that passed ``__post_init__``).
         """
         return resolve_game_config(self.game, self.game_config)
 

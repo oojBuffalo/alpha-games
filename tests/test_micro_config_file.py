@@ -17,27 +17,39 @@ Three layers:
    object, and ties ``aux_loss_weight`` to
    ``games.blokus_duo.targets.AUX_LOSS_WEIGHT`` (λ_aux is one number with one
    source of truth, §7).
-3. Loud rejection — unknown keys, wrong types, out-of-range values, and
-   unregistered game-config names all raise rather than silently degrade.
+3. The dependency direction — name resolution is *adapter-declared*: the
+   ``GAME_CONFIGS`` mapping lives in ``games/``, and ``core/runconfig.py``
+   names no game, so adding a game needs zero ``core/`` edits.
+4. Loud rejection — unknown keys, wrong types, out-of-range values, and
+   undeclared game-config names all raise rather than silently degrade.
 """
 
 from __future__ import annotations
 
+import ast
 import copy
+import inspect
 import json
+import textwrap
+from collections.abc import Iterator
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import core.runconfig as runconfig
+import games.blokus_duo as blokus_duo
 from core.runconfig import (
     MICRO_RUN_CONFIG_PATH,
     RunConfig,
     SelfPlayConfig,
+    available_games,
+    game_configs,
     load_run_config,
     resolve_game_config,
 )
-from games.blokus_duo.config import MICRO_CONFIG
+from games.blokus_duo.config import FULL_CONFIG, MICRO_CONFIG
 from games.blokus_duo.targets import AUX_LOSS_WEIGHT
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -263,7 +275,7 @@ def test_aux_loss_weight_has_one_source_of_truth():
 
 
 def test_game_config_resolves_to_the_micro_instance():
-    """The name resolves through the registry to the §5.3 ``BlokusConfig``."""
+    """The name resolves through the adapter's mapping to the §5.3 ``BlokusConfig``."""
     cfg = load_run_config()
     resolved = cfg.resolve_game_config()
     assert resolved is MICRO_CONFIG
@@ -281,10 +293,133 @@ def test_unknown_game_config_names_are_rejected():
     # Names that would be dangerous under a naive getattr.
     with pytest.raises(ValueError, match="unknown game_config"):
         resolve_game_config("blokus_duo", "__loader__")
+    # ...and game names that would be dangerous fed to an unchecked import.
+    for hostile in ("blokus_duo.config", "..core", "os", "games", "", "__init__"):
+        with pytest.raises(ValueError, match="unknown game"):
+            resolve_game_config(hostile, "MICRO_CONFIG")
 
 
 # --------------------------------------------------------------------------
-# 3. Loud rejection of malformed configs.
+# 3. The dependency direction: adapters declare, core resolves by convention.
+# --------------------------------------------------------------------------
+
+# Every game currently in the repo, plus the Blokus instance-config names. None
+# of these may appear in ``core/runconfig.py``'s resolution path.
+GAME_TOKENS = ("blokus", "othello", "tictactoe", "connect4", "micro_config", "full_config")
+
+# The one per-game string ``core/runconfig.py`` is allowed to carry: the default
+# run-config *file* name (§12 M2.5 names the path). It is data about which run to
+# load, not part of resolving a game name to an adapter, and it costs a new game
+# nothing — a new game ships its own ``configs/*.json`` and passes the path.
+ALLOWED_GAME_MENTIONS = {"blokus_micro.json"}
+
+# The functions that turn the JSON ``game``/``game_config`` strings into an
+# adapter object. This is the code that must stay generic.
+RESOLUTION_PATH = (
+    runconfig.available_games,
+    runconfig.game_configs,
+    runconfig.resolve_game_config,
+    RunConfig.__post_init__,
+    RunConfig.resolve_game_config,
+)
+
+
+def _code_strings(source: str) -> Iterator[str]:
+    """Yield every identifier and string literal in ``source``, minus docstrings.
+
+    Comments and docstrings are prose — a Blokus *example* in a docstring is
+    fine, a Blokus *name* in the code is not — so comments (absent from the AST)
+    and docstrings (skipped explicitly) are exempt. What is left is what the code
+    actually does.
+
+    Args:
+        source: Python source text: a whole module, or one dedented definition.
+
+    Yields:
+        Each identifier (names, attributes, imported module names, ...) and each
+        non-docstring string constant, as written.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                docstrings.add(id(first.value))
+    for node in ast.walk(tree):
+        if id(node) in docstrings:
+            continue
+        for _, value in ast.iter_fields(node):
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if isinstance(item, str):
+                    yield item
+
+
+def test_core_runconfig_declares_no_game():
+    """``core/runconfig.py`` carries no per-game name — the repo-layout rule.
+
+    CLAUDE.md: "adding a game touches only ``games/`` + ``configs/``". A registry
+    of ``game -> config name`` literals in ``core/`` would break that; the
+    resolution path instead reads a mapping the adapter declares.
+    """
+    source = (ROOT / "core" / "runconfig.py").read_text()
+    offenders = {
+        text for text in _code_strings(source) if any(t in text.lower() for t in GAME_TOKENS)
+    }
+    assert offenders == ALLOWED_GAME_MENTIONS
+
+
+@pytest.mark.parametrize("function", RESOLUTION_PATH, ids=lambda f: f.__qualname__)
+def test_game_config_resolution_is_generic(function: Any):
+    """No game name appears in the code that resolves ``game``/``game_config``.
+
+    Args:
+        function: One function on the name-resolution path.
+    """
+    offenders = {
+        text
+        for text in _code_strings(inspect.getsource(function))
+        if any(t in text.lower() for t in GAME_TOKENS)
+    }
+    assert offenders == set()
+
+
+def test_adapter_declares_its_own_named_configs():
+    """The mapping core reads is the adapter's own object, exported by the package."""
+    assert game_configs("blokus_duo") is blokus_duo.GAME_CONFIGS
+    assert dict(blokus_duo.GAME_CONFIGS) == {
+        "FULL_CONFIG": FULL_CONFIG,
+        "MICRO_CONFIG": MICRO_CONFIG,
+    }
+    assert resolve_game_config("blokus_duo", "MICRO_CONFIG") is MICRO_CONFIG
+    assert resolve_game_config("blokus_duo", "FULL_CONFIG") is FULL_CONFIG
+
+
+def test_available_games_is_derived_from_the_games_package():
+    """The game allow-list is discovered under ``games/``, not listed in ``core/``."""
+    discovered = available_games()
+    on_disk = sorted(p.name for p in (ROOT / "games").iterdir() if (p / "__init__.py").is_file())
+    assert list(discovered) == on_disk
+    assert "blokus_duo" in discovered
+
+
+def test_game_declaring_no_configs_fails_loudly():
+    """An adapter that declares nothing is an error, not a silent empty set.
+
+    Only the Blokus adapter is config-parameterized today (M2.5); the M0/M1.5
+    reference games have no named instances, and naming one must say so rather
+    than resolve to nothing.
+    """
+    for game in available_games():
+        if hasattr(import_module(f"games.{game}"), "GAME_CONFIGS"):
+            continue
+        with pytest.raises(ValueError, match="declares no named game configs"):
+            resolve_game_config(game, "MICRO_CONFIG")
+
+
+# --------------------------------------------------------------------------
+# 4. Loud rejection of malformed configs.
 # --------------------------------------------------------------------------
 
 

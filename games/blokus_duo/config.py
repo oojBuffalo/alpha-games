@@ -12,6 +12,10 @@ table, action codec, bitboard masks) can be built once per config behind
 eager: a config that names an unknown piece or puts a start square off the board
 raises at construction, never at first move generation.
 
+:data:`GAME_CONFIGS` is this adapter's declaration of which instance configs a
+run config may name; ``core.runconfig`` reads it by convention (re-exported from
+``games.blokus_duo``) instead of holding a per-game registry of its own.
+
 This module deliberately imports only :mod:`games.blokus_duo.pieces` (for the
 known piece names) — every other module in the package imports *it*, so the
 dependency stays acyclic.
@@ -95,3 +99,16 @@ MICRO_CONFIG = BlokusConfig(
     start_squares=((1, 1), (3, 3)),
     piece_names=("I1", "I2", "I3", "V3"),
 )
+
+# The instance configs a run config may name for this adapter, declared *here*
+# rather than in ``core/`` — ``core.runconfig`` resolves ``game_config`` by
+# importing ``games.<game>`` and reading this mapping by convention, so adding a
+# game touches only ``games/`` + ``configs/`` (design doc §Repo layout). Keys are
+# the names that appear in ``configs/*.json``; values are the config objects
+# themselves, so resolution is a dict lookup — never ``eval`` or ``getattr`` on a
+# string from the file. Re-exported from ``games.blokus_duo``, which is where the
+# runner looks.
+GAME_CONFIGS: dict[str, BlokusConfig] = {
+    "FULL_CONFIG": FULL_CONFIG,
+    "MICRO_CONFIG": MICRO_CONFIG,
+}
