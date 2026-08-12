@@ -10,10 +10,11 @@ core never assumes it.
 The engine (oracle or bitboard) is injected so the whole contract battery and
 the differential fuzz can run against either implementation [F8]. Since M2.5 the
 adapter also takes a :class:`~games.blokus_duo.config.BlokusConfig`, defaulting
-to the full 14×14 game: ``policy_shape``, ``input_planes``, ``input_shape`` and
-the ``encode_state`` plane layout are all derived from it (§5.2's plane count is
-a formula, not a constant), so the §5.3 micro instance is a construction
-argument rather than a fork.
+to the full 14×14 game: ``policy_shape``, ``input_planes``, ``input_shape``, the
+``encode_state`` plane layout, the declared ``symmetry_group`` and the D1 aux
+divisor are all derived from it (§5.2's plane count is a formula, not a
+constant; §8's group is the computed start-square stabilizer), so the §5.3 micro
+instance is a construction argument rather than a fork.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from games.blokus_duo.actions import action_codec
 from games.blokus_duo.bitboard import BitboardEngine
 from games.blokus_duo.config import FULL_CONFIG, BlokusConfig
 from games.blokus_duo.pieces import build_pieces
-from games.blokus_duo.symmetry import GROUP_NAMES, full_permutation, plane_transform
+from games.blokus_duo.symmetry import symmetry_group
 from games.blokus_duo.targets import value_target_spec, value_targets
 
 _TO_PLAY, _TERMINAL = 6, 7
@@ -59,6 +60,7 @@ class BlokusDuo(Game):
         self._config = config
         self._engine = engine if engine is not None else BitboardEngine(config)
         self._codec = action_codec(config)
+        self._symmetry = symmetry_group(config)
         self._board_size = config.board_size
         pieces = build_pieces(config)[0]
         self._num_pieces = len(pieces)
@@ -92,19 +94,14 @@ class BlokusDuo(Game):
 
     @property
     def symmetry_group(self) -> Sequence[SymmetryElement]:
-        # Klein four-group (§8, D9): the plane transform over the 46-plane
-        # encode_state output, plus the full 17,836-length head permutation
-        # with identity filler on off-support ids [F6, revised per PR #2
-        # review]. Still full-game-only: per-config symmetry (the D4
-        # set-stabilizer of the instance's start squares, with per-config
-        # (g,a)->a' tables) is M2.5 task 4, so a reduced instance fails loudly
-        # here rather than declaring the wrong group.
-        if self._config != FULL_CONFIG:
-            raise NotImplementedError(
-                "per-config symmetry is not built yet (M2.5 task 4); "
-                f"symmetry_group is full-game-only, got config {self._config}"
-            )
-        return tuple((plane_transform(g), full_permutation(g)) for g in GROUP_NAMES)
+        # The instance's group (§8, D9), *computed* as the D4 set-stabilizer of
+        # this config's start squares — Klein-4 for both pinned instances, but
+        # never hardcoded. Each element pairs the plane transform over the
+        # encode_state output (46 planes full, 12 micro) with the full
+        # H*W*K-length head permutation, identity filler on off-support ids
+        # [F6, revised per PR #2 review].
+        group = self._symmetry
+        return tuple((group.plane_transform(g), group.full_permutation(g)) for g in group.names)
 
     @property
     def value_targets(self) -> ValueTargetSpec:
@@ -147,10 +144,47 @@ class BlokusDuo(Game):
     def is_terminal(self, state: State) -> bool:
         return state[_TERMINAL]
 
-    def terminal_utility(self, state: State, player_id: PlayerId) -> float:
+    def _score_targets(self, state: State, player_id: PlayerId) -> tuple[int, float]:
+        """Return the D1 ``(z, aux)`` pair for a terminal state, mover-relative.
+
+        The single place the adapter turns engine scores into targets — both
+        :meth:`terminal_utility` and :meth:`training_targets` route through it,
+        so the search value and the training value can never disagree.
+
+        Args:
+            state: A terminal state.
+            player_id: The player whose perspective the targets are stated in.
+
+        Returns:
+            ``(z, aux)`` from :func:`~games.blokus_duo.targets.value_targets`,
+            with the aux divisor derived from this instance's config (109 full,
+            29 micro).
+        """
         scores = self._engine.scores(state)
-        z, _ = value_targets(scores[player_id], scores[1 - player_id], self._config)
-        return float(z)
+        return value_targets(scores[player_id], scores[1 - player_id], self._config)
+
+    def terminal_utility(self, state: State, player_id: PlayerId) -> float:
+        return float(self._score_targets(state, player_id)[0])
+
+    def training_targets(
+        self, state: State, player_id: PlayerId
+    ) -> tuple[float, tuple[float, ...]]:
+        """Return ``(z, (score_diff_aux,))`` — the D1 targets the loop stores.
+
+        Overrides the ABC default (which supplies no aux) because Blokus
+        declares one auxiliary head: core cannot derive ``score_diff /
+        max|score_diff|`` from the declared spec's names and weights.
+
+        Args:
+            state: A terminal state.
+            player_id: The player whose perspective the targets are stated in.
+
+        Returns:
+            ``(z, aux)`` with ``z = sign(score_diff)`` and a one-element aux
+            tuple parallel to ``value_targets.aux_names``.
+        """
+        z, aux = self._score_targets(state, player_id)
+        return float(z), (aux,)
 
     # --- encoding surface (action side owned by M1; plane side by M2) ---------------
 

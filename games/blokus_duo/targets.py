@@ -1,7 +1,14 @@
 """D1 value targets: ``z = sign(score_diff)``, aux ``score_diff/max|diff|`` (§4, §10).
 
-Blokus-local by design [F7]: the mapping lives in the adapter package, not on
-the ``Game`` ABC — no core additions for one game's auxiliary head.
+Blokus-local by design [F7, revised at M2.5 task 4]: the *mapping* still lives
+in the adapter package — core never learns what a score difference is. What
+changed is that the ABC now carries a generic ``training_targets(state,
+player_id) -> (z, aux)`` surface (§6.1's declared-adapter pattern, alongside
+``value_targets`` and ``symmetry_group``) that a game-agnostic self-play loop
+calls to materialize both targets without game imports; :class:`BlokusDuo`
+overrides it by delegating straight to :func:`value_targets` below. The
+original note's intent — "no core additions for one game's auxiliary head" —
+holds: the addition is a declared surface, not Blokus's head in core.
 
 The aux divisor is a *derived* per-instance bound, not a constant: the full game
 pins it at 109 (a player at −89 against one at +20) and the §5.3 micro instance

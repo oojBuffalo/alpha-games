@@ -145,6 +145,49 @@ class Game(ABC):
         per-player utility vector.
         """
 
+    def training_targets(
+        self, state: State, player_id: PlayerId
+    ) -> tuple[float, tuple[float, ...]]:
+        """Return the terminal training targets ``(z, aux)`` for ``player_id``.
+
+        The generic terminal-target surface a game-agnostic self-play loop
+        consumes (M2.5 task 4; supersedes the "no core additions" note in
+        ``games/blokus_duo/targets.py``). It is a *declared* adapter surface in
+        the §6.1 pattern — the same shape as ``value_targets``, ``symmetry_group``
+        and the encoding methods — not one game's head leaking into core: core
+        cannot materialize an aux value itself, because ``ValueTargetSpec``
+        carries head names and loss weights but no mapping from a terminal state
+        to a number (Blokus's ``score_diff / max|diff|`` lives in its adapter).
+
+        Both components are **mover-relative**, i.e. stated from ``player_id``'s
+        perspective, exactly like :meth:`terminal_utility`. The default is the
+        no-aux case — the primary ``z`` is the terminal utility and the aux tuple
+        is empty — so adapters declaring no auxiliary heads (TTT, Connect 4,
+        Othello) need no override, while an adapter that declares aux heads and
+        forgets to override fails loudly here instead of silently training
+        against missing targets.
+
+        Args:
+            state: A terminal state.
+            player_id: The player whose perspective the targets are stated in.
+
+        Returns:
+            ``(z, aux)``: the primary scalar target and one value per declared
+            entry of ``value_targets.aux_names``, in head order.
+
+        Raises:
+            NotImplementedError: If the game declares auxiliary heads but does
+                not override this method — the default cannot produce them.
+        """
+        aux: tuple[float, ...] = ()
+        declared = self.value_targets.aux_names
+        if len(aux) != len(declared):
+            raise NotImplementedError(
+                f"{type(self).__name__} declares aux heads {declared} but does not "
+                f"override training_targets; the default supplies the primary z only"
+            )
+        return self.terminal_utility(state, player_id), aux
+
     # --- encoding surface (abstract since M2, per the M0 seam note) --------------
     # M0 declared these as concrete NotImplementedError stubs (no network → no
     # tensors); with the network landed, every game entering the training stack

@@ -179,10 +179,45 @@ def test_micro_initial_position():
 
 
 def test_micro_config_is_not_wired_into_the_full_game_symmetry_surface():
-    # Per-config symmetry lands in M2.5 task 4; until then the micro adapter
-    # must refuse rather than declare the full game's 17,836-length group.
-    with pytest.raises(NotImplementedError):
-        _ = BlokusDuo(config=MICRO_CONFIG).symmetry_group
+    # Per-config symmetry landed in M2.5 task 4 (the task-2 NotImplementedError
+    # guard this test used to assert is gone): the micro adapter now declares a
+    # real group, and every part of it must live in the *micro* action space.
+    # A group silently routed through the full game's tables would carry
+    # 17,836-long permutations and 14×14 plane transforms — both index-error or
+    # mis-augment the first time a micro sample reached core/augment.py.
+    #
+    # The group is computed, never hardcoded (§8, invariant 4). Recomputed here
+    # from D4 independently of symmetry.py: the set-stabilizer of the micro
+    # start squares {(1,1), (3,3)} on a 5×5 board is Klein-4 — the 90° classes
+    # send (1,1) to (1,3) or (3,1), off the pair.
+    last = MICRO_CONFIG.board_size - 1
+    d4 = {
+        "identity": lambda r, c: (r, c),
+        "rot90": lambda r, c: (c, last - r),
+        "rot180": lambda r, c: (last - r, last - c),
+        "rot270": lambda r, c: (last - c, r),
+        "diag": lambda r, c: (c, r),
+        "antidiag": lambda r, c: (last - c, last - r),
+        "flipv": lambda r, c: (last - r, c),
+        "fliph": lambda r, c: (r, last - c),
+    }
+    starts = set(MICRO_CONFIG.start_squares)
+    stabilizer = {g for g, m in d4.items() if {m(*sq) for sq in starts} == starts}
+    assert stabilizer == {"identity", "rot180", "diag", "antidiag"}  # Klein-4
+
+    game = BlokusDuo(config=MICRO_CONFIG)
+    group = game.symmetry_group
+    assert len(group) == len(stabilizer) == 4
+    in_bounds = set(MICRO_CODEC.in_bounds_actions)
+    planes = game.encode_state(game.initial_state())
+    for plane_transform, perm in group:
+        assert len(perm) == MICRO_CODEC.num_actions == 225  # not the full 17,836
+        assert {perm[a] for a in in_bounds} == in_bounds  # closed on micro placements
+        assert len(plane_transform(planes)) == game.input_planes == 12  # not 46
+
+    # The full game's surface is unchanged by the parameterization — the two
+    # instances declare genuinely different action spaces, not a shared one.
+    assert len(BlokusDuo().symmetry_group[0][1]) == 17_836
 
 
 def test_mismatched_engine_and_config_fail_loudly():
