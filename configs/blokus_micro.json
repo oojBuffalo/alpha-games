@@ -1,0 +1,61 @@
+{
+  "_doc": "M2.5 micro-Blokus run config. Every scalar here is pinned doc-first in metadocs/blokus-duo-az-design-v0_5.md - the game instance in section 5.3, the gate protocol in section 12 (M2.5). tests/test_micro_config_file.py golden-checks this file against those pins; change the doc first, never this file alone.",
+
+  "name": "blokus_micro",
+  "game": "blokus_duo",
+  "game_config": "MICRO_CONFIG",
+
+  "self_play": {
+    "_doc": "The shared core.selfplay.SelfPlayConfig sub-shape. M3's RunConfig composes this same object; the sim count stays a config field (M3's fixed-128 assertion lives in its actor layer, not here).",
+    "sims": 64,
+    "k_temp": 4,
+    "dirichlet_eps": 0.25,
+    "dirichlet_alpha_numerator": 10.8,
+    "root_noise": true
+  },
+
+  "training": {
+    "games": 2000,
+    "learner_steps": 2000,
+    "steps_per_game": 1,
+    "batch_size": 32,
+    "replay_window": 3000,
+    "learning_rate": 0.02,
+    "warmup_steps": 200,
+    "cosine_total_steps": 2000,
+    "aux_loss_weight": 0.25,
+    "checkpoint_selection": "final"
+  },
+
+  "evaluation": {
+    "_doc": "Evaluation seed is deliberately independent of the run seed: the fixed paired set must not be coupled to training.",
+    "agent_form": "rung7_mcts_policy_value",
+    "sims": 64,
+    "root_noise": false,
+    "move_selection": "argmax_n",
+    "opponent": "rung1_uniform_random",
+    "n_pairs": 100,
+    "eval_seed": 97531,
+    "min_score_rate": 0.7
+  },
+
+  "loss_predicates": {
+    "_doc": "Separate policy and value predicates, each a tail mean over a pinned step window compared against the same run's head window. Read from the persisted run record, never recomputed ad hoc.",
+    "head_window_steps": 200,
+    "tail_window_steps": 200,
+    "policy_max_ratio": 0.7,
+    "value_max_ratio": 0.8
+  },
+
+  "throughput": {
+    "_doc": "Dedicated spike run; the official verdict requires the RTX 4060 Ti with CUDA + AMP. GO iff projected full-game games/hour at M3's fixed 128 sims and 35 plies/game reaches the floor.",
+    "warmup_games": 50,
+    "measure_games": 200,
+    "projection_sims": 128,
+    "projection_plies_per_game": 35,
+    "min_projected_games_per_hour": 100
+  },
+
+  "run_seed": 2500,
+  "run_dir": "runs/blokus_micro"
+}
