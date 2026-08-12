@@ -72,6 +72,24 @@ labelled **UNOFFICIAL / PROVISIONAL** in every line it emits, and returns a
 distinct exit code that is not a verdict at all. CI never runs either path (the
 test battery exercises the arithmetic and the gates, never the spike).
 
+**AMP is measured, not asserted.** §12 M2.5 pins "CUDA + AMP" and lists AMP
+on/off among the recorded evidence, so both timed paths — the batch-1 forwards
+behind ``r`` (both nets identically, or the ratio is not apples-to-apples) and
+every self-play leaf evaluation — run inside the run's single
+``run_micro.AmpMode`` context, inference-only (``torch.inference_mode`` +
+autocast, no ``GradScaler``). The reported flag is then read back out of
+:attr:`ForwardRatio.amp` and :attr:`SpikeResult.amp`, both *observed* from
+inside those contexts, and the two must agree — nothing recomputes
+``device.type == "cuda"`` for the header, so the report cannot claim a
+precision the measurement did not use.
+
+**Persistence.** §12 M2.5 gates on *persisted* evidence, so an official run
+writes the report whether or not ``--out`` is given: without it the report goes
+to the canonical artifact (:data:`CANONICAL_OUT`) and the path is announced on
+stdout. An unofficial run without ``--out`` writes nothing — a provisional
+number is not evidence, and must not overwrite the committed artifact by
+default.
+
 Exit codes::
 
     0  official run, GO
@@ -80,10 +98,11 @@ Exit codes::
 
 Usage::
 
-    # The signed verdict, on the 4060 Ti box:
-    python3 scripts/bench_micro_throughput.py --out docs/bench/m2_5-throughput-gate.md
+    # The signed verdict, on the 4060 Ti box (persists to CANONICAL_OUT):
+    python3 scripts/bench_micro_throughput.py
 
-    # A provisional smoke anywhere else (clearly labelled, never a verdict):
+    # A provisional smoke anywhere else (clearly labelled, never a verdict);
+    # --out is required for it to persist anything:
     python3 scripts/bench_micro_throughput.py --allow-unverified-hardware \\
         --out docs/bench/m2_5-throughput-gate.md
 """
@@ -104,10 +123,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ``run_micro`` (sibling script, on sys.path above): the spike times *the*
-# learner step, not a copy of it — any drift between a re-implementation here
-# and the real loop would silently change the measured number, which is the one
-# thing this script exists to get right.
-from run_micro import _learner_step, build_game, game_identity  # noqa: E402
+# learner step and *the* AMP policy, not copies of them — any drift between a
+# re-implementation here and the real loop would silently change the measured
+# number, which is the one thing this script exists to get right.
+from run_micro import AmpMode, _learner_step, amp_evaluator, build_game, game_identity  # noqa: E402
 
 from core.game import Game, State  # noqa: E402
 from core.mcts import Evaluator  # noqa: E402
@@ -125,7 +144,10 @@ from games.blokus_duo.config import FULL_CONFIG  # noqa: E402
 CANONICAL_GPU_SUBSTRING = "4060 Ti"
 CANONICAL_MIN_VRAM_GIB = 15.0
 
-# The committed artifact's path (the M2 report's docs/bench/ convention).
+# The repo root, and the committed artifact's path relative to it (the M2
+# report's docs/bench/ convention). An official run with no ``--out`` writes
+# there: §12 M2.5 gates on persisted evidence.
+ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_OUT = "docs/bench/m2_5-throughput-gate.md"
 
 EXIT_GO = 0
@@ -146,6 +168,8 @@ class SpikeResult:
         net_evals: Leaf network evaluations counted by the wrapping evaluator.
         learner_steps: Learner steps taken inside the interval.
         legal_at_eval: Legal-set sizes seen at evaluated leaves, summed.
+        amp_evals: Of those evaluations, how many ran with autocast **observed**
+            live — the measured half of the report's AMP flag.
         wall_seconds: End-to-end wall clock of the interval (self-play + learner).
         self_play_seconds: Self-play share of ``wall_seconds``.
         train_seconds: Learner share of ``wall_seconds``.
@@ -157,6 +181,7 @@ class SpikeResult:
     net_evals: int
     learner_steps: int
     legal_at_eval: int
+    amp_evals: int
     wall_seconds: float
     self_play_seconds: float
     train_seconds: float
@@ -201,6 +226,27 @@ class SpikeResult:
         """Mean legal-set size at evaluated leaves."""
         return self.legal_at_eval / self.net_evals
 
+    @property
+    def amp(self) -> bool:
+        """Whether AMP was live at **every** leaf evaluation, as observed.
+
+        Returns:
+            True iff autocast was observed live at all ``net_evals``
+            evaluations (and there was at least one).
+
+        Raises:
+            ValueError: If autocast covered only *part* of the interval. That
+                is a wiring bug — half the measurement would then be FP32 while
+                the report states a single precision — and it must not be
+                reported as either "on" or "off".
+        """
+        if self.amp_evals not in (0, self.net_evals):
+            raise ValueError(
+                f"autocast was live for {self.amp_evals} of {self.net_evals} leaf "
+                "evaluations; the reported AMP flag must describe the whole interval"
+            )
+        return self.net_evals > 0 and self.amp_evals == self.net_evals
+
 
 @dataclass(frozen=True)
 class ForwardRatio:
@@ -210,11 +256,15 @@ class ForwardRatio:
         micro_ms: Median batch-1 forward time of the micro net, ms.
         full_ms: Median batch-1 forward time of the full 14×14 net, ms.
         trials: Timed forwards per net (after warm-up).
+        amp: Whether autocast was **observed** live inside the timed forwards —
+            identically for both nets, or the ratio would not be
+            apples-to-apples (:func:`measure_forward_ratio` refuses otherwise).
     """
 
     micro_ms: float
     full_ms: float
     trials: int
+    amp: bool
 
     @property
     def ratio(self) -> float:
@@ -274,7 +324,9 @@ class RunMeta:
         device: The torch device the spike ran on.
         device_name: Human-readable device name (GPU model, or the CPU/MPS tag).
         device_memory_gib: Device memory in GiB, or ``None`` off CUDA.
-        amp: Whether AMP was live (it is an exact no-op off CUDA).
+        amp: Whether AMP was live — :func:`observed_amp`'s reconciliation of
+            what the timed forwards and the leaf evaluations actually ran
+            under, never a re-derivation from the device.
         torch_version: ``torch.__version__``.
         cuda_version: ``torch.version.cuda``, or ``"n/a"``.
         config_path: The run config the scalars came from.
@@ -332,11 +384,33 @@ def display_path(path: Path) -> str:
         repo root, otherwise its absolute form.
     """
     resolved = Path(path).resolve()
-    root = Path(__file__).resolve().parents[1]
     try:
-        return resolved.relative_to(root).as_posix()
+        return resolved.relative_to(Path(ROOT).resolve()).as_posix()
     except ValueError:
         return str(resolved)
+
+
+def resolve_out_path(out: Path | None, official: bool) -> Path | None:
+    """Decide where — if anywhere — the report is persisted.
+
+    §12 M2.5's gates are "pass/fail on *persisted* evidence", so an **official**
+    verdict may never be emitted with nothing left behind: without ``--out`` it
+    defaults to the committed artifact :data:`CANONICAL_OUT`. An **unofficial**
+    run defaults to writing nothing — a provisional number is not evidence, and
+    silently overwriting the committed artifact with one would be worse than
+    printing it to stdout alone (``--out`` remains available to do so
+    deliberately, which is how the provisional report is regenerated).
+
+    Args:
+        out: The ``--out`` path, or ``None``.
+        official: Whether this run may sign a verdict.
+
+    Returns:
+        The path to write, or ``None`` for an unofficial run without ``--out``.
+    """
+    if out is not None:
+        return out
+    return Path(ROOT) / CANONICAL_OUT if official else None
 
 
 def is_canonical_hardware(gpu_name: str, total_memory_bytes: int) -> bool:
@@ -395,22 +469,31 @@ def require_official_hardware(allow_unverified: bool) -> tuple[bool, torch.devic
     )
 
 
-def counting_evaluator(evaluator: Evaluator) -> tuple[Evaluator, list[int]]:
-    """Wrap an evaluator so leaf evaluations and legal-set sizes are counted.
+def counting_evaluator(evaluator: Evaluator, amp: AmpMode) -> tuple[Evaluator, list[int]]:
+    """Wrap an evaluator so leaf evaluations, legal sets and AMP are counted.
 
     The spike's whole instrumentation trick: counters live in this wrapper, so
     ``core/mcts.py`` needs no change. M3's observability task formalizes the
     same counters in ``core/metrics.py``; these are deliberately script-local
     and do not satisfy it.
 
+    The third counter is the AMP measurement: it asks torch, per evaluation,
+    whether autocast is live *at that moment*. For it to see anything, this
+    wrapper must sit **inside** ``run_micro.amp_evaluator``'s context — which
+    is exactly how :func:`run_spike` composes them, and why the report's AMP
+    flag describes the forwards that ran rather than the device they ran on.
+
     Args:
         evaluator: The evaluator to wrap (``core.network.make_network_evaluator``).
+        amp: The run's resolved AMP mode; queried, never used to open a context
+            here (opening one here would make the counter self-fulfilling).
 
     Returns:
-        ``(wrapped, counters)`` where ``counters`` is the mutable pair
-        ``[evaluations, summed_legal_set_size]``, read after the run.
+        ``(wrapped, counters)`` where ``counters`` is the mutable triple
+        ``[evaluations, summed_legal_set_size, evaluations_under_live_autocast]``,
+        read after the run.
     """
-    counters = [0, 0]
+    counters = [0, 0, 0]
 
     def counted(game: Game, state: State) -> tuple[float, dict[int, float] | None]:
         """Evaluate one leaf, incrementing the spike's counters.
@@ -422,12 +505,42 @@ def counting_evaluator(evaluator: Evaluator) -> tuple[Evaluator, list[int]]:
         Returns:
             The wrapped evaluator's ``(value, priors)`` result, unmodified.
         """
+        live = amp.observed()
         value, priors = evaluator(game, state)
         counters[0] += 1
         counters[1] += 0 if priors is None else len(priors)
+        counters[2] += 1 if live else 0
         return value, priors
 
     return counted, counters
+
+
+def observed_amp(ratio: ForwardRatio, spike: SpikeResult) -> bool:
+    """Reconcile the two measured AMP observations into the reported flag.
+
+    The single value the report states, and the only one it may state: both
+    timed paths must have run at the same precision, or "AMP on/off" describes
+    neither of them.
+
+    Args:
+        ratio: The forward-ratio measurement, carrying its observed flag.
+        spike: The self-play measurement, carrying its observed flag.
+
+    Returns:
+        The AMP setting both paths actually ran under.
+
+    Raises:
+        ValueError: If the two disagree (or, via :attr:`SpikeResult.amp`, if
+            autocast covered only part of the measurement interval).
+    """
+    if ratio.amp != spike.amp:
+        raise ValueError(
+            f"AMP observations disagree: timed forwards ran with autocast "
+            f"{'on' if ratio.amp else 'off'} but leaf evaluations with autocast "
+            f"{'on' if spike.amp else 'off'}; the projection combines both, so one "
+            "reported flag cannot describe them"
+        )
+    return ratio.amp
 
 
 def playout_stats(game: Game, seed: int, playouts: int) -> PlayoutStats:
@@ -470,7 +583,7 @@ def playout_stats(game: Game, seed: int, playouts: int) -> PlayoutStats:
 
 
 def measure_forward_ratio(
-    micro: Game, full: Game, device: torch.device, trials: int, warmup: int
+    micro: Game, full: Game, device: torch.device, trials: int, warmup: int, amp: AmpMode
 ) -> ForwardRatio:
     """Time batch-1 forwards of the micro and full nets on the same device.
 
@@ -478,9 +591,12 @@ def measure_forward_ratio(
     exactly this ratio transfers); only the input planes, board area and policy
     head differ. Weights are irrelevant to timing, so both are freshly
     initialized. Median of ``trials`` timed forwards under
-    ``torch.inference_mode`` after ``warmup`` untimed ones, with a CUDA
-    synchronize bracketing each timed forward so the number is not an async
-    launch time.
+    ``torch.inference_mode`` **and** the run's autocast context — the same
+    precision self-play runs at, and identically for both nets, since ``r`` is
+    only meaningful as an apples-to-apples ratio — after ``warmup`` untimed
+    ones, with a CUDA synchronize bracketing each timed forward so the number
+    is not an async launch time. Whether autocast was live is read back out of
+    the context rather than assumed.
 
     Args:
         micro: The micro-Blokus adapter.
@@ -488,24 +604,27 @@ def measure_forward_ratio(
         device: The device both nets are timed on.
         trials: Timed forwards per net.
         warmup: Untimed forwards per net.
+        amp: The run's resolved AMP mode; opens the context and is observed
+            inside it.
 
     Returns:
-        The measured :class:`ForwardRatio`.
+        The measured :class:`ForwardRatio`, its ``amp`` field observed.
 
     Raises:
-        ValueError: If ``trials`` is not positive or ``warmup`` is negative.
+        ValueError: If ``trials`` is not positive, ``warmup`` is negative, or
+            the two nets somehow did not run at the same precision.
     """
     if trials < 1:
         raise ValueError(f"trials must be positive, got {trials}")
     if warmup < 0:
         raise ValueError(f"warmup must be non-negative, got {warmup}")
 
-    def median_ms(game: Game) -> float:
-        """Median batch-1 forward time of ``game``'s net, in ms."""
+    def median_ms(game: Game) -> tuple[float, bool]:
+        """Median batch-1 forward time of ``game``'s net in ms, and the live AMP state."""
         net = Network(NetworkConfig.from_game(game)).to(device).eval()
         planes = torch.zeros(1, game.input_planes, *game.input_shape, device=device)
         times: list[float] = []
-        with torch.inference_mode():
+        with torch.inference_mode(), amp.autocast():
             for _ in range(warmup):
                 net(planes)
             if device.type == "cuda":
@@ -516,9 +635,19 @@ def measure_forward_ratio(
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 times.append((time.perf_counter() - mark) * 1000.0)
-        return statistics.median(times)
+            # Read outside the timed brackets, inside the context that ran them.
+            live = amp.observed()
+        return statistics.median(times), live
 
-    return ForwardRatio(micro_ms=median_ms(micro), full_ms=median_ms(full), trials=trials)
+    micro_ms, micro_amp = median_ms(micro)
+    full_ms, full_amp = median_ms(full)
+    if micro_amp != full_amp:
+        raise ValueError(
+            f"r must be apples-to-apples: micro net timed with autocast "
+            f"{'on' if micro_amp else 'off'}, full net with autocast "
+            f"{'on' if full_amp else 'off'}"
+        )
+    return ForwardRatio(micro_ms=micro_ms, full_ms=full_ms, trials=trials, amp=micro_amp)
 
 
 def run_spike(
@@ -527,6 +656,7 @@ def run_spike(
     device: torch.device,
     warmup_games: int,
     measure_games: int,
+    amp: AmpMode,
     verbose: bool = True,
 ) -> SpikeResult:
     """Run the dedicated spike and return the measurement interval's counters.
@@ -548,6 +678,10 @@ def run_spike(
         device: Device the net and learner run on.
         warmup_games: Leading games excluded from the measurement.
         measure_games: Games in the measurement interval.
+        amp: The run's resolved AMP mode. Leaf inference runs inside it (the
+            learner step already reads the same setting off the batch's device
+            inside ``core.train``), and the counting wrapper sits inside that
+            context so the result carries an *observed* AMP flag.
         verbose: Print progress lines to stderr.
 
     Returns:
@@ -571,7 +705,7 @@ def run_spike(
         device=str(device),
     )
 
-    plies = net_evals = legal = measured_steps = 0
+    plies = net_evals = legal = amp_evals = measured_steps = 0
     self_play_seconds = train_seconds = 0.0
     started = 0.0
     # The learner-step index is monotonic across warm-up and measurement — it
@@ -582,14 +716,18 @@ def run_spike(
         measuring = index >= warmup_games
         if index == warmup_games:
             # Discard everything the warm-up accumulated, then start the clock.
-            plies = net_evals = legal = measured_steps = 0
+            plies = net_evals = legal = amp_evals = measured_steps = 0
             self_play_seconds = train_seconds = 0.0
             started = time.perf_counter()
 
         net.eval()
-        evaluator, counters = counting_evaluator(
-            make_network_evaluator(net, game, device=str(device))
+        # Composition order is load-bearing: amp_evaluator opens the context,
+        # counting_evaluator observes it from inside, the network evaluator
+        # runs the forward under it.
+        counted, counters = counting_evaluator(
+            make_network_evaluator(net, game, device=str(device)), amp
         )
+        evaluator = amp_evaluator(counted, amp)
         mark = time.perf_counter()
         result = play_game(game, evaluator, cfg.self_play, GameRNGs.for_game(cfg.run_seed, index))
         elapsed = time.perf_counter() - mark
@@ -618,6 +756,7 @@ def run_spike(
             plies += result.plies
             net_evals += counters[0]
             legal += counters[1]
+            amp_evals += counters[2]
             measured_steps += cfg.training.steps_per_game
             self_play_seconds += elapsed
             train_seconds += train_elapsed
@@ -637,6 +776,7 @@ def run_spike(
         net_evals=net_evals,
         learner_steps=measured_steps,
         legal_at_eval=legal,
+        amp_evals=amp_evals,
         wall_seconds=time.perf_counter() - started,
         self_play_seconds=self_play_seconds,
         train_seconds=train_seconds,
@@ -877,13 +1017,18 @@ def build_report(
             "```",
         ]
     )
+    amp_note = (
+        "AMP **on** — autocast observed live inside the timed batch-1 forwards and at"
+        " every leaf evaluation"
+        if meta.amp
+        else "AMP **off** (an exact no-op off CUDA) — observed, not assumed"
+    )
     lines = [
         title,
         "",
         *intro,
         "",
-        f"- **Device:** {meta.device_name}{memory} (`{meta.device}`), AMP "
-        f"{'on' if meta.amp else 'off (no-op off CUDA)'}",
+        f"- **Device:** {meta.device_name}{memory} (`{meta.device}`), {amp_note}",
         f"- **torch:** {meta.torch_version} (CUDA {meta.cuda_version})",
         f"- **Date:** {meta.date}",
         f"- **Config:** `{meta.config_path}` — run_seed {meta.run_seed}, fresh weights"
@@ -1076,7 +1221,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         type=Path,
         default=None,
-        help=f"also write the report here (the committed artifact is {CANONICAL_OUT})",
+        help="write the report here; an official run without it persists to the committed"
+        f" artifact {CANONICAL_OUT} (§12 M2.5 gates on persisted evidence), while an"
+        " unofficial run without it writes nothing",
     )
     parser.add_argument(
         "--allow-unverified-hardware",
@@ -1129,6 +1276,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Run the spike, project, and emit the report and the mechanical verdict.
 
+    AMP is resolved once (:class:`~run_micro.AmpMode`) and that one value opens
+    every autocast context; the header's AMP flag comes back out of the two
+    measurements via :func:`observed_amp`, never from the device. An official
+    run always persists its report (:func:`resolve_out_path`).
+
     Args:
         argv: Argument list, or ``None`` for ``sys.argv``.
 
@@ -1138,6 +1290,8 @@ def main(argv: list[str] | None = None) -> int:
     Raises:
         SystemExit: From :func:`require_official_hardware` when the hardware is
             not the pinned 4060 Ti 16 GB and the opt-in flag is absent.
+        ValueError: From :func:`observed_amp` if the timed forwards and the
+            leaf evaluations did not run at the same precision.
     """
     args = parse_args(argv)
     official, device = require_official_hardware(args.allow_unverified_hardware)
@@ -1151,7 +1305,12 @@ def main(argv: list[str] | None = None) -> int:
 
     micro = build_game(cfg)
     full = BlokusDuo(config=FULL_CONFIG)
-    ratio = measure_forward_ratio(micro, full, device, args.forward_trials, args.forward_warmup)
+    # Resolved once, here: the same object opens every autocast context below
+    # and supplies (via the observations it enables) the reported AMP flag.
+    amp = AmpMode.resolve(device)
+    ratio = measure_forward_ratio(
+        micro, full, device, args.forward_trials, args.forward_warmup, amp
+    )
     print(
         f"[spike] batch-1 forward: micro {ratio.micro_ms:.3f} ms, full {ratio.full_ms:.3f} ms,"
         f" r = {ratio.ratio:.3f}",
@@ -1160,7 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     micro_stats = playout_stats(micro, cfg.run_seed, args.playouts)
     full_stats = playout_stats(full, cfg.run_seed, args.playouts)
-    spike = run_spike(cfg, micro, device, warmup_games, measure_games, verbose=not args.quiet)
+    spike = run_spike(cfg, micro, device, warmup_games, measure_games, amp, verbose=not args.quiet)
     projection = make_projection(spike, ratio, cfg)
 
     meta = RunMeta(
@@ -1174,7 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
             if device.type == "cuda"
             else None
         ),
-        amp=device.type == "cuda",
+        amp=observed_amp(ratio, spike),
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "n/a",
         config_path=display_path(args.config),
@@ -1190,10 +1349,18 @@ def main(argv: list[str] | None = None) -> int:
         meta, spike, ratio, projection, ratio_rows(micro, full, micro_stats, full_stats, ratio)
     )
     print(report, end="")
-    if args.out is not None:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(report)
-        print(f"[spike] wrote {args.out}", file=sys.stderr)
+    out_path = resolve_out_path(args.out, official)
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report)
+        if args.out is None:
+            # Loud, on stdout: an official verdict that left no artifact behind
+            # would not be gate evidence, so say where the evidence went.
+            print(
+                f"[spike] no --out given on an official run: the gate evidence was written"
+                f" to {display_path(out_path)} (§12 M2.5 gates on persisted evidence)."
+            )
+        print(f"[spike] wrote {out_path}", file=sys.stderr)
     return verdict_exit_code(projection, official)
 
 

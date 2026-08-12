@@ -13,6 +13,14 @@ per sample (uniform over the adapter's *declared* group, so the micro instance's
 Klein-4 arrives from ``games/`` and not from a constant here), collating, and
 taking one D5 AMP train step (AMP is a no-op off CUDA, so this runs on CPU).
 
+**Both halves run at the same precision.** :class:`AmpMode` resolves AMP once
+per run and drives *both* the learner step's autocast (via ``core.train``'s
+device-derived setting) and the self-play leaf inference (via
+:func:`amp_evaluator`). Leaving leaf inference in FP32 while the learner trains
+under autocast would make the loop's measured cost — the thing
+``scripts/bench_micro_throughput.py`` times through this very module — describe
+a configuration nothing actually runs.
+
 Two artifacts land in the run dir:
 
 * ``run_record.json`` — the persisted evidence task 7's exit gate reads. Per
@@ -34,7 +42,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
@@ -43,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.augment import augment_sample  # noqa: E402
 from core.game import Game  # noqa: E402
+from core.mcts import Evaluator  # noqa: E402
 from core.network import Network, NetworkConfig, make_network_evaluator  # noqa: E402
 from core.runconfig import MICRO_RUN_CONFIG_PATH, RunConfig, load_run_config  # noqa: E402
 from core.seeding import GameRNGs, LearnerRNGs, net_init_seed  # noqa: E402
@@ -128,6 +137,106 @@ def resolve_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+@dataclass(frozen=True)
+class AmpMode:
+    """The run's single resolved mixed-precision setting (D5 AMP; §12 M2.5).
+
+    One instance drives every autocast context in a run **and** whatever
+    "AMP on/off" the caller records — §12 M2.5 lists AMP on/off among the
+    throughput evidence, and a flag computed separately from the context that
+    was actually entered can drift from it silently (FP32 inference recorded as
+    AMP is a wrong number, not a crash). :meth:`observed` closes that loop by
+    reading torch's *live* autocast state from inside the context, so a
+    reported flag can be a measurement rather than a claim.
+
+    Attributes:
+        device_type: Torch device type the context is entered for.
+        enabled: Whether autocast is live. CUDA only — the same rule as
+            ``core.train.make_scaler`` / ``core.train.train_step``, so AMP is an
+            exact no-op off CUDA and the CPU battery computes plain float32.
+    """
+
+    device_type: str
+    enabled: bool
+
+    @classmethod
+    def resolve(cls, device: torch.device) -> AmpMode:
+        """Resolve AMP for a device — the one place the on/off rule is decided.
+
+        Args:
+            device: The device the run's forwards execute on.
+
+        Returns:
+            The mode: enabled on CUDA, disabled everywhere else.
+        """
+        return cls(device_type=device.type, enabled=device.type == "cuda")
+
+    def autocast(self) -> torch.autocast:
+        """Open the run's autocast context.
+
+        No explicit dtype: ``core.train.train_step`` passes none either, so
+        this is torch's default for the device type (float16 on CUDA). Self-play
+        inference must not run at a different precision than the trained-under
+        one by accident.
+
+        Returns:
+            The context manager to wrap forwards in; an exact no-op when
+            ``enabled`` is False.
+        """
+        return torch.autocast(device_type=self.device_type, enabled=self.enabled)
+
+    def observed(self) -> bool:
+        """Whether autocast is live *right now* for this device type.
+
+        Called from inside :meth:`autocast` this reports what actually
+        happened, which is what a report may state; called outside it reports
+        False whatever ``enabled`` says.
+
+        Returns:
+            torch's live autocast state for ``device_type``.
+        """
+        try:
+            return bool(torch.is_autocast_enabled(self.device_type))
+        except TypeError:  # torch < 2.4: the query is per-device-type.
+            if self.device_type == "cpu":
+                return bool(torch.is_autocast_cpu_enabled())
+            return bool(torch.is_autocast_enabled())
+
+
+def amp_evaluator(evaluator: Evaluator, amp: AmpMode) -> Evaluator:
+    """Wrap a leaf evaluator so its forward runs under the run's AMP setting.
+
+    Applied at the call site rather than inside
+    ``core.network.make_network_evaluator``: precision is a *run* policy (this
+    driver's), not a property of the net→MCTS bridge, and ``core/`` has other
+    callers whose behaviour must not move. Autocast is thread-local dispatch
+    state, so the inner evaluator's ``torch.inference_mode`` forward picks it up
+    unchanged — inference-only, no ``GradScaler`` anywhere on this path.
+
+    Args:
+        evaluator: The evaluator to wrap (``make_network_evaluator``'s result).
+        amp: The run's resolved AMP mode.
+
+    Returns:
+        An ``Evaluator`` with identical semantics, evaluated under ``amp``.
+    """
+
+    def evaluate(game: Game, state: object) -> tuple[float, dict[int, float] | None]:
+        """Evaluate one leaf inside the run's autocast context.
+
+        Args:
+            game: The adapter, passed through untouched.
+            state: The leaf state.
+
+        Returns:
+            The wrapped evaluator's ``(value, priors)`` result.
+        """
+        with amp.autocast():
+            return evaluator(game, state)
+
+    return evaluate
 
 
 def write_checkpoint(
@@ -247,7 +356,9 @@ def run_loop(
     identity). Self-play runs the net in ``eval`` mode and training in ``train``
     mode, explicitly — the network-evaluator bridge switches to ``eval`` when it
     is built, and a batch-norm trunk left in the wrong mode is a silent
-    corruption, not a crash.
+    corruption, not a crash. Leaf inference runs under the run's
+    :class:`AmpMode`, the same setting the learner step trains under (an exact
+    no-op off CUDA, so CPU runs are bit-for-bit what they were).
 
     Args:
         cfg: The validated run config (``core.runconfig.load_run_config``).
@@ -293,6 +404,10 @@ def run_loop(
         optimizer, cfg.training.warmup_steps, cfg.training.cosine_total_steps
     )
     scaler = make_scaler(dev.type)
+    # One resolved AMP setting for the whole run: the learner step reads it
+    # from the batch's device inside core.train, self-play through
+    # amp_evaluator below. Both halves therefore run at the same precision.
+    amp = AmpMode.resolve(dev)
 
     window = ReplayWindow(cfg.training.replay_window)
     record = RunRecord(
@@ -309,7 +424,7 @@ def run_loop(
     step = 0
     for game_index in range(cfg.training.games):
         net.eval()
-        evaluator = make_network_evaluator(net, game, device=str(dev))
+        evaluator = amp_evaluator(make_network_evaluator(net, game, device=str(dev)), amp)
         rngs = GameRNGs.for_game(cfg.run_seed, game_index)
         mark = time.perf_counter()
         result = play_game(game, evaluator, cfg.self_play, rngs)

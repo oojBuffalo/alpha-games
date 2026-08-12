@@ -2,7 +2,9 @@
 
 The spike itself is a manual run — the signed verdict is produced once on the
 RTX 4060 Ti 16 GB, and CI (CPU-only) never runs it. **Nothing here runs the
-spike**; what is testable without it is exactly the mechanical part of the gate:
+gate's 50/200 spike** (one single-game invocation exercises the leaf-evaluation
+wiring, which is cheap and not a measurement); what is testable without it is
+exactly the mechanical part of the gate:
 
 * the projection arithmetic ``3600 E / (r S P)`` on fixed inputs, including its
   loud rejection of nonpositive factors;
@@ -14,7 +16,13 @@ spike**; what is testable without it is exactly the mechanical part of the gate:
   and the ``--allow-unverified-hardware`` path labelling itself in the title,
   the intro, the measurement heading and the verdict, with the 4060 Ti slot
   left PENDING;
-* the pinned measurement interval being un-overridable on the official path.
+* the pinned measurement interval being un-overridable on the official path;
+* the AMP flag being **observed** on both timed paths rather than re-derived
+  from the device — CPU autocast (bfloat16) is real, so a forced-on mode on
+  CPU is a genuine falsifier of a flag wired to ``device.type == "cuda"``;
+* the persistence rule: an official run always leaves gate evidence behind
+  (defaulting to the canonical artifact), an unofficial one never writes
+  implicitly.
 """
 
 from __future__ import annotations
@@ -65,6 +73,7 @@ def spike_result(**overrides):
         net_evals=33000,
         learner_steps=200,
         legal_at_eval=270000,
+        amp_evals=0,
         wall_seconds=60.0,
         self_play_seconds=45.0,
         train_seconds=15.0,
@@ -73,9 +82,9 @@ def spike_result(**overrides):
     return BENCH.SpikeResult(**fields)
 
 
-def forward_ratio(micro_ms=1.5, full_ms=3.0, trials=50):
+def forward_ratio(micro_ms=1.5, full_ms=3.0, trials=50, amp=False):
     """A fabricated ForwardRatio."""
-    return BENCH.ForwardRatio(micro_ms=micro_ms, full_ms=full_ms, trials=trials)
+    return BENCH.ForwardRatio(micro_ms=micro_ms, full_ms=full_ms, trials=trials, amp=amp)
 
 
 def make_meta(**overrides):
@@ -367,21 +376,22 @@ def test_playout_stats_are_seeded_and_shaped():
 def test_counting_evaluator_counts_without_touching_the_result():
     """The wrapper is transparent: same (value, priors) out, counters incremented."""
     calls = []
+    off = BENCH.AmpMode(device_type="cpu", enabled=False)
 
     def fake(game, state):
         """A stand-in evaluator returning a fixed value and three priors."""
         calls.append(state)
         return 0.25, {1: 0.1, 2: 0.2, 3: 0.3}
 
-    counted, counters = BENCH.counting_evaluator(fake)
+    counted, counters = BENCH.counting_evaluator(fake, off)
     assert counted(None, "s0") == (0.25, {1: 0.1, 2: 0.2, 3: 0.3})
     assert counted(None, "s1") == (0.25, {1: 0.1, 2: 0.2, 3: 0.3})
-    assert counters == [2, 6]  # two evaluations, six legal actions seen
+    assert counters == [2, 6, 0]  # two evaluations, six legal actions, no AMP
     assert calls == ["s0", "s1"]
     # A uniform-prior evaluator (priors None) still counts the evaluation.
-    none_counted, none_counters = BENCH.counting_evaluator(lambda game, state: (0.0, None))
+    none_counted, none_counters = BENCH.counting_evaluator(lambda game, state: (0.0, None), off)
     none_counted(None, "s")
-    assert none_counters == [1, 0]
+    assert none_counters == [1, 0, 0]
 
 
 def test_display_path_keeps_the_committed_report_machine_independent():
@@ -393,7 +403,231 @@ def test_display_path_keeps_the_committed_report_machine_independent():
 
 def test_measure_forward_ratio_rejects_degenerate_budgets():
     """Guarded before any net is built — a zero-trial 'measurement' is not one."""
+    off = BENCH.AmpMode(device_type="cpu", enabled=False)
     with pytest.raises(ValueError, match="trials must be positive"):
-        BENCH.measure_forward_ratio(None, None, torch.device("cpu"), trials=0, warmup=1)
+        BENCH.measure_forward_ratio(None, None, torch.device("cpu"), trials=0, warmup=1, amp=off)
     with pytest.raises(ValueError, match="warmup must be non-negative"):
-        BENCH.measure_forward_ratio(None, None, torch.device("cpu"), trials=1, warmup=-1)
+        BENCH.measure_forward_ratio(None, None, torch.device("cpu"), trials=1, warmup=-1, amp=off)
+
+
+# --- AMP is measured, not asserted ----------------------------------------------
+#
+# The falsifier these tests lean on: CPU autocast is *real* (bfloat16), so an
+# AmpMode forced on while running on CPU separates "what the run actually did"
+# from "what device it ran on". Any flag re-derived as ``device.type == "cuda"``
+# reports False there and fails these tests — which is precisely the FP32-while-
+# recording-AMP defect they exist to prevent.
+
+
+def micro_game():
+    """The micro-Blokus adapter (built per call; the instance is cheap)."""
+    from games.blokus_duo import BlokusDuo
+    from games.blokus_duo.config import MICRO_CONFIG
+
+    return BlokusDuo(config=MICRO_CONFIG)
+
+
+def test_amp_mode_resolves_once_and_reports_torchs_live_state():
+    """One resolved setting opens the context; ``observed`` reads torch, not the field."""
+    cpu = BENCH.AmpMode.resolve(torch.device("cpu"))
+    assert (cpu.device_type, cpu.enabled) == ("cpu", False)
+    assert BENCH.AmpMode.resolve(torch.device("cuda")).enabled is True  # no GPU needed to resolve
+    # Outside any context nothing is live, whatever the mode claims.
+    forced = BENCH.AmpMode(device_type="cpu", enabled=True)
+    assert forced.observed() is False
+    with cpu.autocast():
+        assert cpu.observed() is False  # a disabled context is an exact no-op
+    with forced.autocast():
+        assert forced.observed() is True
+        # ...and it is a real computation change, not just a flag: CPU autocast
+        # runs autocast-eligible ops in bfloat16.
+        assert (torch.zeros(2, 2) @ torch.zeros(2, 2)).dtype is torch.bfloat16
+    assert (torch.zeros(2, 2) @ torch.zeros(2, 2)).dtype is torch.float32
+
+
+def test_leaf_evaluations_are_counted_as_amp_only_when_they_ran_under_it():
+    """The self-play leaf path: wrapped evaluations count as AMP, bare ones do not."""
+    forced = BENCH.AmpMode(device_type="cpu", enabled=True)
+    dtypes = []
+
+    def fake(game, state):
+        """A stand-in evaluator recording the precision its 'forward' ran at."""
+        dtypes.append((torch.zeros(2, 2) @ torch.zeros(2, 2)).dtype)
+        return 0.0, {1: 0.5}
+
+    counted, counters = BENCH.counting_evaluator(fake, forced)
+    wrapped = BENCH.amp_evaluator(counted, forced)
+    assert wrapped(None, "s0") == (0.0, {1: 0.5})  # transparent
+    assert counters == [1, 1, 1]
+    # The pre-fix wiring, reproduced: call the evaluator *without* the context.
+    counted(None, "s1")
+    assert counters == [2, 2, 1]  # the bare evaluation is not counted as AMP
+    assert dtypes == [torch.bfloat16, torch.float32]
+
+
+def test_spike_amp_flag_is_all_or_nothing_over_the_interval():
+    """Partial autocast coverage is a wiring bug, not a flag value."""
+    assert spike_result(net_evals=100, amp_evals=100).amp is True
+    assert spike_result(net_evals=100, amp_evals=0).amp is False
+    with pytest.raises(ValueError, match="whole interval"):
+        _ = spike_result(net_evals=100, amp_evals=40).amp
+
+
+def test_observed_amp_refuses_paths_that_ran_at_different_precisions():
+    """Wiring the two timed paths separately is exactly the drift this catches."""
+    live = spike_result(net_evals=10, amp_evals=10)
+    dead = spike_result(net_evals=10, amp_evals=0)
+    assert BENCH.observed_amp(forward_ratio(amp=True), live) is True
+    assert BENCH.observed_amp(forward_ratio(amp=False), dead) is False
+    with pytest.raises(ValueError, match="disagree"):
+        BENCH.observed_amp(forward_ratio(amp=True), dead)
+    with pytest.raises(ValueError, match="disagree"):
+        BENCH.observed_amp(forward_ratio(amp=False), live)
+
+
+def test_measure_forward_ratio_reports_the_amp_its_forwards_ran_under():
+    """``r`` is timed inside the run's context, and the flag is read back out of it."""
+    micro, cpu = micro_game(), torch.device("cpu")
+    off = BENCH.measure_forward_ratio(
+        micro, micro, cpu, trials=1, warmup=0, amp=BENCH.AmpMode("cpu", False)
+    )
+    assert off.amp is False
+    on = BENCH.measure_forward_ratio(
+        micro, micro, cpu, trials=1, warmup=0, amp=BENCH.AmpMode("cpu", True)
+    )
+    # Same device, same nets: only the resolved setting differs, so the flag
+    # cannot be a restatement of the device.
+    assert on.amp is True
+    assert off.trials == on.trials == 1
+
+
+def test_run_spike_evaluates_leaves_under_the_runs_amp_setting():
+    """The production composition, on a one-game spike (not the 50/200 gate run).
+
+    ``run_spike`` nests the counting wrapper *inside* ``amp_evaluator``; get that
+    order wrong (or drop the wrapper, which is the defect this replaces) and the
+    forced-on run below counts zero AMP evaluations while still evaluating
+    leaves. Forced on/off on the same CPU device, so nothing here needs a GPU.
+    """
+    from core.runconfig import MICRO_RUN_CONFIG_PATH, load_run_config
+
+    cfg = load_run_config(MICRO_RUN_CONFIG_PATH)
+    game, cpu = BENCH.build_game(cfg), torch.device("cpu")
+    on = BENCH.run_spike(cfg, game, cpu, 0, 1, BENCH.AmpMode("cpu", True), verbose=False)
+    assert on.net_evals > 0
+    assert on.amp_evals == on.net_evals  # every leaf ran inside the context
+    assert on.amp is True
+    off = BENCH.run_spike(cfg, game, cpu, 0, 1, BENCH.AmpMode("cpu", False), verbose=False)
+    assert off.net_evals > 0 and off.amp_evals == 0
+    assert off.amp is False  # ...and a disabled mode really is a no-op
+
+
+# --- main's assembly: metadata provenance and persisted evidence ----------------
+
+
+def drive_main(monkeypatch, tmp_path, *, official, argv, ratio_amp=False, spike_amp=False):
+    """Run ``BENCH.main`` with the hardware gate and the expensive spike stubbed out.
+
+    Nothing here runs the spike, builds the 14×14 adapter or touches CUDA: the
+    hardware verdict, both measurements and the random playouts are replaced,
+    leaving exactly main's assembly — metadata provenance, report, persistence,
+    exit code — under test. ``BENCH.ROOT`` is redirected at ``tmp_path`` so the
+    canonical artifact's *relative* path is exercised without writing to the
+    committed one.
+
+    Args:
+        monkeypatch: The pytest fixture.
+        tmp_path: Stand-in repo root.
+        official: What the stubbed hardware gate reports.
+        argv: The CLI arguments under test.
+        ratio_amp: The AMP flag the stubbed forward measurement observed.
+        spike_amp: Whether the stubbed spike observed AMP at every evaluation.
+
+    Returns:
+        ``main``'s exit code.
+    """
+    micro = micro_game()
+    evals = 33000
+    monkeypatch.setattr(BENCH, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        BENCH, "require_official_hardware", lambda allow: (official, torch.device("cpu"))
+    )
+    monkeypatch.setattr(BENCH, "BlokusDuo", lambda config: micro)
+    monkeypatch.setattr(
+        BENCH, "playout_stats", lambda game, seed, playouts: BENCH.PlayoutStats(1, 6.2, 12.0)
+    )
+    monkeypatch.setattr(
+        BENCH, "ratio_rows", lambda *args, **kwargs: [("board cells", "25", "196", "7.84×")]
+    )
+    monkeypatch.setattr(
+        BENCH, "measure_forward_ratio", lambda *args, **kwargs: forward_ratio(amp=ratio_amp)
+    )
+    monkeypatch.setattr(
+        BENCH,
+        "run_spike",
+        lambda *args, **kwargs: spike_result(net_evals=evals, amp_evals=evals if spike_amp else 0),
+    )
+    return BENCH.main(argv)
+
+
+def test_reported_amp_is_the_observed_one_not_the_devices(monkeypatch, tmp_path, capsys):
+    """The header states what the forwards ran under — here, on CPU, AMP **on**.
+
+    The stubbed device is CPU throughout, so the pre-fix wiring
+    (``amp = device.type == "cuda"``) reports "off" in both halves of this test
+    and fails the first assertion: the flag can only follow the measurements.
+    """
+    drive_main(monkeypatch, tmp_path, official=True, argv=[], ratio_amp=True, spike_amp=True)
+    assert "AMP **on**" in capsys.readouterr().out
+    drive_main(monkeypatch, tmp_path, official=True, argv=[], ratio_amp=False, spike_amp=False)
+    assert "AMP **off**" in capsys.readouterr().out
+    # And a report can never be written at all if the two paths disagreed.
+    with pytest.raises(ValueError, match="disagree"):
+        drive_main(monkeypatch, tmp_path, official=True, argv=[], ratio_amp=True, spike_amp=False)
+
+
+def test_official_run_without_out_persists_to_the_canonical_artifact(monkeypatch, tmp_path, capsys):
+    """§12 M2.5 gates on persisted evidence: a signed verdict always leaves the file."""
+    code = drive_main(monkeypatch, tmp_path, official=True, argv=[])
+    out = capsys.readouterr().out
+    artifact = tmp_path / BENCH.CANONICAL_OUT
+    assert artifact.exists()
+    assert artifact.read_text().startswith("# M2.5 throughput go/no-go")
+    assert artifact.read_text() in out  # what was persisted is what was reported
+    assert code == BENCH.EXIT_GO  # a signed verdict, and it left evidence behind
+    # ...and the run says so, loudly, on stdout.
+    assert "no --out given" in out
+    assert BENCH.CANONICAL_OUT in out
+
+
+def test_unofficial_run_without_out_persists_nothing(monkeypatch, tmp_path, capsys):
+    """A provisional number is not evidence: it must not overwrite the artifact."""
+    code = drive_main(monkeypatch, tmp_path, official=False, argv=["--allow-unverified-hardware"])
+    out = capsys.readouterr().out
+    assert code == BENCH.EXIT_UNOFFICIAL
+    assert BENCH.UNOFFICIAL_TAG in out  # the numbers were emitted...
+    assert list(tmp_path.rglob("*")) == []  # ...and nothing at all was written
+
+
+def test_explicit_out_still_writes_on_the_unofficial_path(monkeypatch, tmp_path):
+    """``--out`` is how the provisional report is regenerated; that path is unchanged."""
+    dest = tmp_path / "elsewhere" / "report.md"
+    code = drive_main(
+        monkeypatch,
+        tmp_path,
+        official=False,
+        argv=["--allow-unverified-hardware", "--out", str(dest)],
+    )
+    assert code == BENCH.EXIT_UNOFFICIAL
+    assert BENCH.UNOFFICIAL_TAG in dest.read_text()
+    assert not (tmp_path / BENCH.CANONICAL_OUT).exists()  # never the canonical one
+
+
+def test_resolve_out_path_defaults_only_official_runs(monkeypatch, tmp_path):
+    """The rule in isolation: official → the committed artifact, unofficial → nothing."""
+    monkeypatch.setattr(BENCH, "ROOT", tmp_path)
+    assert BENCH.resolve_out_path(None, official=True) == tmp_path / BENCH.CANONICAL_OUT
+    assert BENCH.resolve_out_path(None, official=False) is None
+    explicit = tmp_path / "elsewhere.md"
+    assert BENCH.resolve_out_path(explicit, official=True) == explicit
+    assert BENCH.resolve_out_path(explicit, official=False) == explicit

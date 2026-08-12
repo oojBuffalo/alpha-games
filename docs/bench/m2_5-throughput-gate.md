@@ -6,7 +6,7 @@
 python3 scripts/bench_micro_throughput.py --allow-unverified-hardware --out docs/bench/m2_5-throughput-gate.md
 ```
 
-- **Device:** cpu host (`cpu`), AMP off (no-op off CUDA)
+- **Device:** cpu host (`cpu`), AMP **off** (an exact no-op off CUDA) — observed, not assumed
 - **torch:** 2.9.0 (CUDA n/a)
 - **Date:** 2026-08-12
 - **Config:** `configs/blokus_micro.json` — run_seed 2500, fresh weights (net-init seed 13521923826590675288), 64 sims/move, batch-1 leaf inference.
@@ -32,17 +32,17 @@ A dedicated spike, not a training run: `scripts/run_micro.py`'s exact pacing (on
 
 | quantity | value |
 |---|--:|
-| end-to-end games/hour | 13,210.3 |
+| end-to-end games/hour | 14,333.4 |
 | mean plies/game | 6.14 |
-| sims/sec (end-to-end) | 1,442.0 |
-| net-evals/sec (end-to-end) — **E** | 465.9 |
-| net-evals/sec (self-play time only) | 646.8 |
-| learner steps/sec | 3.67 |
+| sims/sec (end-to-end) | 1,564.6 |
+| net-evals/sec (end-to-end) — **E** | 505.5 |
+| net-evals/sec (self-play time only) | 692.3 |
+| learner steps/sec | 3.98 |
 | net-evals per sim | 0.323 |
 | mean legal-set size at evaluated leaves | 6.29 |
-| wall clock, measured interval (s) | 54.5 |
-| — self-play share | 72.0% |
-| — learner share | 27.7% |
+| wall clock, measured interval (s) | 50.2 |
+| — self-play share | 73.0% |
+| — learner share | 26.7% |
 
 The per-phase split is what makes a NO-GO diagnosable: a learner-dominated interval points at the M3 actor–learner split, a self-play-dominated one at batched inference (the M5 lever) or the sims budget.
 
@@ -55,9 +55,9 @@ The per-phase split is what makes a NO-GO diagnosable: a learner-dominated inter
 | raw actions | 225 | 17,836 | 79.27× |
 | mean legal-set size (random playouts) | 14.0 | 232.1 | 16.58× |
 | mean plies/game (random playouts) | 5.8 | 28.2 | 4.91× |
-| batch-1 forward (ms, measured) | 1.392 | 2.621 | 1.88× |
+| batch-1 forward (ms, measured) | 1.310 | 2.284 | 1.74× |
 
-`r = 1.883` is the last row's ratio — median of 50 timed batch-1 forwards per net (after warm-up) on the same device, both nets carrying the identical D5 8×128 trunk (§5.3 keeps the trunk unchanged so exactly this number transfers).
+`r = 1.743` is the last row's ratio — median of 50 timed batch-1 forwards per net (after warm-up) on the same device, both nets carrying the identical D5 8×128 trunk (§5.3 keeps the trunk unchanged so exactly this number transfers).
 
 ## Scaling model, and where it is weak
 
@@ -65,7 +65,7 @@ The per-phase split is what makes a NO-GO diagnosable: a learner-dominated inter
 
 Five assumptions carry the projection, and **the first four all lean optimistic** — the true full-game rate is likely below the projected number:
 
-1. **Dividing the whole loop's cost by `r` alone.** `E` contains tree descent, move generation, `apply`, state encoding and the learner step, none of which scale like the network. The full game's non-network cost grows much faster than `r` — see the ratio table: 79× the raw actions, ~17× the mean legal-set size (828 legal openings at the root vs. 42), ~8× the board cells, ~4× the planes encoded per leaf, against an `r` of 1.88. **This is the weakest assumption in the gate.**
+1. **Dividing the whole loop's cost by `r` alone.** `E` contains tree descent, move generation, `apply`, state encoding and the learner step, none of which scale like the network. The full game's non-network cost grows much faster than `r` — see the ratio table: 79× the raw actions, ~17× the mean legal-set size (828 legal openings at the root vs. 42), ~8× the board cells, ~4× the planes encoded per leaf, against an `r` of 1.74. **This is the weakest assumption in the gate.**
 2. **`r` measured at batch 1 on a GPU is latency-bound.** Both forwards are dominated by kernel-launch overhead there, so the measured `r` can sit near 1 while the true compute ratio is several-fold.
 3. **The learner step is not rescaled at all.** The micro step is batch 32 on 5×5; M3's is batch 256 on 14×14. Folding the micro learner into `E` and then dividing by `r` understates the real learner share.
 4. **`P = 35` is an assumption, not a measurement.** The measured full-game random-playout mean plies is in the ratio table as a check; the projection scales inversely with `P`.
@@ -76,16 +76,16 @@ Consequence for reading the result: a projection comfortably **above** the floor
 ## Projection
 
 ```
-E = 465.9032 net-evals/s
-r = 1.8834
+E = 505.5102 net-evals/s
+r = 1.7431
 S = 128   P = 35
-games_per_hour_full = 3600 * 465.9032 / (1.8834 * 128 * 35) = 198.78
+games_per_hour_full = 3600 * 505.5102 / (1.7431 * 128 * 35) = 233.04
 floor = 100
 ```
 
 ## Verdict
 
-**NO VERDICT (UNOFFICIAL / PROVISIONAL) — the arithmetic would read GO, but this run was not on the pinned RTX 4060 Ti 16 GB: projected 198.8 full-game games/hour vs. a floor of 100 (E = 465.9 net-evals/s, r = 1.883, S = 128, P = 35).**
+**NO VERDICT (UNOFFICIAL / PROVISIONAL) — the arithmetic would read GO, but this run was not on the pinned RTX 4060 Ti 16 GB: projected 233.0 full-game games/hour vs. a floor of 100 (E = 505.5 net-evals/s, r = 1.743, S = 128, P = 35).**
 
 ### RTX 4060 Ti verdict — PENDING
 
