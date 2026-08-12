@@ -21,6 +21,8 @@ Seams are documented but **not built**: N-player (value head + backup, M7) and s
 
 **Rule: adding a game touches only `games/` + `configs/`.** M1.5 (Othello) enforces this with a zero-`core/`-diff acceptance test.
 
+**Named game configs are adapter-declared** (M2.5). A run config's `game` field is the adapter package directory name under `games/`; `game_config` is a key in that package's module-level `GAME_CONFIGS` mapping (`name → instance-config object`), exposed at the package top level in `games/<game>/__init__.py` (Blokus declares its in `games/blokus_duo/config.py` and re-exports it). `core/runconfig.py` resolves the pair generically — match `game` against the packages discovered under `games/`, import only that package, read the fixed `GAME_CONFIGS` attribute, index it with `game_config`. Both JSON strings are only ever set-membership tests or dict keys — never `eval`, never `getattr` on an arbitrary module — and an unknown game, a game declaring no configs, or an unknown config name each raise `ValueError`. Consequence: a new game adds `games/<game>/` (with `GAME_CONFIGS`) plus `configs/<run>.json` and touches **zero** `core/` files; two AST tests in `tests/test_micro_config_file.py` assert it.
+
 ## Invariants — never violate
 
 1. **Pass invariant.** At every nonterminal state, `current_player(state)` returns a player with ≥1 legal action. Adapters realize forced passes either as an explicit pass action (Othello: 64+1 head) or by skipping inactive players (Blokus: no pass action in 14×14×91). `core/` assumes *only* this invariant — never strict alternation, never monotone blocking. (Blokus blocking is monotone — a blocked player never regains a move; Othello passing is not.)
