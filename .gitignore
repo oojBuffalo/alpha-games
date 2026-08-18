@@ -38,3 +38,4 @@ Thumbs.db
 
 # --- Local task/planning scratch (never version-controlled) ---
 tasks/
+.python_version
