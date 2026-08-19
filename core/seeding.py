@@ -7,14 +7,23 @@ and they are the whole point:
   * **Independence.** Consuming one purpose's stream cannot perturb another's sequence,
     so adding a draw to (say) move selection does not silently reshuffle augmentation.
   * **Re-derivability.** Any stream is recomputable from ``(run_seed, labels)`` alone, so
-    parallel actors decorrelate by label and crash-resume needs no persisted RNG state —
-    M3 deepens the keying to durable coordinates (``("actor", id, "game", i, purpose)``,
-    ``("learner", step, "replay-sampling")``) without reshaping this API.
+    parallel actors decorrelate by label and crash-resume needs no persisted RNG state.
 
 The single-process M2.5 label set is the purpose constants below: net init, Dirichlet
 (D7), ∝N move selection (D10), MCTS tie-breaks, symmetry-augmentation ``g`` (D9), and
 replay-window sampling. Pure stdlib, no torch/NumPy: net init consumes the derived int
 directly via ``torch.manual_seed``.
+
+M3 (issue #53) adds the multi-actor label family and durable-coordinate keying without
+reshaping this API: :meth:`GameRNGs.for_actor_game` derives ``("actor", actor_id, "game",
+game_index, purpose)`` streams, and :meth:`LearnerRNGs.for_step` re-keys per checkpointed
+learner step (``("learner", learner_step, purpose)``). Both take durable coordinates —
+an actor's persisted next-game index, a checkpointed step counter — never an in-process
+draw position, which is the entire crash-resume story: no self-play/learner-path
+component may hold a long-lived generator whose position isn't recomputable from
+``(run_seed, durable labels)`` alone. The consumers (the actor and learner loops
+themselves) are later M3 issues; this module only pins and tests the derivation contract
+they build on.
 """
 
 from __future__ import annotations
@@ -124,8 +133,9 @@ class GameRNGs:
 
     One stream per purpose — never one rng threading every stochastic choice — so a change
     in how many Dirichlet draws a search makes cannot shift the move-selection sequence.
-    ``play_game`` takes this bundle; M3 deepens the keying via ``prefix`` (its
-    ``("actor", actor_id, ...)`` family) without changing the bundle's shape.
+    ``play_game`` takes this bundle; :meth:`for_actor_game` deepens the keying to M3's
+    ``("actor", actor_id, ...)`` family via :meth:`for_game`'s ``prefix`` seam, without
+    changing the bundle's shape.
 
     Attributes:
         dirichlet: D7 root-noise stream, handed to ``MCTS(root_noise=...)``.
@@ -166,6 +176,33 @@ class GameRNGs:
             move_selection=component_rng(run_seed, *labels, PURPOSE_MOVE_SELECTION),
             tie_break=component_rng(run_seed, *labels, PURPOSE_TIE_BREAK),
         )
+
+    @classmethod
+    def for_actor_game(cls, run_seed: int, actor_id: int, game_index: int) -> GameRNGs:
+        """Build the bundle for one actor's game (M3's multi-actor label family).
+
+        Thin sugar over :meth:`for_game` with ``prefix=("actor", actor_id)`` — the exact
+        ``("actor", actor_id, "game", game_index, purpose)`` shape M3 adds on top of the
+        single-process M2.5 loop. Parallel actors are decorrelated by construction:
+        ``actor_id`` folds into every label, so two actors never draw the same stream even
+        for the same ``game_index``.
+
+        Args:
+            run_seed: The run's recorded root seed.
+            actor_id: The actor's durable identifier — assigned once and never reissued to
+                a different actor across a restart.
+            game_index: The game's durable index *within that actor*: the actor's
+                persisted next-game-index counter, never an in-process game count. This is
+                what makes a game reproducible on its own after a crash — see
+                :func:`derive_seed`.
+
+        Returns:
+            A frozen bundle of independently derived generators for this actor's game.
+
+        Raises:
+            TypeError: If ``run_seed``, ``actor_id`` or ``game_index`` is not an ``int``.
+        """
+        return cls.for_game(run_seed, game_index, prefix=("actor", actor_id))
 
 
 @dataclass(frozen=True)

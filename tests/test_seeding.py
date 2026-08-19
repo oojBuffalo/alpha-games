@@ -37,7 +37,10 @@ GOLDEN = {
     (12345, "game", 0, "dirichlet"): 7697570542772425456,
     (12345, "game", 1, "dirichlet"): 7117826159696791745,
     (12345, "actor", 3, "game", 0, "move-selection"): 9824953671185842631,
+    (12345, "actor", 3, "game", 0, "dirichlet"): 15804084277158994818,
+    (12345, "actor", 3, "game", 0, "tie-break"): 687149822308989655,
     (12345, "learner", 7, "replay-sampling"): 14003624692365441275,
+    (12345, "learner", 7, "augmentation"): 7221077250744959150,
 }
 
 
@@ -182,3 +185,96 @@ def test_bundles_are_frozen():
     rngs = GameRNGs.for_game(5, 0)
     with pytest.raises(Exception):  # noqa: B017 - dataclasses raise FrozenInstanceError
         rngs.dirichlet = random.Random(0)
+
+
+# --- M3: multi-actor label family + durable-coordinate keying -------------------------
+#
+# GameRNGs.for_actor_game / LearnerRNGs.for_step are the typed helper surface M3's actor
+# and learner components (later issues) build on. Both are thin sugar over derive_seed:
+# no RNG state is ever stored, only the durable coordinates (actor_id, game_index; the
+# checkpointed learner step) that let any stream be recomputed after a crash.
+
+
+def test_canonicalization_never_collides_across_a_part_boundary():
+    # A length-prefixed, type-tagged encoding is self-delimiting: shifting where one
+    # string ends and the next begins, or swapping an int label for its string spelling,
+    # must never alias to the same serialized bytes.
+    seeds = {
+        derive_seed(0, "ab", "c"),
+        derive_seed(0, "a", "bc"),
+        derive_seed(0, 1),
+        derive_seed(0, "1"),
+    }
+    assert len(seeds) == 4
+
+
+def test_for_actor_game_matches_the_documented_actor_label_family():
+    # The exact label family from issue #53: ("actor", actor_id, "game", game_index,
+    # purpose), purpose in {dirichlet, move-selection, tie-break}.
+    rngs = GameRNGs.for_actor_game(12345, actor_id=3, game_index=0)
+    dirichlet_golden = GOLDEN[(12345, "actor", 3, "game", 0, "dirichlet")]
+    move_golden = GOLDEN[(12345, "actor", 3, "game", 0, "move-selection")]
+    tie_break_golden = GOLDEN[(12345, "actor", 3, "game", 0, "tie-break")]
+    assert rngs.dirichlet.random() == random.Random(dirichlet_golden).random()
+    assert rngs.move_selection.random() == random.Random(move_golden).random()
+    assert rngs.tie_break.random() == random.Random(tie_break_golden).random()
+
+
+def test_for_actor_game_is_sugar_over_for_game_with_the_actor_prefix():
+    via_helper = GameRNGs.for_actor_game(2026, actor_id=7, game_index=4)
+    via_prefix = GameRNGs.for_game(2026, 4, prefix=("actor", 7))
+    assert via_helper.dirichlet.random() == via_prefix.dirichlet.random()
+    assert via_helper.move_selection.random() == via_prefix.move_selection.random()
+    assert via_helper.tie_break.random() == via_prefix.tie_break.random()
+
+
+def test_two_actors_are_decorrelated_for_the_same_game_index():
+    # Parallel actors decorrelate by construction: actor_id folds into every label, so
+    # two actors never draw the same stream even when they happen to be on the same
+    # durable game_index.
+    a = GameRNGs.for_actor_game(2026, actor_id=0, game_index=5)
+    b = GameRNGs.for_actor_game(2026, actor_id=1, game_index=5)
+    assert a.dirichlet.random() != b.dirichlet.random()
+    assert a.move_selection.random() != b.move_selection.random()
+    assert a.tie_break.random() != b.tie_break.random()
+
+
+def test_actor_game_index_and_purpose_each_change_the_stream():
+    base = GameRNGs.for_actor_game(2026, actor_id=0, game_index=5)
+    other_game = GameRNGs.for_actor_game(2026, actor_id=0, game_index=6)
+    assert base.dirichlet.random() != other_game.dirichlet.random()
+    draws = {base.dirichlet.random(), base.move_selection.random(), base.tie_break.random()}
+    assert len(draws) == 3
+
+
+def test_actor_game_stream_is_recomputable_after_a_simulated_crash():
+    # Crash-resume: derive the stream from durable coordinates (actor_id, game_index),
+    # draw from it, then discard the generator entirely — no RNG state is carried across
+    # the "restart", only the coordinates that produced it.
+    actor_id, game_index = 4, 17
+    before_crash = GameRNGs.for_actor_game(999, actor_id=actor_id, game_index=game_index)
+    burned = [before_crash.dirichlet.random() for _ in range(30)]
+    del before_crash  # simulate the process dying with zero RNG state persisted
+
+    resumed = GameRNGs.for_actor_game(999, actor_id=actor_id, game_index=game_index)
+    assert [resumed.dirichlet.random() for _ in range(30)] == burned
+
+
+def test_learner_step_stream_is_recomputable_after_a_simulated_crash():
+    # Same property on the learner side: the only persisted coordinate is the
+    # checkpointed step counter, never a stream position.
+    learner_step = 42
+    before_crash = LearnerRNGs.for_step(999, learner_step)
+    burned_aug = [before_crash.augmentation.random() for _ in range(10)]
+    burned_window = [before_crash.window_sampling.random() for _ in range(10)]
+    del before_crash
+
+    resumed = LearnerRNGs.for_step(999, learner_step)
+    assert [resumed.augmentation.random() for _ in range(10)] == burned_aug
+    assert [resumed.window_sampling.random() for _ in range(10)] == burned_window
+
+
+def test_learner_golden_augmentation_stream():
+    rngs = LearnerRNGs.for_step(12345, 7)
+    expected = random.Random(GOLDEN[(12345, "learner", 7, "augmentation")])
+    assert rngs.augmentation.random() == expected.random()
