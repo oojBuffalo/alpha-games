@@ -27,6 +27,7 @@ from games.blokus_duo.actions import action_codec
 from games.blokus_duo.bitboard import BitboardEngine
 from games.blokus_duo.config import FULL_CONFIG, BlokusConfig
 from games.blokus_duo.pieces import build_pieces
+from games.blokus_duo.pieces import orientation_table_hash as _orientation_table_hash
 from games.blokus_duo.symmetry import symmetry_group
 from games.blokus_duo.targets import value_target_spec, value_targets
 
@@ -106,6 +107,21 @@ class BlokusDuo(Game):
     @property
     def value_targets(self) -> ValueTargetSpec:
         return value_target_spec(self._config)
+
+    @property
+    def orientation_table_hash(self) -> str:
+        # Invariant 4 / §5.1: the instance's own re-derived table digest, never
+        # the full 14×14 table's — the micro instance's subset renumbering
+        # (pieces.build_orientation_table) gives it a different hash by
+        # construction, which is the whole point of the fingerprint check.
+        return _orientation_table_hash(self._config)
+
+    @property
+    def encoding_conventions(self) -> dict[str, object]:
+        # The same block already embedded in the M1 fixtures (§5.1) — the
+        # action codec's ``fixture_conventions``, not a copy kept in sync by
+        # hand.
+        return dict(self._codec.fixture_conventions)
 
     # --- core contract -------------------------------------------------------------
 

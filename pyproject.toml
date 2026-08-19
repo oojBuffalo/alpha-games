@@ -8,8 +8,9 @@ version = "0.0.0"
 description = "AlphaZero replication as a game-agnostic engine; POC game Blokus Duo."
 requires-python = ">=3.11"
 # NumPy/torch arrive at M2 with encoding/training; adapters (games/) stay stdlib-pure. In
-# installed package code, torch/numpy imports are confined to core/network.py, core/losses.py,
-# core/train.py; dev-only scripts/ (e.g. the M2 GPU benchmark) may also import torch.
+# installed package code, torch is confined to core/network.py, core/losses.py, core/train.py;
+# NumPy also lands in core/replay_shard.py (M3, the on-disk shard array layout). dev-only
+# scripts/ (e.g. the M2 GPU benchmark) may also import torch.
 dependencies = ["numpy>=1.26", "torch>=2.3"]  # 2.3: torch.amp.GradScaler (core/train.py)
 
 [project.optional-dependencies]
