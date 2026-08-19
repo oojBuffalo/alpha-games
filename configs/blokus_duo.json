@@ -1,0 +1,74 @@
+{
+  "_doc": "M3 full-Blokus (14x14) run config -- the real GPU acceptance run this milestone's evidence is drawn from (metadocs/blokus-duo-az-design-v0_5.md, D5/D6/D7/D10, section 6.2, section 12 M3). Every scalar here is either D-pinned in the design doc or the section-6.2 publish/checkpoint pin; a handful the doc leaves open for the M3 baseline (not itself a production run to convergence -- that is M5.5) are chosen here and documented per-field below. This is a core.run_identity.LaunchConfig, not a bare core.runconfig.RunConfig: num_actors/device/schema_version/runtime extend the schema at the top level, alongside every RunConfig field. tests/test_blokus_duo_config_file.py golden-checks this file; change the doc first, never this file alone.",
+
+  "name": "blokus_duo",
+  "game": "blokus_duo",
+  "game_config": "FULL_CONFIG",
+
+  "self_play": {
+    "_doc": "D6 M3 validate tier: fixed 128 sims, no playout-cap randomization (core.actor.VALIDATE_TIER_SIMS). D10 k_temp = 8 (plies 0-7 sample ~N, argmax after). D7 root Dirichlet ε = 0.25, α-numerator 10.8 (alpha = 10.8 / #legal moves at the root).",
+    "sims": 128,
+    "k_temp": 8,
+    "dirichlet_eps": 0.25,
+    "dirichlet_alpha_numerator": 10.8,
+    "root_noise": true
+  },
+
+  "training": {
+    "_doc": "D5: batch 256, base LR 0.02, SGD momentum 0.9 / wd 1e-4 (core.train), replay window ~250k positions, replay ratio band [2, 4] (core.learner enforces the band; not a config field). publish_interval/checkpoint_count are the section-6.2 pin (200, K=30); the learner's own async stop condition is checkpoint_count * publish_interval = 6000 steps, independent of learner_steps below. learner_steps/games/steps_per_game are carried for schema parity with the M2.5 fixed-budget loop shape (core.runconfig.TrainingConfig's pacing-coherence check) but are not this driver's stop condition -- chosen here as 6000 learner_steps at 1 step/game (games = 6000), matching the learner's real step budget so the two readings of 'how long is this run' agree. warmup_steps/cosine_total_steps are not doc-pinned for the full game specifically (only 'LR ~= 0.02 warmup + cosine', D5); chosen proportionally to the micro config's 200/2000 = 10% warmup, scaled to this run's 6000-step schedule (600 warmup, cosine spans the full 6000). replay_warmup_positions is an implementation-level knob (not design-doc-pinned), scaled from micro's 128 by the batch-size ratio (256/32 = 8x) to 1024.",
+    "games": 6000,
+    "learner_steps": 6000,
+    "steps_per_game": 1,
+    "batch_size": 256,
+    "replay_window": 250000,
+    "learning_rate": 0.02,
+    "warmup_steps": 600,
+    "cosine_total_steps": 6000,
+    "aux_loss_weight": 0.25,
+    "checkpoint_selection": "final",
+    "publish_interval": 200,
+    "checkpoint_count": 30,
+    "replay_warmup_positions": 1024
+  },
+
+  "evaluation": {
+    "_doc": "Non-material for this run's identity (core.run_identity.FIELD_CLASSIFICATION): M4's evaluation harness defines the real full-game protocol; these values are a placeholder carried only to satisfy RunConfig's schema, mirroring the M2.5 protocol shape at full-board sim counts.",
+    "agent_form": "rung7_mcts_policy_value",
+    "sims": 128,
+    "root_noise": false,
+    "move_selection": "argmax_n",
+    "opponent": "rung1_uniform_random",
+    "n_pairs": 100,
+    "eval_seed": 97531,
+    "min_score_rate": 0.7
+  },
+
+  "loss_predicates": {
+    "_doc": "Non-material for this run's identity; the M2.5-style exit-gate windows, carried for schema parity -- M3 itself has no exit gate (that is the M2.5 gate this run's entry condition already references).",
+    "head_window_steps": 200,
+    "tail_window_steps": 200,
+    "policy_max_ratio": 0.7,
+    "value_max_ratio": 0.8
+  },
+
+  "throughput": {
+    "_doc": "Non-material for this run's identity; the section-12 M2.5 throughput protocol that already produced this run's entry-condition GO verdict (issue #66) -- carried for schema parity, not re-run by this config.",
+    "warmup_games": 50,
+    "measure_games": 200,
+    "projection_sims": 128,
+    "projection_plies_per_game": 35,
+    "min_projected_games_per_hour": 100
+  },
+
+  "run_seed": 4096,
+  "run_dir": "runs/blokus_duo",
+
+  "num_actors": 4,
+  "device": "cuda",
+  "schema_version": 1,
+  "runtime": {
+    "refresh_poll_interval": 1.0,
+    "pacing_poll_interval": 1.0,
+    "ceiling_poll_interval": 1.0
+  }
+}
