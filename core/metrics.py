@@ -123,6 +123,34 @@ def next_epoch(run_dir: Path | str, proc: str) -> int:
     return max(existing, default=-1) + 1
 
 
+def list_procs(run_dir: Path | str) -> frozenset[str]:
+    """Return every process name that has ever written epoch files under ``run_dir``.
+
+    Discovers process identity purely from the ``<proc>-<epoch>.jsonl`` naming
+    convention -- no hardcoded list of actor ids or process names. Used by
+    issue #62's ``core.observability.reduce_run`` to enumerate every
+    per-process file it must read without assuming how many actors a run had.
+
+    Args:
+        run_dir: The run's root directory.
+
+    Returns:
+        The distinct ``proc`` values found among filenames under
+        ``run_dir/metrics/`` (empty if the directory does not exist yet).
+    """
+    directory = metrics_dir(run_dir)
+    if not directory.exists():
+        return frozenset()
+    procs = set()
+    for p in directory.iterdir():
+        if not p.is_file():
+            continue
+        m = _EPOCH_PATTERN.match(p.name)
+        if m is not None:
+            procs.add(m.group("proc"))
+    return frozenset(procs)
+
+
 def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any]]:
     """Yield every record ``proc`` has ever durably appended, across all epochs.
 

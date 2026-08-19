@@ -50,6 +50,20 @@ until it clears. Neither hook's cadence depends on this module knowing
 anything about replay ratios, checkpoint files, or IPC — those are the
 concerns of the seams issue #60 (pacing math) and issue #61 (real weight
 publication) build against.
+
+**Observability is opt-in and additive (issue #62).** ``metrics_writer`` /
+``position_counter`` are both ``None`` by default -- a caller that never
+supplies them (every test predating this issue) gets byte-identical
+behavior. When both are given, every finished game flushes three ``delta``
+records to ``metrics_writer`` at the game boundary: ``games_completed``
+(always ``1``), ``sims_run`` (``result.plies * self_play.sims`` -- exact and
+cheap, since a validate-tier actor runs no playout-cap randomization, so
+every ply searches exactly ``self_play.sims`` simulations), and
+``positions_evaluated`` (drained from ``position_counter``, which the
+caller is responsible for wiring into the actual evaluator via
+``core.observability.count_positions`` -- this module never constructs an
+evaluator itself). ``positions_evaluated`` is omitted entirely when no
+``position_counter`` was supplied, never written as a fabricated zero.
 """
 
 from __future__ import annotations
@@ -60,10 +74,18 @@ from pathlib import Path
 
 from core.game import Game
 from core.mcts import Evaluator
+from core.metrics import EpochMetricsWriter
+from core.observability import (
+    SERIES_GAMES_COMPLETED,
+    SERIES_POSITIONS_EVALUATED,
+    SERIES_SIMS_RUN,
+    PositionCounter,
+    delta_record,
+)
 from core.replay_shard import PendingSample, ShardWriter
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
-from core.selfplay import Sample, play_game
+from core.selfplay import GameResult, Sample, play_game
 
 # D6: validate the loop at a fixed simulation count first (§7); the actor is
 # pinned to it, the shared game loop is not.
@@ -191,6 +213,16 @@ class ActorDriver:
             lifecycle).
         should_stop: Optional callable polled alongside ``max_games``; ``run``
             stops as soon as either says to.
+        metrics_writer: Optional. When given, every finished game flushes
+            ``games_completed`` / ``sims_run`` / ``positions_evaluated``
+            deltas to it (module docstring). ``None`` (the default) disables
+            all metrics flushing — backward compatible with every existing
+            caller.
+        position_counter: Optional. Drained once per game to populate the
+            ``positions_evaluated`` delta; only consulted when
+            ``metrics_writer`` is also given. The caller wires this counter
+            into the actual evaluator (``core.observability.count_positions``)
+            — this module only drains it.
 
     Raises:
         ValueError: If ``self_play`` is not the D6 validate tier, or
@@ -211,6 +243,8 @@ class ActorDriver:
         wait: WaitFn | None = None,
         max_games: int | None = None,
         should_stop: StopFn | None = None,
+        metrics_writer: EpochMetricsWriter | None = None,
+        position_counter: PositionCounter | None = None,
     ) -> None:
         validate_actor_self_play_config(self_play)
         if max_games is not None and max_games <= 0:
@@ -226,6 +260,8 @@ class ActorDriver:
         self.wait = wait if wait is not None else _default_wait
         self.max_games = max_games
         self.should_stop = should_stop
+        self.metrics_writer = metrics_writer
+        self.position_counter = position_counter
         self.writer = ShardWriter(Path(out_dir), game, run_id, str(actor_id))
 
     def run(self) -> list[Path]:
@@ -320,4 +356,34 @@ class ActorDriver:
         # ShardWriter is the only source of durable game indices; if this ever
         # disagrees, something else has started writing under our actor_id.
         assert self.writer.state.next_game_index == game_index + 1
+        self._flush_game_metrics(result)
         return path
+
+    def _flush_game_metrics(self, result: GameResult) -> None:
+        """Append this game's delta series at the between-game flush boundary.
+
+        A no-op unless ``metrics_writer`` was supplied at construction
+        (module docstring: optional, off by default). ``games_completed`` is
+        always exactly ``1`` -- one flush per finished game. ``sims_run`` is
+        computed directly rather than counted (``result.plies *
+        self.self_play.sims``): an actor is pinned to the D6 validate tier
+        (no playout-cap randomization), so every ply searched exactly
+        ``self.self_play.sims`` simulations, making the product exact.
+        ``positions_evaluated`` is drained from ``position_counter`` and
+        omitted entirely when none was supplied -- never a fabricated zero.
+
+        Args:
+            result: The just-finished game.
+        """
+        if self.metrics_writer is None:
+            return
+        now = time.time()
+        self.metrics_writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=now))
+        self.metrics_writer.append(
+            delta_record(SERIES_SIMS_RUN, result.plies * self.self_play.sims, timestamp=now)
+        )
+        if self.position_counter is not None:
+            positions = self.position_counter.drain()
+            self.metrics_writer.append(
+                delta_record(SERIES_POSITIONS_EVALUATED, positions, timestamp=now)
+            )

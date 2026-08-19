@@ -131,6 +131,11 @@ from core.game import Game
 from core.losses import LossBreakdown
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import Network, NetworkConfig
+from core.observability import (
+    CHECKPOINT_PUBLISHED_KIND,
+    gauge_record,
+    total_record,
+)
 from core.replay_shard import SampleRecord, _atomic_write_json
 from core.replay_window import ReplayWindow, samples_drawn
 from core.runconfig import RunConfig
@@ -146,8 +151,21 @@ REPLAY_RATIO_CEILING = 4.0
 # (core.metrics) -- one learner per run, so no id suffix.
 LEARNER_PROC = "learner"
 
-# The marker record's ``kind`` discriminator (module docstring).
-CHECKPOINT_PUBLISHED_KIND = "checkpoint_published"
+# CHECKPOINT_PUBLISHED_KIND is defined in core.observability (issue #62 owns
+# the full kind taxonomy) and re-exported here unchanged so existing
+# ``from core.learner import CHECKPOINT_PUBLISHED_KIND`` call sites keep
+# working verbatim.
+
+# The learner-owned series this module emits every trained step (issue #62).
+# ``learner_step`` is the exact ``total`` series; the rest are ``gauge``s,
+# never summed by the reducer -- see core.observability's module docstring
+# for the full kind taxonomy.
+SERIES_LEARNER_STEP = "learner_step"
+SERIES_LOSS_TOTAL = "loss_total"
+SERIES_LOSS_VALUE = "loss_value"
+SERIES_LOSS_POLICY = "loss_policy"
+SERIES_LOSS_AUX = "loss_aux"
+SERIES_REPLAY_RATIO = "replay_ratio"
 
 PACING_FILENAME = "pacing.json"
 PACING_HOLD = "hold"
@@ -364,6 +382,16 @@ class LearnerDriver:
                 for _ in range(self.step):
                     self.scheduler.step()
 
+        # The learner-owned metrics high-water (issue #62): the opaque
+        # ``metrics`` dict seam issue #56 built for exactly this. A fresh
+        # start has nothing to restore (``{}``); a resume seeds it from the
+        # winning bundle's own snapshot, so a query made before this
+        # process's first new step still reflects the pre-crash state rather
+        # than reading as freshly empty -- "restored totals continue, not
+        # reset" (module docstring's resume-transparency section applies
+        # here too).
+        self._high_water: dict[str, float] = dict(resumed.metrics) if resumed is not None else {}
+
         newest = newest_published_version(self.ckpt_dir)
         self.version = newest if newest is not None else 0
         # Completes any publish a prior process left unfinished at this
@@ -465,6 +493,7 @@ class LearnerDriver:
         self.step += 1
         self.scheduler.step()
         self._enforce_floor()
+        self._flush_step_metrics(parts)
         self._maybe_publish()
         return parts
 
@@ -521,6 +550,53 @@ class LearnerDriver:
             learner_step=self.step,
         )
 
+    # --- observability: per-step total/gauge series (issue #62) ------------
+
+    def _flush_step_metrics(self, parts: LossBreakdown) -> None:
+        """Append this step's total/gauge series and refresh the in-memory high-water.
+
+        Called once per trained step, after ``self.step`` already reflects
+        the completed step -- unconditional, unlike ``ActorDriver``'s opt-in
+        metrics wiring: this driver already owns ``self.epoch_writer``
+        unconditionally (issue #60's ``checkpoint_published`` marker), so
+        extending it with more series is "more of the same", not a new
+        optional seam. ``learner_step`` is the exact ``total`` series; the
+        loss components and the D5 replay ratio are ``gauge``s -- last-in-
+        time-order, never summed by the reducer (``core.observability``).
+        ``loss_aux`` and ``replay_ratio`` are appended only when there is
+        something real to report (an aux head exists; the window is
+        non-empty) -- never a fabricated placeholder value.
+
+        ``self._high_water`` mirrors exactly what was just appended (minus
+        ``learner_step``, which :meth:`_build_bundle` always derives fresh
+        from ``self.step`` instead) so the *next* checkpoint bundle --
+        published or the rolling resume snapshot -- carries it forward, and
+        a resumed driver's ``_high_water`` is never emptier than what the
+        winning bundle already captured.
+
+        Args:
+            parts: This step's ``LossBreakdown`` (``core.train.train_step``).
+        """
+        now = time.time()
+        self.epoch_writer.append(total_record(SERIES_LEARNER_STEP, self.step, timestamp=now))
+        for series, value in (
+            (SERIES_LOSS_TOTAL, parts.total),
+            (SERIES_LOSS_VALUE, parts.value),
+            (SERIES_LOSS_POLICY, parts.policy),
+        ):
+            v = float(value)
+            self._high_water[series] = v
+            self.epoch_writer.append(gauge_record(series, v, timestamp=now))
+        if parts.aux is not None:
+            v = float(parts.aux)
+            self._high_water[SERIES_LOSS_AUX] = v
+            self.epoch_writer.append(gauge_record(SERIES_LOSS_AUX, v, timestamp=now))
+        stored = self.window.positions_stored
+        if stored > 0:
+            ratio = samples_drawn(self.step, self.batch_size) / stored
+            self._high_water[SERIES_REPLAY_RATIO] = ratio
+            self.epoch_writer.append(gauge_record(SERIES_REPLAY_RATIO, ratio, timestamp=now))
+
     # --- one train step: sample, augment, collate, train_step ---------------
 
     def _training_row(self, record: SampleRecord, planes: Any, sparse_pi: Any) -> tuple[Any, ...]:
@@ -571,12 +647,21 @@ class LearnerDriver:
     def _build_bundle(self, version: int) -> CheckpointBundle:
         """Snapshot the live training objects into a bundle for ``version``.
 
+        ``metrics`` carries the learner's own high-water snapshot (issue
+        #62): ``self._high_water`` (the loss gauges / replay ratio as of the
+        most recent flushed step) plus ``learner_step`` computed fresh from
+        ``self.step`` every call -- never read from ``self._high_water``
+        itself, so it is always current even at a fresh step-0 build, before
+        :meth:`_flush_step_metrics` has ever run.
+
         Args:
             version: The model-version ordinal to stamp on the bundle.
 
         Returns:
             The assembled bundle (``core.checkpoint.build_bundle``).
         """
+        metrics = dict(self._high_water)
+        metrics[SERIES_LEARNER_STEP] = float(self.step)
         return build_bundle(
             version=version,
             learner_step=self.step,
@@ -585,9 +670,7 @@ class LearnerDriver:
             net=self.net,
             optimizer=self.optimizer,
             scaler=self.scaler,
-            # Reserved for issue #62's reducer high-water snapshot (tasks/m3/011,
-            # task 11.3); this module writes nothing into it yet.
-            metrics={},
+            metrics=metrics,
         )
 
     def _marker_published(self, version: int) -> bool:

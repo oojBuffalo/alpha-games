@@ -31,6 +31,7 @@ from core.checkpoint import (
     list_published_versions,
     load_checkpoint,
     read_latest_pointer,
+    resume_path,
 )
 from core.learner import (
     CHECKPOINT_PUBLISHED_KIND,
@@ -41,6 +42,7 @@ from core.learner import (
 )
 from core.metrics import EpochMetricsWriter, epoch_metrics_path, iter_epoch_records, next_epoch
 from core.network import NetworkConfig
+from core.observability import reduce_run
 from core.replay_shard import SampleRecord, shard_filename, write_shard
 from core.runconfig import TrainingConfig, load_run_config
 from games.blokus_duo import BlokusDuo
@@ -593,7 +595,11 @@ def test_immutability_a_redundant_publish_call_is_a_silent_no_op(tmp_path):
     before = published_path.read_bytes()
     driver._maybe_publish()  # self.step is already the version-1 boundary
     assert published_path.read_bytes() == before
-    markers = [r for r in iter_epoch_records(run_dir, "learner") if r["model_version"] == 1]
+    markers = [
+        r
+        for r in iter_epoch_records(run_dir, "learner")
+        if r.get("kind") == CHECKPOINT_PUBLISHED_KIND and r["model_version"] == 1
+    ]
     assert len(markers) == 1  # not duplicated by the redundant call
 
 
@@ -734,3 +740,50 @@ def test_resume_equivalence_straddles_a_publish_and_its_snapshot(tmp_path):
     ]
     counts = Counter(r["model_version"] for r in markers)
     assert counts == {0: 1, 1: 1, 2: 1}
+
+
+# ==============================================================================
+# 7. The observability high-water snapshot (issue #62): survives a resume
+# ==============================================================================
+
+
+def test_high_water_snapshot_survives_resume_and_continues_not_resets(tmp_path):
+    """The checkpoint ``metrics`` dict is the learner's own high-water
+    snapshot (issue #62, the opaque seam issue #56 built for this): a
+    resumed driver restores it verbatim rather than starting empty, and
+    ``reduce_run``'s cumulative curves only ever grow across the resume.
+    """
+    shard_dir = tmp_path / "shards"
+    write_real_micro_shards(shard_dir, n_shards=8, positions_per_shard=7)
+    cfg = tiny_micro_run_config(publish_interval=2, checkpoint_count=2, replay_warmup_positions=1)
+    ckpt_dir, run_dir = tmp_path / "ckpt", tmp_path / "run"
+
+    driver_b = make_micro_driver(shard_dir, ckpt_dir, run_dir, run_config=cfg, max_steps=1)
+    driver_b.run()
+    assert driver_b.step == 1
+
+    snapshot = load_checkpoint(resume_path(ckpt_dir), MICRO)
+    assert snapshot.metrics["learner_step"] == 1.0
+    assert "loss_total" in snapshot.metrics
+
+    reduced_before = reduce_run(run_dir)
+    assert reduced_before.totals["learner_step"] == 1.0
+    assert reduced_before.gauges["loss_total"] == snapshot.metrics["loss_total"]
+
+    # --- "kill"; resume into a fresh driver instance ------------------------
+    driver_c = make_micro_driver(shard_dir, ckpt_dir, run_dir, run_config=cfg)
+    assert driver_c.step == 1  # recovered from the rolling resume snapshot
+    # Restored *before* any new step trains: the exact prior snapshot, not
+    # an empty reset.
+    assert driver_c._high_water == snapshot.metrics
+
+    driver_c.run()  # trains the remaining steps to total_steps == 4
+    assert driver_c.step == 4
+
+    reduced_after = reduce_run(run_dir)
+    assert reduced_after.totals["learner_step"] == 4.0
+    # The reducer's cumulative learner_step total only ever grows across the
+    # resume -- never resets to 0, never reverts to the pre-resume value.
+    assert reduced_after.totals["learner_step"] > reduced_before.totals["learner_step"]
+    # The gauges reflect the *latest* step in run time order, post-resume.
+    assert reduced_after.gauges["loss_total"] == driver_c._high_water["loss_total"]
