@@ -15,6 +15,7 @@
   },
 
   "training": {
+    "_doc": "publish_interval/checkpoint_count are the M3 §6.2 pin (interval 200, K = 30; total_steps = 6000 for core.learner.LearnerDriver's own async stop condition, independent of the M2.5 fixed-budget learner_steps above). replay_warmup_positions is an implementation-level knob (not design-doc-pinned): the minimum positions_stored before the [2, 4] replay-ratio band is enforced.",
     "games": 2000,
     "learner_steps": 2000,
     "steps_per_game": 1,
@@ -24,7 +25,10 @@
     "warmup_steps": 200,
     "cosine_total_steps": 2000,
     "aux_loss_weight": 0.25,
-    "checkpoint_selection": "final"
+    "checkpoint_selection": "final",
+    "publish_interval": 200,
+    "checkpoint_count": 30,
+    "replay_warmup_positions": 128
   },
 
   "evaluation": {

@@ -401,12 +401,16 @@ class SelfPlayConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Training budget, optimizer schedule, and replay window (§12 M2.5).
+    """Training budget, optimizer schedule, and replay window (§12 M2.5/M3).
 
     Attributes:
         games: Self-play games in the run.
         learner_steps: Total learner steps — the pacing consequence of
-            ``games × steps_per_game``.
+            ``games × steps_per_game``. This is the M2.5 fixed-budget loop's
+            own stop condition (``scripts/run_micro.py``); the M3 async
+            actor-learner loop (``core/learner.py``) stops at its own
+            ``checkpoint_count * publish_interval`` instead (§6.2) -- the two
+            are deliberately independent scalars, not required to agree.
         steps_per_game: Learner steps per completed self-play game.
         batch_size: Learner minibatch size.
         replay_window: Replay ring-buffer capacity, in samples.
@@ -417,6 +421,23 @@ class TrainingConfig:
             ``tests/test_micro_config_file.py`` pins the two together.
         checkpoint_selection: Which checkpoint the evaluation gate reads; one of
             :data:`CHECKPOINT_SELECTIONS`.
+        publish_interval: Learner steps between weight publications (§6.2) --
+            pinned doc-first at M3: **200**. ``core.learner.LearnerDriver``
+            bumps ``model_version`` and publishes an immutable checkpoint
+            every ``publish_interval`` steps (version 0, the seeded init,
+            publishes once at fresh startup, outside this cadence).
+        checkpoint_count: *K*, the number of post-init publishes the primary
+            §1 Δ contrast draws from (§6.2) -- pinned doc-first at M3: **30**.
+            The learner stops at exactly ``checkpoint_count * publish_interval``
+            steps, never a partial final interval.
+        replay_warmup_positions: Minimum ``positions_stored`` the replay
+            window must hold before the learner enforces the D5 [2, 4] replay
+            ratio band in either direction (§7/§10) -- an implementation-level
+            knob (not itself a design-doc-pinned scalar) that exists only to
+            avoid a freshly started run deadlocking its own fill: with too
+            few positions stored, the ratio computed against an empty-ish
+            window is degenerate and would otherwise immediately signal
+            "hold" to actors before they have produced anything.
     """
 
     games: int
@@ -429,6 +450,9 @@ class TrainingConfig:
     cosine_total_steps: int
     aux_loss_weight: float
     checkpoint_selection: str
+    publish_interval: int
+    checkpoint_count: int
+    replay_warmup_positions: int
 
     def __post_init__(self) -> None:
         """Validate the budget, the schedule, and their coherence.
@@ -460,6 +484,9 @@ class TrainingConfig:
                 f"games ({self.games}) * steps_per_game ({self.steps_per_game})"
             )
         _one_of(self.checkpoint_selection, CHECKPOINT_SELECTIONS, "training.checkpoint_selection")
+        _positive(self.publish_interval, "training.publish_interval")
+        _positive(self.checkpoint_count, "training.checkpoint_count")
+        _positive(self.replay_warmup_positions, "training.replay_warmup_positions")
 
 
 @dataclass(frozen=True)
@@ -775,6 +802,9 @@ def _training_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
             "cosine_total_steps",
             "aux_loss_weight",
             "checkpoint_selection",
+            "publish_interval",
+            "checkpoint_count",
+            "replay_warmup_positions",
         ),
         where,
     )
@@ -789,6 +819,9 @@ def _training_from_dict(raw: Mapping[str, Any]) -> TrainingConfig:
         cosine_total_steps=_int(raw, "cosine_total_steps", where),
         aux_loss_weight=_float(raw, "aux_loss_weight", where),
         checkpoint_selection=_str(raw, "checkpoint_selection", where),
+        publish_interval=_int(raw, "publish_interval", where),
+        checkpoint_count=_int(raw, "checkpoint_count", where),
+        replay_warmup_positions=_int(raw, "replay_warmup_positions", where),
     )
 
 
