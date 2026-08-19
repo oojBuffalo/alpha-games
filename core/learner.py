@@ -377,14 +377,50 @@ class LearnerDriver:
     def run(self) -> list[LossBreakdown]:
         """Train steps until a stop condition triggers.
 
+        Blocks (:meth:`_await_first_data`) before each step until the
+        replay window holds at least one position -- unlike the D5 ratio
+        band, warm-up never waives this: a freshly started learner racing a
+        freshly started actor (issue #61's concurrent-process wiring) has no
+        other guarantee that any shard has been ingested yet by the time
+        this runs.
+
         Returns:
             The per-step ``LossBreakdown``s produced by this call, in step
             order.
         """
         results: list[LossBreakdown] = []
         while not self._stop_requested(len(results)):
+            if not self._await_first_data():
+                break  # should_stop fired before any data ever arrived
             results.append(self._run_step())
         return results
+
+    def _await_first_data(self) -> bool:
+        """Block (via ``wait``) until the window holds at least one position.
+
+        Training's first step needs *some* data to sample a batch from --
+        unlike the D5 ratio band, this is never waived by warm-up (the
+        module docstring's warm-up section is only about ratio
+        *enforcement*, not about whether training can start at all;
+        ``core.replay_window.ReplayWindow.sample_batch`` raises against a
+        genuinely empty window). A concurrently started learner has no other
+        guarantee an actor has written its first shard yet (issue #61), so
+        this is exactly where that startup race is resolved -- cheaply, a
+        single no-op rescan per step once the first shard has landed, since
+        ``positions_stored`` only grows.
+
+        Returns:
+            ``True`` once the window holds at least one position. ``False``
+            if ``should_stop`` fires first -- the caller must not train a
+            step against a window that might still be empty.
+        """
+        self.window.rescan()
+        while self.window.positions_stored == 0:
+            if self.should_stop is not None and self.should_stop():
+                return False
+            self.wait()
+            self.window.rescan()
+        return True
 
     def _stop_requested(self, steps_this_call: int) -> bool:
         """Return whether :meth:`run` should stop before training another step.
@@ -441,6 +477,14 @@ class LearnerDriver:
         real actor publishing new shards is what clears the block -- the
         "waits for ingestion" half of the D5 band. A no-op during warm-up
         (module docstring).
+
+        Also returns early if ``should_stop`` fires while blocked -- without
+        this, a learner waiting here for actors that have genuinely stalled
+        could never observe a shutdown signal (issue #61). Returning early
+        lets the in-flight step it was called from finish (train, advance,
+        publish-if-due, snapshot) exactly as the module docstring's
+        "Stop condition" section already promises; the ceiling is briefly
+        exceeded rather than the process hanging forever on exit.
         """
         self.window.rescan()
         if self.window.positions_stored < self.replay_warmup_positions:
@@ -449,6 +493,8 @@ class LearnerDriver:
             stored = self.window.positions_stored
             prospective = samples_drawn(self.step + 1, self.batch_size)
             if prospective / stored <= REPLAY_RATIO_CEILING:
+                return
+            if self.should_stop is not None and self.should_stop():
                 return
             self.wait()
             self.window.rescan()

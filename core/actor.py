@@ -232,8 +232,12 @@ class ActorDriver:
         """Play games until the stop condition triggers.
 
         Each iteration: check the stop condition, wait out a pacing hold,
-        refresh weights, play one whole game at the pinned version, and
-        publish it as its own shard. A production actor (no ``max_games`` /
+        re-check the stop condition (a hold can span an arbitrarily long
+        wait -- issue #61's signal-shutdown wiring needs the loop to notice
+        ``should_stop`` firing *during* the hold, not only at the top of the
+        next iteration, or a paused actor would never exit), refresh
+        weights, play one whole game at the pinned version, and publish it
+        as its own shard. A production actor (no ``max_games`` /
         ``should_stop``) loops forever, exactly like the design doc's
         actor–learner split assumes.
 
@@ -243,6 +247,12 @@ class ActorDriver:
         published: list[Path] = []
         while not self._stop_requested(len(published)):
             self._await_pacing()
+            # Only re-check when a pacing hook is actually installed: with
+            # none, ``_await_pacing`` is a guaranteed no-op and re-checking
+            # here would poll ``should_stop`` an extra, observable time per
+            # iteration for no behavioral gain.
+            if self.pacing is not None and self._stop_requested(len(published)):
+                break
             evaluator, model_version = self.refresh()
             published.append(self._play_and_publish_one_game(evaluator, model_version))
         return published
@@ -263,10 +273,19 @@ class ActorDriver:
         return self.should_stop is not None and self.should_stop()
 
     def _await_pacing(self) -> None:
-        """Block on the pacing hook, via ``wait``, until it clears (or is absent)."""
+        """Block on the pacing hook, via ``wait``, until it clears (or is absent).
+
+        Also returns early if ``should_stop`` fires while held -- without
+        this, an actor paused by a learner permanently below the D5 replay
+        floor could never observe a shutdown signal (issue #61): the pacing
+        hold has no other exit condition, so a signal-driven ``should_stop``
+        must be polled from inside it, not only between games.
+        """
         if self.pacing is None:
             return
         while self.pacing():
+            if self.should_stop is not None and self.should_stop():
+                return
             self.wait()
 
     def _play_and_publish_one_game(self, evaluator: Evaluator | None, model_version: int) -> Path:
