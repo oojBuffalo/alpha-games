@@ -43,7 +43,7 @@ ADAPTERS = [
 ]
 
 
-_TERMINALS: dict[tuple[int, int], State] = {}
+_TERMINALS: dict[tuple[Game, int], State] = {}
 
 
 def play_random(game: Game, seed: int) -> State:
@@ -53,6 +53,17 @@ def play_random(game: Game, seed: int) -> State:
     reused by every contract check below, so the full-game Blokus playouts run
     once each rather than once per assertion.
 
+    Keyed on ``game`` itself (identity-hashed — no adapter defines ``__eq__``),
+    not ``id(game)``. A raw ``id()`` is only unique among *simultaneously
+    existing* objects (the CPython object-identity guarantee, data model
+    §3.1): once a short-lived adapter built inside one parametrized call (e.g.
+    ``test_blokus_aux_equals_the_targets_module_golden``) is garbage-collected,
+    its address is free to be handed to the very next adapter allocated —
+    silently aliasing that new adapter onto a stale cache entry built for a
+    different config. Keying on ``game`` makes ``_TERMINALS`` hold a strong
+    reference to every memoized adapter, which keeps each one alive — and its
+    address un-reusable — for the rest of the run.
+
     Args:
         game: The adapter to play.
         seed: RNG seed for the move choices.
@@ -60,7 +71,7 @@ def play_random(game: Game, seed: int) -> State:
     Returns:
         The terminal state reached.
     """
-    key = (id(game), seed)
+    key = (game, seed)
     if key not in _TERMINALS:
         rng = random.Random(seed)
         state = game.initial_state()
