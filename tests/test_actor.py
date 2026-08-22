@@ -403,3 +403,72 @@ def test_different_actor_id_decorrelates_the_same_game_index(tmp_path):
     moves_a = [(r.mover, r.ply, r.sparse_pi) for r in records_a]
     moves_b = [(r.mover, r.ply, r.sparse_pi) for r in records_b]
     assert moves_a != moves_b
+
+
+# --- signal-shutdown wiring (issue #61): should_stop honored during a pacing hold ---
+
+
+def test_should_stop_firing_during_a_pacing_hold_exits_without_a_new_game(tmp_path):
+    """A hold has no other exit condition -- should_stop must be polled inside it."""
+    events = []
+
+    def pacing():
+        return True  # holds forever unless should_stop cuts it short
+
+    def wait():
+        events.append("wait")
+
+    def should_stop():
+        return len(events) >= 2  # fires partway through the hold
+
+    driver = make_driver(tmp_path, pacing=pacing, wait=wait, should_stop=should_stop)
+    paths = driver.run()
+
+    assert paths == []  # no game was ever in flight, so none gets played
+    assert events == ["wait", "wait"]
+
+
+def test_should_stop_firing_during_a_pacing_hold_still_finishes_an_in_flight_game(tmp_path):
+    """should_stop stops *production*, never an already-in-flight game."""
+    events = []
+    state = {"held": True, "games_started": 0}
+
+    def pacing():
+        return state["held"]
+
+    def wait():
+        events.append("wait")
+        if len(events) == 2:
+            state["held"] = False  # release the hold on the next poll
+
+    def refresh():
+        state["games_started"] += 1
+        return None, 1
+
+    def should_stop():
+        # True only once a game has actually started -- proves the hold's
+        # should_stop check never pre-empts a game already under way, while
+        # still stopping production immediately after it.
+        return state["games_started"] >= 1
+
+    driver = make_driver(
+        tmp_path, pacing=pacing, wait=wait, refresh=refresh, should_stop=should_stop
+    )
+    paths = driver.run()
+
+    assert len(paths) == 1
+    assert events == ["wait", "wait"]
+
+
+def test_should_stop_call_count_is_unchanged_when_no_pacing_hook_is_installed(tmp_path):
+    """The run()-level re-check only fires when a pacing hook exists (no extra polls)."""
+    checks = {"n": 0}
+
+    def should_stop():
+        checks["n"] += 1
+        return checks["n"] > 2
+
+    driver = make_driver(tmp_path, pacing=None, max_games=None, should_stop=should_stop)
+    paths = driver.run()
+    assert len(paths) == 2
+    assert checks["n"] == 3

@@ -372,6 +372,85 @@ def test_ceiling_never_blocks_when_already_within_band(tmp_path):
     assert driver.step == 1
 
 
+def test_ceiling_should_stop_escapes_the_wait_loop_and_the_step_still_completes(tmp_path):
+    """A learner shutting down while permanently ceiling-blocked must not hang forever.
+
+    Issue #61's signal-shutdown wiring needs ``should_stop`` polled from
+    inside the ceiling's wait loop -- otherwise a learner blocked on actors
+    that have genuinely stalled could never observe a shutdown signal. The
+    in-flight step must still run to completion once the escape fires (the
+    module docstring's "Stop condition" contract: ``run`` only stops
+    *between* steps).
+    """
+    shard_dir = tmp_path / "shards"
+    _write_ttt_shard(shard_dir, "run", "a", 0, 2)  # positions_stored = 2, never grows
+    calls = {"n": 0}
+
+    def wait():
+        calls["n"] += 1
+
+    def should_stop():
+        return calls["n"] >= 3
+
+    training = ttt_training_config(batch_size=10, replay_warmup_positions=1)
+    driver = make_ttt_driver(
+        tmp_path, training=training, shard_dir=shard_dir, wait=wait, should_stop=should_stop
+    )
+    driver._run_step()  # would block forever pre-#61 without the should_stop escape
+
+    assert calls["n"] == 3  # stopped waiting the instant should_stop fired
+    assert driver.step == 1  # the in-flight step still ran to completion
+
+
+def test_run_blocks_until_the_first_shard_lands_then_trains(tmp_path):
+    """Warm-up waives ratio *enforcement*, never whether training can start.
+
+    A freshly started learner racing a freshly started actor (issue #61) has
+    no other guarantee any shard exists yet when ``run`` starts -- this is
+    the wait that resolves it.
+    """
+    shard_dir = tmp_path / "shards"
+    calls = {"n": 0}
+
+    def wait():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            _write_ttt_shard(shard_dir, "run", "a", 0, 3)
+
+    training = ttt_training_config(batch_size=4, replay_warmup_positions=1)
+    driver = make_ttt_driver(
+        tmp_path, training=training, shard_dir=shard_dir, wait=wait, max_steps=1
+    )
+    results = driver.run()
+
+    assert calls["n"] == 2  # blocked exactly until the first shard was ingested
+    assert len(results) == 1
+    assert driver.step == 1
+
+
+def test_run_with_should_stop_before_any_data_ever_arrives_trains_nothing(tmp_path):
+    """A shutdown signal that beats every actor to the punch must not crash."""
+    shard_dir = tmp_path / "shards"  # never populated
+
+    def wait():
+        pass  # nothing ever appears; should_stop is what ends the wait
+
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    training = ttt_training_config(batch_size=4, replay_warmup_positions=1)
+    driver = make_ttt_driver(
+        tmp_path, training=training, shard_dir=shard_dir, wait=wait, should_stop=should_stop
+    )
+    results = driver.run()
+
+    assert results == []  # never trained a step against an empty window
+    assert driver.step == 0
+
+
 def test_floor_writes_hold_below_two_and_clears_to_go_at_two(tmp_path):
     shard_dir = tmp_path / "shards"
     _write_ttt_shard(shard_dir, "run", "a", 0, 100)  # positions_stored = 100, static
