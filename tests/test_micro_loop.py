@@ -314,6 +314,26 @@ def test_root_noise_off_changes_the_game_but_not_its_legality():
     assert with_noise.moves != without.moves
 
 
+# --- M3 backward-compatible extension (model_version / game_id) ----------------
+
+
+def test_play_game_leaves_model_version_and_game_id_unset_by_default():
+    """Every M2.5-era caller is unaffected: both new fields default to None."""
+    cfg = self_play_cfg(sims=8, k_temp=2)
+    result = play_game(MICRO, None, cfg, GameRNGs.for_game(5, 4))
+    assert all(s.model_version is None and s.game_id is None for s in result.samples)
+
+
+def test_play_game_stamps_an_optional_model_version_and_game_id():
+    """The M3 actor layer's extension: both are caller-supplied labels, verbatim."""
+    cfg = self_play_cfg(sims=8, k_temp=2)
+    game_id = ("run-x", "actor-0", 7)
+    result = play_game(MICRO, None, cfg, GameRNGs.for_game(5, 4), model_version=3, game_id=game_id)
+    assert result.samples  # a real game was played
+    assert all(s.model_version == 3 for s in result.samples)
+    assert all(s.game_id == game_id for s in result.samples)
+
+
 # --- replay window --------------------------------------------------------------
 
 

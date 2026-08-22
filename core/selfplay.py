@@ -32,6 +32,18 @@ mover-relative own/opponent encoding the network is trained on.
 Seeding is per-purpose (``core.seeding``): ``play_game`` takes a
 :class:`~core.seeding.GameRNGs` bundle, so a change in how many Dirichlet draws a
 search makes cannot shift the move-selection sequence.
+
+M3 (issue #59) extends :class:`Sample`/:func:`play_game` backward-compatibly with
+the two fields the full on-disk sample record (``core.replay_shard.PendingSample``)
+needs beyond what this module already produced: ``model_version`` (the pinned
+weight version the whole game's search ran against, §6.2) and ``game_id`` (the
+durable ``(run_id, actor_id, game_index)`` triple). Both are optional keyword-only
+parameters on ``play_game``, stamped verbatim onto every sample of the game;
+omitted, they default to ``None`` and every existing call site (the micro loop,
+the exit gate) is unaffected. Assigning a *real* ``game_id`` is never this
+module's job — that identity comes from exactly one place,
+``core.replay_shard.ShardWriter``'s persisted state — ``play_game`` only carries
+whatever label its caller (``core.actor.ActorDriver``) already derived from it.
 """
 
 from __future__ import annotations
@@ -141,7 +153,9 @@ class Sample:
     ``(planes, sparse_pi, ply)`` is the base triple M3's versioned
     ``SampleRecord`` extends backward-compatibly; ``mover`` is carried because
     the terminal backfill is mover-relative, and ``z``/``aux`` are ``None`` until
-    that backfill runs (:func:`backfill_targets`).
+    that backfill runs (:func:`backfill_targets`). ``model_version``/``game_id``
+    are the two fields the M3 actor layer adds on top (see the module docstring);
+    both are ``None`` unless ``play_game`` was called with them set.
 
     Attributes:
         planes: The adapter's ``encode_state`` output (nested tuples; the
@@ -154,6 +168,14 @@ class Sample:
         z: The D1 primary target, or ``None`` before backfill.
         aux: The declared auxiliary targets in head order, or ``None`` before
             backfill (a game declaring no aux heads backfills an empty tuple).
+        model_version: The pinned weight version the search ran against (§6.2),
+            or ``None`` when the caller did not supply one (every non-actor
+            caller, e.g. the micro loop).
+        game_id: The durable ``(run_id, actor_id, game_index)`` triple this
+            sample's game was played under, or ``None`` when the caller did not
+            supply one. Never assigned by this module — only ever a label
+            carried through from the caller (``core.actor.ActorDriver``, which
+            reads it from ``core.replay_shard.ShardWriter``'s persisted state).
     """
 
     planes: Any
@@ -162,6 +184,8 @@ class Sample:
     mover: PlayerId
     z: float | None = None
     aux: tuple[float, ...] | None = None
+    model_version: int | None = None
+    game_id: tuple[str, str, int] | None = None
 
     def training_row(self, num_aux: int) -> tuple[Any, ...]:
         """Return the sample in ``core.train.collate``'s spec-driven row shape.
@@ -250,6 +274,9 @@ def play_game(
     evaluator: Evaluator | None,
     cfg: SelfPlayConfig,
     rngs: GameRNGs,
+    *,
+    model_version: int | None = None,
+    game_id: tuple[str, str, int] | None = None,
 ) -> GameResult:
     """Play one complete self-play game, returning its stored samples.
 
@@ -273,6 +300,15 @@ def play_game(
             tie-break and the D10 argmax tie-break are deterministic, and the
             stream stays reserved so introducing a randomized tie-break later
             cannot shift the move-selection sequence.
+        model_version: Stamped verbatim onto every sample's ``Sample.model_version``
+            (§6.2 version pinning — one model version per game). ``None`` (the
+            default) leaves every sample's ``model_version`` unset, which is what
+            every caller through M2.5 does; the M3 actor layer is the first
+            caller to pass one.
+        game_id: Stamped verbatim onto every sample's ``Sample.game_id``. This
+            function never derives or validates the id — it is only ever a
+            label the caller already owns (``core.actor.ActorDriver``, from
+            ``core.replay_shard.ShardWriter``'s persisted state).
 
     Returns:
         The finished :class:`GameResult`, its samples already backfilled.
@@ -296,6 +332,8 @@ def play_game(
                 sparse_pi=tuple(policy_target(visits)),
                 ply=ply,
                 mover=game.current_player(state),
+                model_version=model_version,
+                game_id=game_id,
             )
         )
         action = select_move(visits, ply, cfg.k_temp, rngs.move_selection)
