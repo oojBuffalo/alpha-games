@@ -106,7 +106,14 @@ from core.actor import ActorDriver, PacingFn, RefreshFn, RefreshResult, WaitFn
 from core.checkpoint import load_checkpoint, published_checkpoint_path, read_latest_pointer
 from core.game import Game
 from core.learner import PACING_HOLD, LearnerDriver, pacing_file_path, read_pacing_file
+from core.metrics import EpochMetricsWriter
 from core.network import Network, NetworkConfig, make_network_evaluator
+from core.observability import (
+    PositionCounter,
+    count_positions,
+    segment_end_record,
+    segment_start_record,
+)
 from core.runconfig import RunConfig, SelfPlayConfig
 
 # A zero-argument, picklable callable that builds a fresh adapter instance.
@@ -198,6 +205,7 @@ def build_actor_refresh(
     network_config: NetworkConfig | None = None,
     poll_interval: float = 1.0,
     wait: WaitFn | None = None,
+    position_counter: PositionCounter | None = None,
 ) -> RefreshFn:
     """Build the real ``refresh`` seam: the learner's ``latest`` pointer, live.
 
@@ -238,6 +246,15 @@ def build_actor_refresh(
         wait: The backoff strategy invoked while blocked on a first
             checkpoint. Defaults to a real sleep of ``poll_interval``; tests
             inject their own no-sleep fake.
+        position_counter: Optional (issue #62). When given, every built
+            evaluator is wrapped with ``core.observability.count_positions``
+            before caching, so every leaf-inference call this actor makes
+            through it adds ``1`` position to the counter (M3's batch-1
+            bridge). ``None`` (the default) returns
+            ``core.network.make_network_evaluator``'s evaluator unwrapped --
+            byte-identical to every call site that predates this parameter.
+            Wrapped once per newly-built version, never re-wrapped on a
+            cache hit.
 
     Returns:
         A zero-argument ``RefreshFn`` returning ``(evaluator, model_version)``
@@ -257,7 +274,10 @@ def build_actor_refresh(
             bundle = load_checkpoint(published_checkpoint_path(directory, version), game)
             net = Network(net_config).to(device)
             net.load_state_dict(bundle.model_state_dict)
-            cache["evaluator"] = make_network_evaluator(net, game, device=device)
+            evaluator = make_network_evaluator(net, game, device=device)
+            if position_counter is not None:
+                evaluator = count_positions(evaluator, position_counter)
+            cache["evaluator"] = evaluator
             cache["version"] = version
         return cache["evaluator"], cache["version"]
 
@@ -320,6 +340,16 @@ def run_actor_process(
     ``max_games`` (test-facing). Every argument is picklable so this function
     is a valid ``spawn``-context ``Process`` target (module docstring).
 
+    Every real actor process is observed unconditionally (issue #62: "captured
+    live from step zero of every run") -- unlike ``core.actor.ActorDriver``'s
+    own ``metrics_writer``/``position_counter`` constructor parameters, which
+    stay optional/``None``-default so a driver built directly (most of
+    ``tests/test_actor.py``) is unaffected. This process entrypoint opens this
+    actor's ``run_dir/metrics/actor-<actor_id>-<epoch>.jsonl`` writer, a fresh
+    :class:`~core.observability.PositionCounter`, and wires the counter into
+    :func:`build_actor_refresh` so every leaf-inference call this actor makes
+    is counted.
+
     Args:
         game_factory: Builds this process's adapter instance.
         self_play: The D6 validate-tier self-play scalars
@@ -344,12 +374,15 @@ def run_actor_process(
     """
     game = game_factory()
     stop = ShutdownFlag().install()
+    metrics_writer = EpochMetricsWriter(run_dir, f"actor-{actor_id}")
+    position_counter = PositionCounter()
     refresh = build_actor_refresh(
         game=game,
         ckpt_dir=ckpt_dir,
         device=device,
         network_config=network_config,
         poll_interval=refresh_poll_interval,
+        position_counter=position_counter,
     )
     pacing = build_actor_pacing(run_dir)
     driver = ActorDriver(
@@ -364,6 +397,8 @@ def run_actor_process(
         wait=lambda: _default_wait(pacing_poll_interval),
         max_games=max_games,
         should_stop=stop,
+        metrics_writer=metrics_writer,
+        position_counter=position_counter,
     )
     driver.run()
 
@@ -488,24 +523,39 @@ class LaunchedRun:
         actors: Live actor process handles, keyed by ``actor_id``. A caller
             restarting a killed actor re-keys this dict with the new handle:
             ``launched.actors[actor_id] = start_actor_process(launched.ctx, **kwargs)``.
+        metrics_writer: This run's ``orchestrator`` epoch-metrics writer
+            (issue #62) -- the single, coordinator-owned source of GPU-hour
+            segment records. :func:`launch_run` already appended this run's
+            ``segment_start`` record before returning; :meth:`shutdown`
+            appends the matching ``segment_end``.
     """
 
     ctx: BaseContext
     learner: multiprocessing.process.BaseProcess
     actors: dict[int, multiprocessing.process.BaseProcess]
+    metrics_writer: EpochMetricsWriter
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
         return (self.learner, *self.actors.values())
 
     def shutdown(self, timeout: float = 30.0) -> None:
-        """Send SIGTERM to every live process and join them.
+        """Send SIGTERM to every live process, join them, and close the GPU-hour segment.
 
         ``Process.terminate()`` sends ``SIGTERM`` (never ``SIGKILL``) --
         exactly the signal :class:`ShutdownFlag` catches, so every process
         runs its own clean-shutdown path (module docstring) rather than
         being killed mid-write. Every process is signaled before any join,
         so they shut down concurrently rather than one at a time.
+
+        The ``segment_end`` record (issue #62) is appended last, after every
+        process has been joined (or timed out) -- it marks the orchestrator's
+        own single-counted GPU-hour segment as complete, so it should not be
+        written while a process this run started might still be using the
+        device. A run whose ``shutdown`` is never called (or that crashes
+        first) simply never closes its segment -- ``core.observability
+        .reduce_run``'s documented, conservative "an unterminated segment
+        contributes zero" rule, not a special case here.
 
         Args:
             timeout: Seconds to wait for each process to exit on its own
@@ -518,6 +568,7 @@ class LaunchedRun:
                 process.terminate()
         for process in self.all_processes():
             process.join(timeout)
+        self.metrics_writer.append(segment_end_record())
 
 
 def launch_run(
@@ -549,6 +600,15 @@ def launch_run(
     launch primitive: the CLI it builds resolves a ``RunConfig`` and calls
     this; this module makes no config-file or CLI-argument decisions itself.
 
+    This is also where the run's GPU-hour segment starts (issue #62): the
+    orchestrator -- this calling process, never a spawned child -- is the one
+    entity that knows about every process sharing the device, so it is the
+    only sanctioned writer of GPU-hour records (module docstring's
+    "single-counted regardless of process count"). The ``segment_start``
+    record is appended before any child process starts, so the segment's
+    span is a strict superset of every actor/learner process's lifetime;
+    :meth:`LaunchedRun.shutdown` appends the matching ``segment_end``.
+
     Args:
         game_factory: Builds each process's own adapter instance (called
             once per process, not shared).
@@ -578,6 +638,8 @@ def launch_run(
         A :class:`LaunchedRun` with live handles for the learner and every
         started actor.
     """
+    metrics_writer = EpochMetricsWriter(run_dir, "orchestrator")
+    metrics_writer.append(segment_start_record(device=device))
     ctx = new_spawn_context()
     learner = start_learner_process(
         ctx,
@@ -611,4 +673,4 @@ def launch_run(
         )
         for actor_id in ids
     }
-    return LaunchedRun(ctx=ctx, learner=learner, actors=actors)
+    return LaunchedRun(ctx=ctx, learner=learner, actors=actors, metrics_writer=metrics_writer)
