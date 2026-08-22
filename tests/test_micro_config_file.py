@@ -85,6 +85,13 @@ EXPECTED: dict[str, Any] = {
         "cosine_total_steps": 2000,
         "aux_loss_weight": 0.25,
         "checkpoint_selection": "final",
+        # M3 §6.2 pin (PR #76): publish every 200 learner steps, K = 30
+        # checkpoints (core.learner.LearnerDriver's own async stop condition,
+        # independent of learner_steps above). replay_warmup_positions is an
+        # implementation-level (not design-doc-pinned) knob.
+        "publish_interval": 200,
+        "checkpoint_count": 30,
+        "replay_warmup_positions": 128,
     },
     # "the rung-7 agent form at 64 eval sims, no Dirichlet noise and
     # deterministic argmax-N move choice. Opponent: rung 1 (uniform random).
@@ -215,6 +222,9 @@ def test_loader_parses_the_pinned_file():
     assert cfg.training.warmup_steps == 200
     assert cfg.training.cosine_total_steps == 2000
     assert cfg.training.checkpoint_selection == "final"
+    assert cfg.training.publish_interval == 200
+    assert cfg.training.checkpoint_count == 30
+    assert cfg.training.replay_warmup_positions == 128
 
     assert cfg.evaluation.agent_form == "rung7_mcts_policy_value"
     assert cfg.evaluation.sims == 64
