@@ -12,7 +12,7 @@ the search tree itself does not require hashability.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -104,6 +104,45 @@ class Game(ABC):
     @abstractmethod
     def value_targets(self) -> ValueTargetSpec:
         """Declared value/aux target specification (design doc §6.1, D1)."""
+
+    # --- declared replay/checkpoint fingerprint surface (M3, §5.1/§12) ---------
+    # Read by ``core.artifact_fingerprint.build_fingerprint`` — never hardcoded
+    # per-game there. Both are non-abstract with game-agnostic defaults so every
+    # M0/M1/M1.5 adapter keeps working unmodified; only a game whose encoding
+    # carries a convention block or an orientation table overrides one.
+
+    @property
+    def orientation_table_hash(self) -> str | None:
+        """Hex digest of this adapter's orientation table, or ``None`` if it has none.
+
+        Invariant 4 (§5.1): orientation-ID assignment must be serialized and
+        validated on load so a silent id remapping can't corrupt replay shards
+        or checkpoints. Only piece-orientation games (the Blokus family) carry
+        such a table; every other adapter (TTT, Connect 4, Othello) declares
+        nothing and gets the default ``None`` rather than a game-specific
+        sentinel.
+
+        Returns:
+            The sha256 hex digest of the orientation table, or ``None``.
+        """
+        return None
+
+    @property
+    def encoding_conventions(self) -> Mapping[str, Any]:
+        """Declared encoding-convention block for the fingerprint, or ``{}``.
+
+        Free-form JSON-serializable key/value pairs describing whatever
+        operational conventions the adapter's encoding surface depends on
+        (axis order, flatten formula, anchor rule, board size, start squares,
+        ...) — the §5.1 "conventions" block fixture files already embed
+        alongside the orientation hash. The default is empty: an adapter with
+        nothing convention-sensitive to declare (TTT, Connect 4, Othello)
+        declares nothing rather than a game-specific placeholder.
+
+        Returns:
+            A mapping of JSON-serializable convention values.
+        """
+        return {}
 
     # --- core contract ---------------------------------------------------------
 
