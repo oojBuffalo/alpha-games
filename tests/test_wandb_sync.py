@@ -505,65 +505,129 @@ class _FakeRun:
         self.metric_defines[name] = step_metric
 
 
-class _CrashAfterN:
-    """Wraps a :class:`_FakeRun` so its ``log`` raises after ``n`` accepted calls.
+def test_write_ahead_plan_reviewer_scenario_new_record_becomes_eligible_before_retry(tmp_path):
+    """Reviewer's exact scenario (comment: 'next_step is not stable across a crash if new
+    records arrive before retry'). Pass 1 computes a plan logging learner L1 at step 0 and
+    actor A1 at step 1; simulate a crash after those rows are logged but before the plan is
+    applied/cleared (the sidecar still holds the pending plan, cursors unadvanced). Before
+    retry, learner L2 becomes finalized. Retry must replay L1@0 and A1@1 verbatim (identical
+    payload/step to the pre-crash attempt -- what a real server drops), then assign L2 a
+    *fresh* step (2) rather than colliding with A1's step or dropping L2."""
+    root = _write_run(tmp_path, run_id="run-plan-new-record", now=0.0)
+    learner_writer = EpochMetricsWriter(root, "learner")
+    actor_writer = EpochMetricsWriter(root, "actor-0")
+    for rec in _learner_group(1, 10.0) + _learner_group(2, 11.0):  # L2 not yet finalized
+        learner_writer.append(rec)
+    for rec in _game(10.0) + _game(20.0):  # A1 finalized by the second game's boundary
+        actor_writer.append(rec)
 
-    Simulates "logged some rows then the process crashed": the wrapped
-    run's own ``.logged`` list still reflects exactly what was accepted
-    before the raise, the same way a real crash would leave whatever the
-    (real) wandb client had already durably queued.
-    """
+    state = ws.load_sync_state(root)
+    plan = ws._compute_batch(root, state, finalize=False)
+    assert len(plan["rows"]) == 2
+    assert plan["rows"][0]["payload"]["learner/learner_step"] == 1
+    assert plan["rows"][1]["payload"]["actor/proc"] == "actor-0"
+    assert [row["step"] for row in plan["rows"]] == [0, 1]
 
-    def __init__(self, inner: _FakeRun, n: int):
-        self._inner = inner
-        self._n = n
-        self.summary = inner.summary
+    # Persist the plan (write-ahead), log every row -- then "crash": never apply/clear it.
+    state.pending_plan = plan
+    ws.save_sync_state(root, state)
+    pre_crash_run = _FakeRun()
+    for row in plan["rows"]:
+        pre_crash_run.log(row["payload"], step=row["step"], commit=True)
 
-    def log(self, payload, *, step=None, commit=None):
-        if len(self._inner.logged) >= self._n:
-            raise RuntimeError("simulated crash mid-sync")
-        self._inner.log(payload, step=step, commit=commit)
+    # Before retry, L2 becomes finalized (a third learner group proves L2 done).
+    learner_writer.append(
+        {
+            "kind": "total",
+            "series": "learner_step",
+            "value": 3,
+            "timestamp": 12.0,
+        }
+    )
 
-    def define_metric(self, name, *, step_metric=None):
-        self._inner.define_metric(name, step_metric=step_metric)
+    # "Process restart": reload state from disk -- the pending plan survived the crash.
+    state2 = ws.load_sync_state(root)
+    assert state2.pending_plan is not None
+    fresh_run = _FakeRun()
+    changed = ws.sync_once(fresh_run, root, state2, finalize=False)
+    assert changed is True
+
+    # L1 and A1 replay verbatim: same step, same payload as the pre-crash attempt.
+    assert fresh_run.logged[0]["step"] == pre_crash_run.logged[0]["step"] == 0
+    assert fresh_run.logged[0]["payload"] == pre_crash_run.logged[0]["payload"]
+    assert fresh_run.logged[1]["step"] == pre_crash_run.logged[1]["step"] == 1
+    assert fresh_run.logged[1]["payload"] == pre_crash_run.logged[1]["payload"]
+    # L2 is picked up fresh -- a new step, never colliding with A1's already-used step 1.
+    assert len(fresh_run.logged) == 3
+    assert fresh_run.logged[2]["step"] == 2
+    assert fresh_run.logged[2]["payload"]["learner/learner_step"] == 2
+    assert state2.pending_plan is None
+    assert state2.next_step == 3
 
 
-def test_crash_before_cursor_persistence_replays_with_identical_deterministic_steps(tmp_path):
-    """Comment 1: a crash after some accepted ``run.log`` calls, before the sidecar is
-    saved, must replay those same rows with the exact same steps on the next attempt --
-    the mechanism real wandb's resume path relies on to drop the replay server-side."""
-    root = _write_run(tmp_path, run_id="run-crash-replay", now=0.0)
+def test_write_ahead_plan_crash_before_any_row_logged(tmp_path):
+    """Comment A: a crash right after the plan is persisted, before a single row is logged --
+    retry must log every planned row, verbatim, with nothing lost."""
+    root = _write_run(tmp_path, run_id="run-plan-crash-before-log", now=0.0)
     writer = EpochMetricsWriter(root, "learner")
-    for rec in _learner_group(1, 10.0) + _learner_group(2, 11.0) + _learner_group(3, 12.0):
+    for rec in _learner_group(1, 10.0):
         writer.append(rec)
 
-    inner = _FakeRun()
-    crashing = _CrashAfterN(inner, n=2)
-    state1 = ws.load_sync_state(root)
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        ws.sync_once(crashing, root, state1, finalize=True)
-    # Exactly 2 of the 3 groups were accepted before the crash; nothing was persisted.
-    accepted_before_crash = list(inner.logged)
-    assert len(accepted_before_crash) == 2
-    assert not ws.sync_state_path(root).exists()
+    state = ws.load_sync_state(root)
+    plan = ws._compute_batch(root, state, finalize=True)
+    assert len(plan["rows"]) == 1
 
-    # "Process restart": reload state from disk (unchanged -- nothing was ever saved).
+    state.pending_plan = plan
+    ws.save_sync_state(root, state)
+    # "Crash" -- no run.log call ever happens for this attempt.
+
     state2 = ws.load_sync_state(root)
-    assert state2 == ws.SyncState()
+    assert state2.pending_plan is not None
     fresh_run = _FakeRun()
     changed = ws.sync_once(fresh_run, root, state2, finalize=True)
     assert changed is True
-    assert len(fresh_run.logged) == 3
+    assert len(fresh_run.logged) == 1
+    assert fresh_run.logged[0]["step"] == plan["rows"][0]["step"] == 0
+    assert fresh_run.logged[0]["payload"] == plan["rows"][0]["payload"]
+    assert fresh_run.logged[0]["commit"] is True
+    assert state2.pending_plan is None
 
-    # The replayed attempt reassigns the exact same step (and payload) to the same rows.
-    for original, replayed in zip(accepted_before_crash, fresh_run.logged[:2], strict=False):
+
+def test_write_ahead_plan_crash_mid_batch_prefix_accepted(tmp_path):
+    """Comment A: a crash after only a prefix of the plan's rows were logged -- retry
+    replays the *entire* plan (including the already-accepted prefix) verbatim; a real
+    server drops that prefix via the step mechanism, so nothing is duplicated, and the
+    rest of the batch (never accepted) is logged for the first time."""
+    root = _write_run(tmp_path, run_id="run-plan-crash-mid-batch", now=0.0)
+    learner_writer = EpochMetricsWriter(root, "learner")
+    actor_writer = EpochMetricsWriter(root, "actor-0")
+    for rec in _learner_group(1, 10.0) + _learner_group(2, 11.0):
+        learner_writer.append(rec)
+    for rec in _game(10.0) + _game(20.0):
+        actor_writer.append(rec)
+
+    state = ws.load_sync_state(root)
+    plan = ws._compute_batch(root, state, finalize=False)
+    assert len(plan["rows"]) == 2
+
+    state.pending_plan = plan
+    ws.save_sync_state(root, state)
+    pre_crash_run = _FakeRun()
+    pre_crash_run.log(plan["rows"][0]["payload"], step=plan["rows"][0]["step"], commit=True)
+    # "Crash" -- the second row (A1) was never sent.
+
+    state2 = ws.load_sync_state(root)
+    fresh_run = _FakeRun()
+    changed = ws.sync_once(fresh_run, root, state2, finalize=False)
+    assert changed is True
+    assert len(fresh_run.logged) == 2
+    for original, replayed in zip(plan["rows"], fresh_run.logged, strict=True):
         assert replayed["step"] == original["step"]
-        assert replayed["commit"] is True
         assert replayed["payload"] == original["payload"]
-    # Steps are monotonically increasing across the whole replayed pass.
-    steps = [row["step"] for row in fresh_run.logged]
-    assert steps == sorted(steps)
-    assert len(set(steps)) == len(steps)
+    # The already-accepted prefix matches exactly what the crashed attempt had logged.
+    assert fresh_run.logged[0]["step"] == pre_crash_run.logged[0]["step"]
+    assert fresh_run.logged[0]["payload"] == pre_crash_run.logged[0]["payload"]
+    assert state2.pending_plan is None
 
 
 def test_one_shot_default_holds_back_an_incomplete_flush_then_completes_on_the_next_sync(
@@ -755,6 +819,131 @@ def test_checkpoint_payload_carries_the_positions_and_gpu_hours_axis_fields(tmp_
     assert payload["checkpoint/gpu_hours_axis"] == payload["checkpoint/gpu_hours"]
     assert payload["checkpoint/marker_vs_positions"] == payload["checkpoint/model_version"]
     assert payload["checkpoint/marker_vs_gpu_hours"] == payload["checkpoint/model_version"]
+
+
+def test_clock_rollback_clamps_wall_clock_axis_and_never_regresses(tmp_path):
+    """Comment B: reviewer's exact scenario -- one actor appends timestamps 10,20,30,15,16
+    (a clock rollback after t=30), plus a successor game to finalize the t=16 group under
+    the default finalize=False. The released actor/wall_clock_s values must never regress:
+    15 and 16 release pinned at the pre-rollback high-water mark (30), not at their own raw
+    (smaller) timestamps, and cumulative totals still advance by exactly one game per row."""
+    root = _write_run(tmp_path, run_id="run-rollback-single", now=0.0)
+    writer = EpochMetricsWriter(root, "actor-0")
+    for rec in _game(10.0) + _game(20.0) + _game(30.0) + _game(15.0) + _game(16.0) + _game(40.0):
+        writer.append(rec)
+
+    fake_run = _FakeRun()
+    state = ws.load_sync_state(root)
+    changed = ws.sync_once(fake_run, root, state, finalize=False)
+    assert changed is True
+
+    wall_clock = [row["payload"]["actor/wall_clock_s"] for row in fake_run.logged]
+    assert wall_clock == [10.0, 20.0, 30.0, 30.0, 30.0]
+    assert wall_clock == sorted(wall_clock)  # never regresses, even across the rollback
+    games = [row["payload"]["actor/games_completed"] for row in fake_run.logged]
+    assert games == [1, 2, 3, 4, 5]
+    sims = [row["payload"]["actor/sims_run"] for row in fake_run.logged]
+    assert sims == [10, 20, 30, 40, 50]
+    # The t=40 successor (needed only to finalize the t=16 group) stays held back as the
+    # new trailing group -- nothing beyond the 5 real games is released yet.
+    assert len(fake_run.logged) == 5
+    assert state.actor_watermarks["actor-0"] == 30.0
+
+
+def test_clock_rollback_with_second_actor_global_sort_and_cumulative_totals(tmp_path):
+    """Comment B: the same clock-rollback actor alongside a second, normally-advancing
+    actor. The global watermark and release sort must both use effective_ts (never the raw
+    timestamp): actor 1's own group at t=35 is held back because actor 0's watermark (capped
+    at 30 by the rollback) hasn't reached it, even though actor 1's *own* stream is fine --
+    demonstrating the watermark and the clamp composing correctly. --finalize then flushes
+    everything still buffered, in global sorted order, with correct running cumulatives."""
+    root = _write_run(tmp_path, run_id="run-rollback-two-actors", now=0.0)
+    actor0 = EpochMetricsWriter(root, "actor-0")
+    actor1 = EpochMetricsWriter(root, "actor-1")
+    for rec in _game(10.0) + _game(20.0) + _game(30.0) + _game(15.0) + _game(16.0) + _game(40.0):
+        actor0.append(rec)
+    for rec in _game(25.0) + _game(35.0) + _game(45.0):
+        actor1.append(rec)
+
+    fake_run = _FakeRun()
+    state = ws.load_sync_state(root)
+    changed = ws.sync_once(fake_run, root, state, finalize=False)
+    assert changed is True
+
+    released = [
+        (row["payload"]["actor/proc"], row["payload"]["actor/wall_clock_s"])
+        for row in fake_run.logged
+    ]
+    assert released == [
+        ("actor-0", 10.0),
+        ("actor-0", 20.0),
+        ("actor-1", 25.0),
+        ("actor-0", 30.0),
+        ("actor-0", 30.0),
+        ("actor-0", 30.0),
+    ]
+    wall_clock = [ts for _, ts in released]
+    assert wall_clock == sorted(wall_clock)
+    games = [row["payload"]["actor/games_completed"] for row in fake_run.logged]
+    assert games == [1, 2, 3, 4, 5, 6]
+    sims = [row["payload"]["actor/sims_run"] for row in fake_run.logged]
+    assert sims == [10, 20, 30, 40, 50, 60]
+    # actor 1's own t=35 group is held back: the GLOBAL watermark is capped at actor 0's
+    # rollback-pinned high-water mark (30), not actor 1's own (35) -- nothing is dropped.
+    assert [g["effective_ts"] for g in state.actor_buffer["actor-1"]] == [35.0]
+
+    changed2 = ws.sync_once(fake_run, root, state, finalize=True)
+    assert changed2 is True
+    tail = [
+        (row["payload"]["actor/proc"], row["payload"]["actor/wall_clock_s"])
+        for row in fake_run.logged[6:]
+    ]
+    assert tail == [("actor-1", 35.0), ("actor-0", 40.0), ("actor-1", 45.0)]
+    assert [row["payload"]["actor/games_completed"] for row in fake_run.logged[6:]] == [7, 8, 9]
+    assert state.actor_buffer == {}
+    # The complete release sequence, across both passes, never regresses.
+    every_wall_clock = [row["payload"]["actor/wall_clock_s"] for row in fake_run.logged]
+    assert every_wall_clock == sorted(every_wall_clock)
+
+
+def test_clock_rollback_effective_ts_deterministic_across_crash_replay(tmp_path):
+    """Comment B: effective_ts assignment is a pure function of file-append order plus the
+    persisted high-water mark, so it is identical across a crash and retry -- confirmed two
+    ways: (1) computing a plan twice from the same unchanged confirmed state yields byte-for-
+    byte identical rows; (2) running the rollback scenario through a simulated crash (comment
+    A's write-ahead plan) reproduces the exact same clamped actor/wall_clock_s values."""
+    root = _write_run(tmp_path, run_id="run-rollback-determinism", now=0.0)
+    writer = EpochMetricsWriter(root, "actor-0")
+    for rec in _game(10.0) + _game(20.0) + _game(30.0) + _game(15.0) + _game(16.0) + _game(40.0):
+        writer.append(rec)
+
+    state = ws.load_sync_state(root)
+    plan_a = ws._compute_batch(root, state, finalize=False)
+    plan_b = ws._compute_batch(root, state, finalize=False)
+    assert plan_a == plan_b
+
+    # Simulate a crash mid-replay (comment A's mechanism) and confirm the clamped values
+    # the crashed attempt already sent match exactly what the retry re-sends.
+    state.pending_plan = plan_a
+    ws.save_sync_state(root, state)
+    pre_crash_run = _FakeRun()
+    for row in plan_a["rows"][:3]:
+        pre_crash_run.log(row["payload"], step=row["step"], commit=True)
+
+    state2 = ws.load_sync_state(root)
+    fresh_run = _FakeRun()
+    changed = ws.sync_once(fresh_run, root, state2, finalize=False)
+    assert changed is True
+    assert len(fresh_run.logged) == len(plan_a["rows"])
+    for original, replayed in zip(plan_a["rows"], fresh_run.logged, strict=True):
+        assert replayed["step"] == original["step"]
+        assert replayed["payload"] == original["payload"]
+    # Only the pre-crash prefix (3 of 5 rows) was actually sent before the simulated crash;
+    # compare just that prefix against the retry's replay of the same rows.
+    for original, replayed in zip(pre_crash_run.logged, fresh_run.logged[:3], strict=True):
+        assert (
+            replayed["payload"]["actor/wall_clock_s"] == original["payload"]["actor/wall_clock_s"]
+        )
 
 
 # ==============================================================================

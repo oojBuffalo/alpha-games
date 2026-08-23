@@ -12,37 +12,63 @@ same run dir stays idempotent.
 only import of it anywhere in this repo is the guarded one in
 :func:`_require_wandb`. ``core/`` and ``games/`` never import it.
 
-**Idempotency: the precise mechanism and its guarantee.** The W&B run id is
-derived from the run's own identity (``core.run_identity.RunRecord.run_id``),
-so re-syncing resumes the same W&B run rather than creating a duplicate
-(``resume="allow"``). Within that run, every :func:`~wandb.Run.log` call this
-script makes carries an explicit, deterministic ``step`` -- this tool's own
-monotonically increasing count of every row it has ever logged for this run
-(:attr:`SyncState.next_step`), assigned in the fixed order one full
-:func:`sync_once` pass visits records (learner flush groups, then
-checkpoints, then released actor flush groups -- see below), and ``commit=True``
-so each row lands as its own complete history entry rather than accumulating
-into a later one. On ``wandb.init(id=..., resume="allow")``, W&B's client
-seeds its next-step counter one past the highest step the server has already
-recorded for that run id (verified against the ``wandb`` 0.28 SDK source,
+**Idempotency: durable write-ahead reconciliation, not pass-order numbering.**
+An earlier version of this module numbered rows by their position within each
+freshly computed batch (a plain per-run counter, incremented once per row).
+That numbering is *not* stable across a crash-and-retry when the retry's
+batch differs from the crashed pass's batch -- e.g. a new record becomes
+eligible between the crash and the retry -- because the row at position N in
+the new batch is not necessarily the same underlying event as the row at
+position N in the old one: retrying could then re-derive *different* rows
+under the *same* step numbers (silently dropped as "already seen") while
+shifting a genuinely new row onto a step number the server had already
+accepted for something else (silently duplicated). Step numbers must
+therefore be tied to a persisted plan, never recomputed on retry.
+
+Every sync pass (:func:`sync_once`) is now: (1) compute a batch as a fully
+rendered plan -- every row's metric-name/value payload and its explicit step,
+plus the resulting sync state once the batch is applied
+(:func:`_compute_batch`) -- against a private working copy, so nothing about
+the confirmed state changes yet; (2) persist that plan into
+:attr:`SyncState.pending_plan` and save the sidecar (:func:`save_sync_state`,
+atomic temp-file rename) *before* logging a single row -- a durable,
+replayable record of exactly what this pass intends to do; (3) log every row
+in the plan, in order, ``commit=True``; (4) apply the plan's resulting state
+and clear ``pending_plan``, then save the sidecar again (:func:`_run_plan`).
+A crash at any point between step 2 and the end of step 4 leaves
+``pending_plan`` set on disk; the next invocation (:func:`sync_once`,
+one-shot or ``--follow``) detects this and *replays that exact plan* -- the
+same rows, the same steps, the same order -- before computing anything new.
+Newly-eligible records are, by construction, absent from a persisted plan
+(the plan was rendered before they existed), so they are picked up by the
+fresh batch computed immediately afterward, with fresh step numbers layered
+on top of the now-applied state -- never renumbering or colliding with the
+replayed plan. Replaying an already-persisted plan is itself safe to repeat
+(a second crash mid-replay): every row in the plan always carries the same
+step it was given when first computed, so replaying it again is just
+re-submitting the same ``(step, payload)`` pairs.
+
+**Why an explicit step at all.** Every :func:`~wandb.Run.log` call this
+script makes carries an explicit, deterministic ``step`` -- part of the plan
+a row belongs to, assigned once when that plan is computed and never
+recomputed -- and ``commit=True`` so each row lands as its own complete
+history entry rather than accumulating into a later one. On
+``wandb.init(id=..., resume="allow")``, W&B's client seeds its next-step
+counter one past the highest step the server has already recorded for that
+run id (verified against the ``wandb`` 0.28 SDK source,
 ``sdk/internal/sender.py``'s ``_resume_state.step = last_step + 1`` and
 ``sdk/internal/handler.py``'s ``handle_request_partial_history``, which drops
 -- client-side, before ever forwarding the row -- any subsequently logged row
 whose ``step`` is less than that counter, emitting a local warning rather
-than an error). Since :attr:`SyncState.next_step` is only ever persisted
-together with the cursors/buffers of the rows it was assigned to (the sidecar
-is one JSON document, saved as a unit -- see :func:`save_sync_state`), a
-crash between an accepted ``run.log`` and the next sidecar save reprocesses
-those same not-yet-cursor-advanced records from an unchanged
-``next_step`` baseline on the next invocation, reassigning them the exact
-same step values -- which W&B then drops as already-seen. This makes replay
-a true no-op, not merely a bounded duplicate window: **the guarantee is "a
-row is logged to W&B history at most once," contingent on the assumptions
-above (one ``wandb`` run id per run dir, nobody else logging to that run id,
-and this script never logging a real -- not replayed -- row out of the fixed
-per-pass order this docstring names).** Follow mode persists the sidecar
-after every poll (not only at process exit), bounding how much a genuine
-crash mid-poll ever has to replay to one poll's worth of records.
+than an error). Because a plan's steps never change once persisted, replaying
+it after a crash reassigns exactly the same steps to exactly the same rows
+every time, and the already-accepted prefix of any replay is dropped by that
+mechanism. **The guarantee is "a row is logged to W&B history at most
+once,"** covering an in-progress run directory whose eligible-record set
+grows between a crash and a retry -- not just a same-batch replay --
+contingent on the assumptions above (one ``wandb`` run id per run dir, nobody
+else logging to that run id, and this script never logging a real -- not
+replayed -- row outside the plan mechanism this docstring names).
 
 Every chart's x-axis is one of this script's own ``wandb.define_metric``
 custom step fields (below), never W&B's own implicit step -- which is
@@ -84,33 +110,55 @@ un-consumed, for a later sync to complete. Pass ``--finalize`` only when the
 run directory is known to be complete (the process that was writing it has
 exited) -- it flushes every trailing group, from every process, once.
 
-**Multi-actor throughput is buffered and released behind a global
-watermark.** ``actor/*`` and ``throughput/*`` are meant to read as one
-coherent timeline across every actor, but each actor's own file only proves
-its *own* chronology -- actor 0 having reached t=40 says nothing about
-whether actor 1's next group lands at t=20 or t=41. Every actor's newly
-finalized groups are therefore buffered per-process
+**Multi-actor throughput is buffered and released behind a global watermark
+of clamped timestamps.** ``actor/*`` and ``throughput/*`` are meant to read
+as one coherent timeline across every actor, but each actor's own file only
+proves its *own* chronology -- actor 0 having reached t=40 says nothing
+about whether actor 1's next group lands at t=20 or t=41. Every actor's
+newly finalized groups are therefore buffered per-process
 (:attr:`SyncState.actor_buffer`) rather than logged immediately; a group is
 released only once the *global watermark* -- the minimum, across every actor
-process this run has ever had, of that process's own highest observed group
-timestamp (:attr:`SyncState.actor_watermarks`) -- has reached or passed it.
-This relies on one assumption verified against the writer
-(``core.actor.ActorDriver._flush_game_metrics`` stamps one ``time.time()``
-per flush, strictly append-ordered within a single-writer process): a
-process's own records are non-decreasing in timestamp, so "this process has
-shown groups up to T" really does promise "no future group from it will be
-earlier than T." Released groups are logged in global sorted
-``(timestamp, proc)`` order with cumulative totals computed at release time,
-in that order -- never the order they happened to arrive in across polls.
-**Known stall behavior:** one actor that has gone quiet (crashed, or simply
-slower than its siblings) holds back every other actor's throughput data at
-its own last-seen timestamp indefinitely -- the data is buffered, not lost,
-and ``--finalize`` (once the run is known complete) flushes every buffered
-group regardless of watermark. A brand-new actor process whose metrics file
-exists but has not yet completed its first flush contributes no watermark
-at all and blocks release the same way, for the same reason: this script
-cannot distinguish "about to report" from "already dead" without
-``--finalize``.
+process this run has ever had, of that process's own highest observed
+``effective_ts`` (:attr:`SyncState.actor_watermarks`, below) -- has reached
+or passed it.
+
+**Clock-rollback clamp, not a monotonicity assumption.** An earlier version
+of this module claimed ``core.actor``'s ``time.time()`` timestamps were
+verified non-decreasing within one process's file and used them directly for
+ordering. That claim does not hold: ``time.time()`` is wall-clock, not
+monotonic, and can step backwards under NTP correction or a manual clock
+change, which would let a later-arriving, earlier-stamped group release
+*after* a later-timestamped one has already reached W&B -- violating the
+non-regressing timeline this mechanism exists to guarantee. Every group's
+ordering/axis coordinate is therefore ``effective_ts``, a *monotonized*
+clamp of the raw timestamp: the running max of a process's own raw
+timestamps in file-append order, seeded from that process's persisted
+high-water mark (:func:`_plan_actors`). ``effective_ts`` -- never the raw
+timestamp -- drives every place ordering or a chart axis is at stake: the
+per-process high-water mark, the global watermark, the
+``(effective_ts, proc)`` release sort, and the logged ``actor/wall_clock_s``
+value itself (a chart axis must never regress; the raw pre-clamp value
+would). Ordering is exact when clocks behave; under a rollback, every group
+written until the clock recovers past the prior high-water mark is pinned at
+that high-water mark -- a bounded, documented distortion (a burst of groups
+reporting one wall-clock coordinate) rather than a silent regression or a
+dropped/duplicated row. This clamp is computed purely from each process's
+own file-append order plus its persisted high-water mark, so it is
+deterministic across crashes/re-reads -- rows rendered by the write-ahead
+plan above already carry their final, clamped axis value, so replaying a
+pending plan never needs to (and never does) recompute it.
+
+Released groups are logged in this global sorted order with cumulative
+totals computed at release time, in that order -- never the order they
+happened to arrive in across polls. **Known stall behavior:** one actor that
+has gone quiet (crashed, or simply slower than its siblings) holds back
+every other actor's throughput data at its own last-seen ``effective_ts``
+indefinitely -- the data is buffered, not lost, and ``--finalize`` (once the
+run is known complete) flushes every buffered group regardless of
+watermark. A brand-new actor process whose metrics file exists but has not
+yet completed its first flush contributes no watermark at all and blocks
+release the same way, for the same reason: this script cannot distinguish
+"about to report" from "already dead" without ``--finalize``.
 
 **Honest granularity.** Actor deltas land at between-game flush boundaries
 (``core.actor.ActorDriver._flush_game_metrics``), the same convention
@@ -222,19 +270,31 @@ class SyncState:
             in release order.
         actor_buffer: Per-actor-process finalized flush groups not yet
             released to W&B, pending the cross-process watermark (module
-            docstring). Each entry is ``{"timestamp", "deltas"}``, the same
-            shape :func:`_split_actor_records` returns.
+            docstring). Each entry is ``{"timestamp", "effective_ts",
+            "deltas"}`` -- ``effective_ts`` is the monotonized clamp
+            (module docstring's clock-rollback rule, :func:`_plan_actors`)
+            added at ingestion time; ``timestamp`` is the raw, unclamped
+            value, kept only for inspection/debugging.
         actor_watermarks: Per-actor-process high-water mark: the highest
-            group timestamp ever observed from that process, whether or not
+            ``effective_ts`` ever observed from that process, whether or not
             that group has been released yet. Monotonically non-decreasing
-            per process (module docstring's within-file timestamp
-            monotonicity assumption); the global release watermark is the
-            minimum of these across every actor process this run has ever
-            had.
-        next_step: The next explicit W&B ``step`` this script will assign --
-            a running count of every row it has ever logged for this run,
-            in the fixed per-pass order the module docstring names. The
-            idempotency mechanism this script relies on (module docstring).
+            per process *by construction* of the clamp (module docstring),
+            regardless of whether the underlying raw timestamps are; the
+            global release watermark is the minimum of these across every
+            actor process this run has ever had.
+        next_step: The next explicit W&B ``step`` this script will assign to
+            a newly computed plan's rows -- a running count of every row
+            ever logged for this run. Never reused once a plan has been
+            persisted (module docstring's write-ahead mechanism); a
+            replayed plan carries its own already-assigned steps and does
+            not consult this counter.
+        pending_plan: A plan from :func:`_compute_batch` that has been
+            persisted (module docstring) but not yet fully applied -- set
+            just before this script starts logging its rows, cleared just
+            after every row is logged and the plan's resulting state is
+            applied. ``None`` when no pass is mid-flight. A non-``None``
+            value found at startup means a prior pass crashed between those
+            two points and must be replayed verbatim before anything else.
     """
 
     proc_cursors: dict[str, int] = field(default_factory=dict)
@@ -243,6 +303,7 @@ class SyncState:
     actor_buffer: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     actor_watermarks: dict[str, float] = field(default_factory=dict)
     next_step: int = 0
+    pending_plan: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return this state as a plain, JSON-serializable dict."""
@@ -253,6 +314,7 @@ class SyncState:
             "actor_buffer": {proc: list(groups) for proc, groups in self.actor_buffer.items()},
             "actor_watermarks": dict(self.actor_watermarks),
             "next_step": self.next_step,
+            "pending_plan": self.pending_plan,
         }
 
     @classmethod
@@ -274,6 +336,7 @@ class SyncState:
             },
             actor_watermarks=dict(raw.get("actor_watermarks", {})),
             next_step=int(raw.get("next_step", 0)),
+            pending_plan=raw.get("pending_plan"),
         )
 
 
@@ -558,8 +621,8 @@ def _define_metrics(run: Any) -> None:
     the learner's loss/gauge series; wall-clock and positions for actor
     throughput; learner-step, positions, and GPU-hours for checkpoint
     markers. Covering more than one axis for the same values means parallel
-    metric names logging the same numbers (:func:`_sync_actors`,
-    :func:`_sync_checkpoints`) -- the fresh ``throughput/positions_evaluated``
+    metric names logging the same numbers (:func:`_plan_actors`,
+    :func:`_plan_checkpoints`) -- the fresh ``throughput/positions_evaluated``
     and ``checkpoint/*_axis`` names below exist only so a *second* axis can
     be defined without shadowing the first (``actor/positions_evaluated``
     and ``checkpoint/positions_evaluated``/``checkpoint/gpu_hours`` keep
@@ -627,110 +690,153 @@ def _init_wandb_run(
 
 
 # ==============================================================================
-# The sync passes
+# Plan computation: pure functions from (run_dir, confirmed state) -> a plan
 # ==============================================================================
 
 
-def _sync_learner(run: Any, run_dir: Path | str, state: SyncState, *, finalize: bool) -> bool:
-    """Replay new learner flush groups into ``learner/*`` and sync any new checkpoints.
+def _working_copy(state: SyncState) -> SyncState:
+    """A snapshot copy of ``state``'s mutable fields for :func:`_compute_batch` to work against.
+
+    Never shares a mutable container with ``state``: :func:`_compute_batch`
+    mutates the returned copy freely while computing a plan, with zero risk
+    of the confirmed ``state`` changing before the caller decides to persist
+    and execute that plan (module docstring's write-ahead mechanism).
 
     Args:
-        run: The live W&B run.
-        run_dir: The run's root directory.
-        state: Mutated in place: the learner cursor, :attr:`SyncState.next_step`,
-            and (via :func:`_sync_checkpoints`) checkpoint bookkeeping.
-        finalize: Forwarded to :func:`_split_learner_records`.
+        state: The state to snapshot. Its own ``pending_plan`` is not part
+            of this copy -- plan bookkeeping is the caller's concern, not a
+            plan-computation input.
 
     Returns:
-        Whether anything new was logged.
+        An independent copy of every field :func:`_compute_batch` reads or
+        writes.
     """
-    records = list(iter_epoch_records(run_dir, LEARNER_PROC))
-    cursor = state.proc_cursors.get(LEARNER_PROC, 0)
-    groups, checkpoints, consumed = _split_learner_records(records[cursor:], finalize=finalize)
-
-    for group in groups:
-        payload = {"learner/learner_step": group["learner_step"]}
-        for series, value in group["gauges"].items():
-            payload[f"learner/{series}"] = value
-        step = state.next_step
-        state.next_step += 1
-        run.log(payload, step=step, commit=True)
-    state.proc_cursors[LEARNER_PROC] = cursor + consumed
-
-    checkpoints_changed = _sync_checkpoints(run, run_dir, state, checkpoints)
-    return bool(groups) or checkpoints_changed
+    return SyncState(
+        proc_cursors=dict(state.proc_cursors),
+        checkpoint_versions_synced=list(state.checkpoint_versions_synced),
+        actor_totals=dict(state.actor_totals),
+        actor_buffer={
+            proc: [dict(g) for g in groups] for proc, groups in state.actor_buffer.items()
+        },
+        actor_watermarks=dict(state.actor_watermarks),
+        next_step=state.next_step,
+    )
 
 
-def _sync_checkpoints(
-    run: Any, run_dir: Path | str, state: SyncState, new_checkpoints: list[dict[str, Any]]
-) -> bool:
-    """Log every not-yet-synced ``checkpoint_published`` marker as a summary point.
+def _plan_checkpoints(
+    run_dir: Path | str, working: SyncState, new_checkpoints: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[tuple[str, Any]]]:
+    """Render a row (plus a summary update) for every not-yet-synced checkpoint marker.
 
     Sourced from ``core.observability.reduce_run(run_dir).checkpoints`` --
     reusing the canonical ``(learner_step, positions_evaluated, gpu_hours)``
     join rather than re-deriving it (module docstring's "honest granularity"
-    note is exactly ``reduce_run``'s own documented bound). Logs the marker's
-    ``model_version`` a second and third time under
+    note is exactly ``reduce_run``'s own documented bound). Also renders the
+    marker's ``model_version`` a second and third time under
     ``checkpoint/marker_vs_positions``/``checkpoint/marker_vs_gpu_hours`` so
     the positions/GPU-hours axes (:func:`_define_metrics`) carry data too.
 
     Args:
-        run: The live W&B run.
         run_dir: The run's root directory.
-        state: Mutated in place: ``checkpoint_versions_synced`` and
-            :attr:`SyncState.next_step`.
+        working: Mutated in place: ``checkpoint_versions_synced`` and
+            ``next_step``.
         new_checkpoints: Newly observed ``checkpoint_published`` records
             (:func:`_split_learner_records`'s second return value).
 
     Returns:
-        Whether any new checkpoint was logged.
+        ``(rows, summary_updates)``.
     """
+    rows: list[dict[str, Any]] = []
+    summary_updates: list[tuple[str, Any]] = []
     pending = sorted(
         {
             rec["model_version"]
             for rec in new_checkpoints
-            if rec["model_version"] not in state.checkpoint_versions_synced
+            if rec["model_version"] not in working.checkpoint_versions_synced
         }
     )
     if not pending:
-        return False
+        return rows, summary_updates
 
     reduced = reduce_run(run_dir)
     for version in pending:
         if version not in reduced.checkpoints:
             continue  # not yet visible to reduce_run's own scan; retried next sync
         learner_step, positions_evaluated, gpu_hours = reduced.checkpoints[version]
-        step = state.next_step
-        state.next_step += 1
-        run.log(
+        step = working.next_step
+        working.next_step += 1
+        rows.append(
             {
-                "checkpoint/model_version": version,
-                "checkpoint/learner_step": learner_step,
-                "checkpoint/positions_evaluated": positions_evaluated,
-                "checkpoint/gpu_hours": gpu_hours,
-                "checkpoint/positions_evaluated_axis": positions_evaluated,
-                "checkpoint/gpu_hours_axis": gpu_hours,
-                "checkpoint/marker_vs_positions": version,
-                "checkpoint/marker_vs_gpu_hours": version,
-            },
-            step=step,
-            commit=True,
+                "payload": {
+                    "checkpoint/model_version": version,
+                    "checkpoint/learner_step": learner_step,
+                    "checkpoint/positions_evaluated": positions_evaluated,
+                    "checkpoint/gpu_hours": gpu_hours,
+                    "checkpoint/positions_evaluated_axis": positions_evaluated,
+                    "checkpoint/gpu_hours_axis": gpu_hours,
+                    "checkpoint/marker_vs_positions": version,
+                    "checkpoint/marker_vs_gpu_hours": version,
+                },
+                "step": step,
+            }
         )
-        run.summary[f"checkpoint_{version}"] = {
-            "learner_step": learner_step,
-            "positions_evaluated": positions_evaluated,
-            "gpu_hours": gpu_hours,
-        }
-        state.checkpoint_versions_synced.append(version)
-    return True
+        summary_updates.append(
+            (
+                f"checkpoint_{version}",
+                {
+                    "learner_step": learner_step,
+                    "positions_evaluated": positions_evaluated,
+                    "gpu_hours": gpu_hours,
+                },
+            )
+        )
+        working.checkpoint_versions_synced.append(version)
+    return rows, summary_updates
+
+
+def _plan_learner(
+    run_dir: Path | str, working: SyncState, *, finalize: bool
+) -> tuple[list[dict[str, Any]], list[tuple[str, Any]]]:
+    """Render this pass's new learner flush-group rows plus any new checkpoint rows.
+
+    Pure: mutates only ``working`` (a :func:`_working_copy`), never the live
+    run.
+
+    Args:
+        run_dir: The run's root directory.
+        working: Mutated in place: the learner cursor, ``next_step``, and
+            (via :func:`_plan_checkpoints`) checkpoint bookkeeping.
+        finalize: Forwarded to :func:`_split_learner_records`.
+
+    Returns:
+        ``(rows, summary_updates)`` -- learner rows followed by any
+        checkpoint rows, in the order they must be logged.
+    """
+    rows: list[dict[str, Any]] = []
+    records = list(iter_epoch_records(run_dir, LEARNER_PROC))
+    cursor = working.proc_cursors.get(LEARNER_PROC, 0)
+    groups, checkpoints, consumed = _split_learner_records(records[cursor:], finalize=finalize)
+
+    for group in groups:
+        payload = {"learner/learner_step": group["learner_step"]}
+        for series, value in group["gauges"].items():
+            payload[f"learner/{series}"] = value
+        step = working.next_step
+        working.next_step += 1
+        rows.append({"payload": payload, "step": step})
+    working.proc_cursors[LEARNER_PROC] = cursor + consumed
+
+    checkpoint_rows, summary_updates = _plan_checkpoints(run_dir, working, checkpoints)
+    rows.extend(checkpoint_rows)
+    return rows, summary_updates
 
 
 def _actor_watermark(state: SyncState, procs: list[str]) -> float:
     """Return the global cross-actor release watermark (module docstring).
 
     The minimum, across every currently known actor process, of that
-    process's own highest observed group timestamp -- a process this run has
-    never seen a group from yet contributes ``-inf`` (blocks release
+    process's own highest observed ``effective_ts`` -- a process this run
+    has never seen a group from yet contributes ``-inf`` (blocks release
     entirely, the documented stall behavior) rather than being silently
     excluded.
 
@@ -746,86 +852,99 @@ def _actor_watermark(state: SyncState, procs: list[str]) -> float:
     return min(state.actor_watermarks.get(proc, float("-inf")) for proc in procs)
 
 
-def _sync_actors(run: Any, run_dir: Path | str, state: SyncState, *, finalize: bool) -> bool:
-    """Buffer new actor flush groups, then release them behind the global watermark.
+def _plan_actors(
+    run_dir: Path | str, working: SyncState, *, finalize: bool
+) -> list[dict[str, Any]]:
+    """Render this pass's actor throughput rows: ingest, clamp, buffer, then release.
 
-    Every actor process's newly finalized groups are added to
-    :attr:`SyncState.actor_buffer` and that process's
-    :attr:`SyncState.actor_watermarks` entry is raised to its latest group's
-    timestamp; only groups at or below the current global watermark
-    (:func:`_actor_watermark`) -- or, under ``finalize=True``, every buffered
-    group regardless -- are then released: merged across every process in
-    global ``(timestamp, proc)`` order and logged as one coherent cumulative
-    throughput curve (module docstring).
+    Every actor process's newly finalized groups are timestamp-clamped
+    (module docstring's monotonized ``effective_ts``, below) and added to
+    ``working.actor_buffer``; only groups at or below the current global
+    watermark (:func:`_actor_watermark`) -- or, under ``finalize=True``,
+    every buffered group regardless -- are then released: merged across
+    every process in global ``(effective_ts, proc)`` order and rendered as
+    one coherent cumulative throughput curve.
+
+    **Clock-rollback clamp.** ``core.actor`` stamps each flush with
+    ``time.time()``, which is not guaranteed monotonic. Every group's
+    ``effective_ts`` is the running max of its own process's raw timestamps
+    seen so far (seeded from that process's persisted high-water mark,
+    ``working.actor_watermarks``), computed purely from file append order
+    and therefore deterministic across crashes/re-reads. ``effective_ts`` --
+    never the raw timestamp -- is used everywhere ordering or a chart axis
+    is at stake (module docstring).
 
     Args:
-        run: The live W&B run.
         run_dir: The run's root directory.
-        state: Mutated in place: per-actor cursors, the buffer, watermarks,
-            the running ``actor_totals`` cumulative sums, and
-            :attr:`SyncState.next_step`.
+        working: Mutated in place: per-actor cursors, the buffer,
+            watermarks, the running ``actor_totals`` cumulative sums, and
+            ``next_step``.
         finalize: Forwarded to :func:`_split_actor_records`; also bypasses
             the watermark gate entirely for release (module docstring).
 
     Returns:
-        Whether anything new was logged.
+        The rendered rows, in release order.
     """
+    rows: list[dict[str, Any]] = []
     record = read_run_record(run_dir)
     run_start_ts = _parse_iso_utc(record.created_at)
     procs = _actor_procs(run_dir)
 
     for proc in procs:
         records = list(iter_epoch_records(run_dir, proc))
-        cursor = state.proc_cursors.get(proc, 0)
+        cursor = working.proc_cursors.get(proc, 0)
         groups, consumed = _split_actor_records(records[cursor:], finalize=finalize)
-        state.proc_cursors[proc] = cursor + consumed
+        working.proc_cursors[proc] = cursor + consumed
         if groups:
-            state.actor_buffer.setdefault(proc, []).extend(groups)
-            state.actor_watermarks[proc] = max(
-                state.actor_watermarks.get(proc, float("-inf")), groups[-1]["timestamp"]
-            )
+            effective_ts = working.actor_watermarks.get(proc, float("-inf"))
+            for group in groups:
+                effective_ts = max(effective_ts, group["timestamp"])
+                group["effective_ts"] = effective_ts
+            working.actor_buffer.setdefault(proc, []).extend(groups)
+            working.actor_watermarks[proc] = effective_ts
 
-    watermark = float("inf") if finalize else _actor_watermark(state, procs)
+    watermark = float("inf") if finalize else _actor_watermark(working, procs)
 
     released: list[tuple[str, dict[str, Any]]] = []
-    for proc in list(state.actor_buffer):
-        buffered = state.actor_buffer[proc]
-        ready = [g for g in buffered if g["timestamp"] <= watermark]
+    for proc in list(working.actor_buffer):
+        buffered = working.actor_buffer[proc]
+        ready = [g for g in buffered if g["effective_ts"] <= watermark]
         if not ready:
             continue
-        held_back = [g for g in buffered if g["timestamp"] > watermark]
+        held_back = [g for g in buffered if g["effective_ts"] > watermark]
         released.extend((proc, g) for g in ready)
         if held_back:
-            state.actor_buffer[proc] = held_back
+            working.actor_buffer[proc] = held_back
         else:
-            del state.actor_buffer[proc]
+            del working.actor_buffer[proc]
 
-    released.sort(key=lambda item: (item[1]["timestamp"], item[0]))
+    released.sort(key=lambda item: (item[1]["effective_ts"], item[0]))
 
     for proc, group in released:
         for series, value in group["deltas"].items():
-            state.actor_totals[series] = state.actor_totals.get(series, 0.0) + value
-        games_total = state.actor_totals.get(SERIES_GAMES_COMPLETED, 0.0)
-        positions_total = state.actor_totals.get(SERIES_POSITIONS_EVALUATED, 0.0)
-        sims_total = state.actor_totals.get(SERIES_SIMS_RUN, 0.0)
-        step = state.next_step
-        state.next_step += 1
-        run.log(
+            working.actor_totals[series] = working.actor_totals.get(series, 0.0) + value
+        games_total = working.actor_totals.get(SERIES_GAMES_COMPLETED, 0.0)
+        positions_total = working.actor_totals.get(SERIES_POSITIONS_EVALUATED, 0.0)
+        sims_total = working.actor_totals.get(SERIES_SIMS_RUN, 0.0)
+        step = working.next_step
+        working.next_step += 1
+        rows.append(
             {
-                "actor/wall_clock_s": group["timestamp"] - run_start_ts,
-                "actor/proc": proc,
-                "actor/games_completed": games_total,
-                "actor/positions_evaluated": positions_total,
-                "actor/sims_run": sims_total,
-                "throughput/positions_evaluated": positions_total,
-                "throughput/games_vs_positions": games_total,
-                "throughput/sims_vs_positions": sims_total,
-            },
-            step=step,
-            commit=True,
+                "payload": {
+                    "actor/wall_clock_s": group["effective_ts"] - run_start_ts,
+                    "actor/proc": proc,
+                    "actor/games_completed": games_total,
+                    "actor/positions_evaluated": positions_total,
+                    "actor/sims_run": sims_total,
+                    "throughput/positions_evaluated": positions_total,
+                    "throughput/games_vs_positions": games_total,
+                    "throughput/sims_vs_positions": sims_total,
+                },
+                "step": step,
+            }
         )
 
-    return bool(released)
+    return rows
 
 
 def _parse_iso_utc(stamp: str) -> float:
@@ -842,12 +961,115 @@ def _parse_iso_utc(stamp: str) -> float:
     return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
 
 
-def sync_once(run: Any, run_dir: Path | str, state: SyncState, *, finalize: bool = False) -> bool:
-    """Run one full sync pass: new learner flushes, checkpoints, and actor throughput.
+def _compute_batch(run_dir: Path | str, state: SyncState, *, finalize: bool) -> dict[str, Any]:
+    """Pure: compute the next batch of rows to log against a snapshot of ``state``.
 
-    Pure with respect to the run dir (never writes to it); mutates ``state``
-    in place and calls ``run.log``/``run.summary`` for anything new. The
-    caller owns persisting ``state`` (:func:`save_sync_state`).
+    Never touches a live run and never mutates ``state`` -- returns
+    everything the caller needs to persist as a recoverable pending plan and
+    then execute it (:func:`_run_plan`, module docstring's write-ahead
+    mechanism).
+
+    Args:
+        run_dir: The run's root directory.
+        state: The current confirmed sync state (read-only; a working copy
+            is computed against, per :func:`_working_copy`).
+        finalize: Forwarded to the record splitters and the actor release
+            gate.
+
+    Returns:
+        ``{"rows": [...], "summary_updates": [...], "post_state": {...}}``
+        -- ``rows`` and ``summary_updates`` in the exact order they must be
+        applied; ``post_state`` is the plain dict ``state`` should become
+        once every row has been logged (:func:`_apply_plan`).
+    """
+    working = _working_copy(state)
+    rows: list[dict[str, Any]] = []
+    summary_updates: list[tuple[str, Any]] = []
+
+    learner_rows, ckpt_updates = _plan_learner(run_dir, working, finalize=finalize)
+    rows.extend(learner_rows)
+    summary_updates.extend(ckpt_updates)
+
+    rows.extend(_plan_actors(run_dir, working, finalize=finalize))
+
+    return {
+        "rows": rows,
+        "summary_updates": summary_updates,
+        "post_state": {
+            "proc_cursors": working.proc_cursors,
+            "checkpoint_versions_synced": working.checkpoint_versions_synced,
+            "actor_totals": working.actor_totals,
+            "actor_buffer": working.actor_buffer,
+            "actor_watermarks": working.actor_watermarks,
+            "next_step": working.next_step,
+        },
+    }
+
+
+def _apply_plan(state: SyncState, plan: dict[str, Any]) -> None:
+    """Advance ``state``'s cursors/buffers/totals/next_step to ``plan``'s resulting values.
+
+    Args:
+        state: Mutated in place.
+        plan: A plan from :func:`_compute_batch`.
+    """
+    post = plan["post_state"]
+    state.proc_cursors = dict(post["proc_cursors"])
+    state.checkpoint_versions_synced = list(post["checkpoint_versions_synced"])
+    state.actor_totals = dict(post["actor_totals"])
+    state.actor_buffer = {proc: list(groups) for proc, groups in post["actor_buffer"].items()}
+    state.actor_watermarks = dict(post["actor_watermarks"])
+    state.next_step = post["next_step"]
+
+
+def _run_plan(run: Any, run_dir: Path | str, state: SyncState, plan: dict[str, Any]) -> None:
+    """Execute one row-logging plan under the write-ahead protocol (module docstring).
+
+    Persists ``plan`` as ``state.pending_plan`` FIRST (durable before any
+    ``run.log`` calls) so a crash at any point during logging leaves a
+    recoverable, exact record of what to replay; only once every row has
+    been (re-)logged does this apply the plan's resulting state and clear
+    the pending marker, in one further atomic write. Replaying an
+    already-persisted plan (this function called again with the same
+    ``plan`` after a crash, via ``state.pending_plan``) is exactly this same
+    call again -- logging every row a second time is safe under the
+    explicit-step mechanism (module docstring): rows the server already
+    accepted are dropped, rows it never saw are accepted for the first time.
+
+    Args:
+        run: The live W&B run.
+        run_dir: The run's root directory.
+        state: Mutated in place: ``pending_plan`` while executing, then the
+            plan's ``post_state`` fields once every row is logged.
+        plan: A plan from :func:`_compute_batch` (or ``state.pending_plan``
+            itself, to replay one left over from a crashed pass). Must have
+            a non-empty ``rows`` list -- callers with nothing to log should
+            not call this at all.
+    """
+    state.pending_plan = plan
+    save_sync_state(run_dir, state)
+
+    for row in plan["rows"]:
+        run.log(row["payload"], step=row["step"], commit=True)
+    for key, value in plan["summary_updates"]:
+        run.summary[key] = value
+
+    _apply_plan(state, plan)
+    state.pending_plan = None
+    save_sync_state(run_dir, state)
+
+
+def sync_once(run: Any, run_dir: Path | str, state: SyncState, *, finalize: bool = False) -> bool:
+    """Run one full sync pass: replay any crashed pass's plan, then compute and run a new one.
+
+    If ``state.pending_plan`` is set (a prior pass crashed after persisting
+    a plan but before finishing it), that plan is replayed verbatim first --
+    same rows, same steps, same order -- before anything else happens
+    (module docstring). A fresh batch is then computed against the
+    now-current state; if it has any rows, it is executed the same
+    write-ahead-protected way. A batch with no rows still has its (possibly
+    advanced) cursor/watermark bookkeeping applied and persisted, just
+    without the plan-persist/replay dance a row-logging batch needs.
 
     Args:
         run: The live W&B run.
@@ -862,9 +1084,20 @@ def sync_once(run: Any, run_dir: Path | str, state: SyncState, *, finalize: bool
     Returns:
         Whether anything new was logged.
     """
-    learner_changed = _sync_learner(run, run_dir, state, finalize=finalize)
-    actor_changed = _sync_actors(run, run_dir, state, finalize=finalize)
-    return learner_changed or actor_changed
+    changed = False
+    if state.pending_plan is not None:
+        _run_plan(run, run_dir, state, state.pending_plan)
+        changed = True
+
+    plan = _compute_batch(run_dir, state, finalize=finalize)
+    if plan["rows"]:
+        _run_plan(run, run_dir, state, plan)
+        changed = True
+    else:
+        _apply_plan(state, plan)
+        save_sync_state(run_dir, state)
+
+    return changed
 
 
 # ==============================================================================
