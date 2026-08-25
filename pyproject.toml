@@ -16,6 +16,9 @@ dependencies = ["numpy>=1.26", "torch>=2.3"]  # 2.3: torch.amp.GradScaler (core/
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
+# Strictly opt-in: scripts/wandb_sync.py is the only importer (guarded, with a clear
+# install-hint error when missing); core/ and games/ never import wandb.
+wandb = ["wandb>=0.17"]
 
 [tool.setuptools.packages.find]
 # Engine + adapters only; excludes metadocs/ and tests/ from the installed package
