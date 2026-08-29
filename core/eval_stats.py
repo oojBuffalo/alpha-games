@@ -2,9 +2,11 @@
 within-cell paired-bootstrap resampler, and the Delta/CI/Mann-Kendall inference
 layer built on top of it (design doc §1, §9; tasks/m4/006, 007).
 
-Four pieces, deliberately factored so the bootstrap (task 7.1) reuses the fit
-without a second fit implementation, and the inference layer (task 7.2) reuses
-the resampler without a second resampling implementation:
+Five pieces, deliberately factored so the bootstrap (task 7.1) reuses the fit
+without a second fit implementation, the inference layer (task 7.2) reuses
+the resampler without a second resampling implementation, and the verdict
+assembly (task 7.3) reuses every one of the above without re-deriving any of
+them:
 
 * **The fit.** :func:`snapshot_matches` aggregates every cell within an
   :class:`~core.eval_store.EvalSnapshot`'s *complete contiguous member
@@ -61,13 +63,30 @@ the resampler without a second resampling implementation:
   reads its lower endpoint) and :func:`per_checkpoint_ci`'s per-version
   columns -- the same ``B`` replicates, no second resample. :func:`mann_kendall`
   is the pure-stdlib, tie/continuity-corrected trend test, reported but never
-  gating. None of this module decides *whether* a snapshot is the complete
-  K-set eligible for a Delta at all -- that gate, the provisional-vs-
-  authoritative distinction, and ``verdict.json`` assembly are task 7.3's.
+  gating.
+* **``verdict.json`` assembly (task 7.3; task 1 pin 8; reviews P4/P6/P7).**
+  :func:`build_verdict` is the one-shot orchestrator over every piece above:
+  it reads the watched run's own stored ``config.json``
+  (``core.run_identity.read_stored_config``) for ``k_target``
+  (``training.checkpoint_count``) and the eval seed, loads the eval-store
+  snapshot, and decides *whether* that snapshot's contiguous member prefix is
+  the complete K-set eligible for a Delta at all -- the gate none of the
+  functions above make on their own. Before the complete K-set exists, the
+  artifact is provisional (``delta: null`` plus an explicit ``reason``, no
+  gate anywhere); ``authoritative`` additionally requires ``B ==
+  core.eval_protocol.BOOTSTRAP_B_PRODUCTION`` exactly. The artifact carries
+  its own evidence fingerprint (the snapshot's :attr:`~core.eval_store.
+  EvalSnapshot.snapshot_fingerprint`), a content-hash reference to the
+  ``elo_curve.json`` derived artifact it refreshes alongside itself, the
+  recorded :func:`bootstrap_seed`, and the full protocol-registry block
+  (``core.eval_protocol.REGISTRY`` plus its fingerprint) -- everything a
+  later reader needs to know exactly what evidence, seed, and protocol
+  version produced this verdict, without re-deriving any of it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -87,16 +106,21 @@ from core.eval_protocol import (
     BOOTSTRAP_B_PRODUCTION,
     BOOTSTRAP_CI_LOWER_QUANTILE,
     BOOTSTRAP_CI_UPPER_QUANTILE,
+    PROTOCOL_VERSION,
+    REGISTRY,
+    protocol_fingerprint,
 )
 from core.eval_store import (
     EvalSnapshot,
     PairRecord,
     eval_dir,
     iter_cells,
+    load_snapshot,
     read_cell,
     records_to_match,
 )
 from core.observability import reduce_run
+from core.run_identity import read_stored_config
 from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 #: The M1.6 frozen ladder's rung-1 anchor identity -- ``core.agents.RandomAgent.name``
@@ -810,4 +834,160 @@ def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
 
     payload = {"snapshot_fingerprint": snapshot.snapshot_fingerprint, "rows": rows}
     _atomic_write_json(elo_curve_path(run_dir), payload)
+    return payload
+
+
+# ---------------------------------------------------------------------------------
+# verdict.json assembly (task 7.3; design doc §9/§12; task 1 pin 8; reviews
+# P4/P6/P7; second pass P2.1/P2.2/S2.2).
+# ---------------------------------------------------------------------------------
+
+_VERDICT_NAME = "verdict.json"
+
+
+def verdict_path(run_dir: Path | str) -> Path:
+    """Return the §12 M5.5 verdict artifact's on-disk path for one run.
+
+    Args:
+        run_dir: The run's root directory.
+
+    Returns:
+        ``<run_dir>/eval/verdict.json``.
+    """
+    return eval_dir(run_dir) / _VERDICT_NAME
+
+
+def _file_sha256(path: Path) -> str:
+    """Return the sha256 hex digest of a file's raw on-disk bytes.
+
+    Args:
+        path: The file to hash.
+
+    Returns:
+        A 64-character lowercase hex digest.
+    """
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> dict[str, Any]:
+    """Assemble and durably write the §12 M5.5 verdict artifact.
+
+    The one-shot orchestrator over every earlier piece of this module. Reads
+    the watched run's own stored config
+    (``core.run_identity.read_stored_config``) for ``k_target``
+    (``training.checkpoint_count``) and the eval seed
+    (``evaluation.eval_seed``); loads the run's eval-store snapshot
+    (``core.eval_store.load_snapshot``); fits the point estimate
+    (:func:`fit_snapshot_elo`) and refreshes the §1 plot series
+    (:func:`elo_curve`) from that *same* snapshot object, so the verdict's
+    evidence fingerprint and its ``elo_curve.json`` reference always describe
+    the identical dataset; draws ``B`` bootstrap replicates
+    (:func:`bootstrap_replicates`) exactly once, reused for both
+    per-checkpoint CIs (:func:`per_checkpoint_ci`) and -- **iff** the
+    snapshot's contiguous member prefix equals the complete ``k_target``
+    -member set (task 1 pin 8) -- the Delta contrast (:func:`delta_hat`,
+    :func:`replicate_deltas`, :func:`order_statistic_ci`,
+    :func:`delta_gate`); and runs Mann-Kendall (:func:`mann_kendall`) over the
+    evaluated prefix's point-estimate curve unconditionally (reported, never
+    gating, task 1 pin 7).
+
+    Before the complete K-set exists, the artifact is provisional: it carries
+    no ``delta_hat``, no Delta CI, and no gate anywhere -- only
+    ``delta: null`` plus an explicit ``reason`` string -- alongside the
+    per-checkpoint CIs and Mann-Kendall result that *are* what live
+    (incomplete-prefix) reporting consists of. ``authoritative`` requires
+    both the complete K-set **and** ``B ==
+    core.eval_protocol.BOOTSTRAP_B_PRODUCTION`` exactly -- a complete K-set
+    evaluated at a smaller admissible ``B`` (e.g. a reduced-cost test run)
+    still carries a full Delta/CI/gate, just never the ``authoritative`` flag.
+
+    Args:
+        run_dir: The run's root directory -- the eval snapshot's own root,
+            the root ``core.run_identity.read_stored_config`` reads
+            ``config.json`` from, and the root this writes
+            ``eval/verdict.json`` (and refreshes ``eval/elo_curve.json``)
+            under.
+        B: The bootstrap replicate count. Must be admissible (task 1 pin 7:
+            ``B ≡ 39 mod 40``; see :func:`order_statistic_ci`). Defaults to
+            the pinned production value; the artifact always records the
+            value actually used.
+
+    Returns:
+        The verdict payload -- the identical JSON-safe dict durably written
+        (temp-name-then-``os.replace``, sorted keys, so the same records and
+        seed always produce bit-identical bytes) to :func:`verdict_path`.
+
+    Raises:
+        ValueError: If ``B`` is not admissible, or propagated from
+            :func:`fit_snapshot_elo`/:func:`elo_curve` (an empty snapshot, an
+            agent disconnected from the anchor, or a scored member with no
+            ``checkpoint_published`` marker).
+        FileNotFoundError: If ``run_dir`` has no stored ``config.json``
+            (``core.run_identity.read_stored_config``).
+    """
+    _validate_admissible_B(B)
+    run_dir = Path(run_dir)
+
+    snapshot = load_snapshot(run_dir)
+    stored_config = read_stored_config(run_dir)
+    k_target = stored_config.run.training.checkpoint_count
+    eval_seed_value = stored_config.run.evaluation.eval_seed
+
+    seed = bootstrap_seed(eval_seed_value)
+    point_curve = checkpoint_elo(fit_snapshot_elo(snapshot))
+    checkpoints_evaluated = snapshot.member_prefix
+    is_complete_k_set = checkpoints_evaluated == k_target
+
+    replicate_ratings = list(bootstrap_replicates(snapshot, seed, B))
+    elo_by_version = dict(point_curve)
+    per_checkpoint_payload = [
+        {"model_version": version, "elo": elo_by_version[version], "ci": [lower, upper]}
+        for version, (lower, upper) in per_checkpoint_ci(replicate_ratings, B)
+    ]
+
+    mk = mann_kendall([elo for _, elo in point_curve])
+    mann_kendall_payload = {
+        "n": mk.n,
+        "insufficient_data": mk.insufficient_data,
+        "s": mk.s,
+        "z": mk.z,
+        "p": mk.p,
+    }
+
+    if is_complete_k_set:
+        delta_ci = order_statistic_ci(replicate_deltas(replicate_ratings), B)
+        delta_payload: dict[str, Any] | None = {
+            "delta_hat": delta_hat(point_curve),
+            "ci": [delta_ci[0], delta_ci[1]],
+            "gate": delta_gate(delta_ci),
+        }
+        reason = None
+    else:
+        delta_payload = None
+        reason = (
+            f"snapshot prefix covers {checkpoints_evaluated} of {k_target} required "
+            "checkpoint(s) -- the Delta contrast is only ever computed over the "
+            "complete K-set (task 1 pin 8); no prefix Delta exists, advisory or otherwise"
+        )
+
+    elo_curve(run_dir, snapshot)
+    elo_curve_fingerprint = _file_sha256(elo_curve_path(run_dir))
+
+    payload: dict[str, Any] = {
+        "authoritative": is_complete_k_set and B == BOOTSTRAP_B_PRODUCTION,
+        "checkpoints_evaluated": checkpoints_evaluated,
+        "k_target": k_target,
+        "bootstrap_b": B,
+        "bootstrap_seed": seed,
+        "evidence_fingerprint": snapshot.snapshot_fingerprint,
+        "elo_curve_fingerprint": elo_curve_fingerprint,
+        "protocol_version": PROTOCOL_VERSION,
+        "protocol_fingerprint": protocol_fingerprint(),
+        "protocol_constants": dict(REGISTRY),
+        "per_checkpoint": per_checkpoint_payload,
+        "mann_kendall": mann_kendall_payload,
+        "delta": delta_payload,
+        "reason": reason,
+    }
+    _atomic_write_json(verdict_path(run_dir), payload)
     return payload

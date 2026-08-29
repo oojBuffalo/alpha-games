@@ -21,9 +21,13 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import random
+import re
+from pathlib import Path
 
 import pytest
 
+from core import eval_protocol
 from core.agents import RandomAgent
 from core.elo import fit_elo
 from core.eval_protocol import BOOTSTRAP_B_PRODUCTION
@@ -34,6 +38,7 @@ from core.eval_stats import (
     bootstrap_replicate_matches,
     bootstrap_replicates,
     bootstrap_seed,
+    build_verdict,
     checkpoint_elo,
     delta_gate,
     delta_hat,
@@ -46,6 +51,7 @@ from core.eval_stats import (
     per_checkpoint_ci,
     replicate_deltas,
     snapshot_matches,
+    verdict_path,
 )
 from core.eval_store import (
     CellId,
@@ -66,6 +72,14 @@ from core.observability import (
     segment_end_record,
     segment_start_record,
 )
+from core.run_identity import (
+    ENTRY_CONDITION,
+    LAUNCH_SCHEMA_VERSION,
+    LaunchConfig,
+    RunRecord,
+    write_provenance,
+)
+from core.runconfig import MICRO_RUN_CONFIG_PATH
 from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 # ---------------------------------------------------------------------------------
@@ -125,6 +139,66 @@ def _write_member(run_dir, member_version, cells):
 def _closed_form(p: float) -> float:
     """Elo difference whose expected score is exactly ``p`` (mirrors tests/test_elo.py)."""
     return 400.0 * math.log10(p / (1.0 - p))
+
+
+def _write_run_config(run_dir, *, checkpoint_count: int, eval_seed: int, run_id: str = "test-run"):
+    """Write a valid ``config.json`` a ``build_verdict`` call can read K/eval_seed from.
+
+    Starts from the real pinned micro-Blokus config (already game/schema-valid)
+    and overrides only ``training.checkpoint_count`` and ``evaluation.eval_seed``
+    -- the two scalars ``build_verdict`` itself reads -- plus the launcher-only
+    fields ``LaunchConfig`` requires. Never touches ``core/run_identity.py``;
+    only exercises its already-public ``write_provenance``/``LaunchConfig`` API.
+    """
+    raw = json.loads(MICRO_RUN_CONFIG_PATH.read_text())
+    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+    raw["training"] = dict(raw["training"])
+    raw["training"]["checkpoint_count"] = checkpoint_count
+    raw["evaluation"] = dict(raw["evaluation"])
+    raw["evaluation"]["eval_seed"] = eval_seed
+    raw["num_actors"] = 1
+    raw["device"] = "cpu"
+    raw["schema_version"] = LAUNCH_SCHEMA_VERSION
+    raw["runtime"] = {
+        "refresh_poll_interval": 1.0,
+        "pacing_poll_interval": 1.0,
+        "ceiling_poll_interval": 1.0,
+    }
+    launch_config = LaunchConfig.from_dict(raw)
+    record = RunRecord(
+        run_id=run_id, created_at="2026-01-01T00:00:00Z", entry_condition=ENTRY_CONDITION
+    )
+    write_provenance(run_dir, launch_config, record)
+
+
+def _write_checkpoint_markers(run_dir, versions):
+    """Write one ``checkpoint_published`` marker per member version.
+
+    The minimal metrics fixture ``elo_curve``/``build_verdict`` need:
+    ``core.observability.reduce_run`` requires no GPU segments or actor deltas
+    to compute ``net_evals``/``gpu_hours`` -- both default to ``0.0`` with none
+    on disk -- only a marker per scored member version.
+    """
+    learner = EpochMetricsWriter(run_dir, "learner")
+    for i, version in enumerate(sorted(versions), start=1):
+        _append_checkpoint_published(
+            learner, version=version, learner_step=10 * i, timestamp=float(i)
+        )
+
+
+def _find_key(obj, key: str) -> bool:
+    """Recursively search a JSON-shaped ``dict``/``list`` tree for ``key``.
+
+    A plain key search, never a substring search over serialized text (which
+    would false-positive on an unrelated word like "aggregate").
+    """
+    if isinstance(obj, dict):
+        if key in obj:
+            return True
+        return any(_find_key(value, key) for value in obj.values())
+    if isinstance(obj, list):
+        return any(_find_key(item, key) for item in obj)
+    return False
 
 
 # ==============================================================================
@@ -775,3 +849,294 @@ def test_mann_kendall_never_claims_a_trend_when_insufficient():
     assert result.s is None
     assert result.z is None
     assert result.p is None
+
+
+# ==============================================================================
+# 7. verdict.json assembly (tasks/m4/007, subtask 7.3)
+# ==============================================================================
+
+
+def test_build_verdict_is_bit_identical_across_two_independently_built_runs(tmp_path):
+    """Same records + seed -> bit-identical verdict.json bytes (task 1 pin 7's
+    determinism discipline, at the whole-artifact grain)."""
+
+    def _build(root):
+        for version in (1, 2, 3):
+            _write_member(root, version, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+        _write_checkpoint_markers(root, [1, 2, 3])
+        _write_run_config(root, checkpoint_count=3, eval_seed=4242)
+        return build_verdict(root, B=39)
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    payload_a = _build(root_a)
+    payload_b = _build(root_b)
+
+    assert payload_a == payload_b
+    assert verdict_path(root_a).read_bytes() == verdict_path(root_b).read_bytes()
+
+
+def test_build_verdict_writes_exactly_what_it_returns(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=5)
+
+    payload = build_verdict(tmp_path, B=39)
+
+    assert verdict_path(tmp_path) == tmp_path / "eval" / "verdict.json"
+    on_disk = json.loads(verdict_path(tmp_path).read_text(encoding="utf-8"))
+    assert on_disk == payload
+
+
+def test_build_verdict_partial_k_snapshot_yields_null_delta_and_no_gate_key(tmp_path):
+    """The no-prefix-Delta golden (task 1 pin 8): a partial-K snapshot carries
+    per-checkpoint CIs and MK, but delta is null with a reason, and the "gate"
+    key exists nowhere in the artifact -- not nested, not advisory."""
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=99)  # K=3, only 2 scored
+
+    payload = build_verdict(tmp_path, B=39)
+
+    assert payload["checkpoints_evaluated"] == 2
+    assert payload["k_target"] == 3
+    assert payload["authoritative"] is False
+    assert payload["delta"] is None
+    assert isinstance(payload["reason"], str) and payload["reason"]
+    assert [row["model_version"] for row in payload["per_checkpoint"]] == [1, 2]
+    assert payload["mann_kendall"]["insufficient_data"] is True  # n=2 < 3
+    assert not _find_key(payload, "gate")
+
+
+def test_build_verdict_complete_k_set_carries_delta_ci_and_gate(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [0.0, 0.0, 0.5, 0.0])])
+    _write_member(tmp_path, 2, [(7, "random", [2.0, 2.0, 1.5, 2.0])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=17)
+
+    payload = build_verdict(tmp_path, B=39)
+
+    assert payload["checkpoints_evaluated"] == payload["k_target"] == 2
+    assert payload["delta"] is not None
+    assert set(payload["delta"]) == {"delta_hat", "ci", "gate"}
+    assert payload["delta"]["ci"][0] <= payload["delta"]["delta_hat"] <= payload["delta"]["ci"][1]
+    assert payload["reason"] is None
+
+
+def test_build_verdict_on_disk_partial_cell_perturbs_nothing(tmp_path):
+    """The bootstrap consumes only snapshot cells: a cell that is merely opened
+    and appended -- never completed -- must change nothing (task 1 pin 9 /
+    P2.2), including at the whole-verdict grain."""
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=123)
+
+    build_verdict(tmp_path, B=39)
+    baseline_bytes = verdict_path(tmp_path).read_bytes()
+
+    # A stray, never-completed member-3 cell -- structurally "scheduled" but not
+    # yet complete -- sits entirely outside every in-scope cell set.
+    header = _header(candidate_version=3, rung=7, opponent_id="random", n_pairs=2)
+    register_member(tmp_path, 3, [header.cell_id.to_string()])
+    _fill(tmp_path, header, [1.0, 1.0])  # opened + appended, never completed
+
+    build_verdict(tmp_path, B=39)
+    assert verdict_path(tmp_path).read_bytes() == baseline_bytes
+
+
+def test_build_verdict_authoritative_requires_complete_k_set_and_b_1999(tmp_path):
+    """authoritative flips only when the last required cell of the last member
+    completes, and only at B=1999: a complete K-set at B=39 is non-authoritative
+    but still carries Delta and CI; an incomplete K-set at B=1999 stays
+    non-authoritative regardless."""
+    run_complete = tmp_path / "complete"
+    _write_member(run_complete, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(run_complete, [1])
+    _write_run_config(run_complete, checkpoint_count=1, eval_seed=7)
+
+    at_39 = build_verdict(run_complete, B=39)
+    assert at_39["authoritative"] is False
+    assert at_39["delta"] is not None
+
+    at_1999 = build_verdict(run_complete, B=1999)
+    assert at_1999["authoritative"] is True
+    assert at_1999["delta"] is not None
+
+    run_partial = tmp_path / "partial"
+    _write_member(run_partial, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(run_partial, [1])
+    _write_run_config(run_partial, checkpoint_count=2, eval_seed=7)  # K=2, only 1 scored
+
+    partial_at_1999 = build_verdict(run_partial, B=1999)
+    assert partial_at_1999["authoritative"] is False
+    assert partial_at_1999["delta"] is None
+
+
+def _null_pair_scores(rng: random.Random, n_pairs: int) -> list[float]:
+    """``n_pairs`` i.i.d. pair scores with no built-in trend (mean 1.0/2, symmetric).
+
+    Each of the pair's two games independently scores 0.0/0.5/1.0 with
+    probabilities 0.45/0.10/0.45 -- a fair, mildly-drawish coin, identical for
+    every member, so the population Delta is exactly 0.
+    """
+
+    def _game() -> float:
+        draw = rng.random()
+        if draw < 0.45:
+            return 0.0
+        if draw < 0.55:
+            return 0.5
+        return 1.0
+
+    return [_game() + _game() for _ in range(n_pairs)]
+
+
+@pytest.mark.slow
+def test_bootstrap_gate_false_at_approximately_the_nominal_rate_under_a_true_null(tmp_path):
+    """A synthetic no-improvement fixture (exchangeable pair scores, task 1 pin
+    7/8) over a complete tiny K-set: with no true Elo separation across
+    checkpoints, repeated independent data draws must gate True only rarely --
+    B=39's conservative min/max-based order-statistic CI (task 1 pin 7) is far
+    more conservative than the asymptotic 95% two-sided rate, so the empirical
+    false-positive rate should sit well below the nominal one-sided 2.5%.
+    """
+    k = 3
+    n_pairs = 6
+    n_reps = 60
+    b = 39
+
+    gates = []
+    for rep in range(n_reps):
+        root = tmp_path / f"null-{rep}"
+        rng = random.Random(1_000_000 + rep)
+        for version in range(1, k + 1):
+            _write_member(root, version, [(7, "random", _null_pair_scores(rng, n_pairs))])
+        snapshot = load_snapshot(root)
+        seed = bootstrap_seed(2_000_000 + rep)
+        replicate_ratings = list(bootstrap_replicates(snapshot, seed, b))
+        ci = order_statistic_ci(replicate_deltas(replicate_ratings), b)
+        gates.append(delta_gate(ci))
+
+    false_positive_rate = sum(gates) / n_reps
+    assert false_positive_rate <= 0.15, (
+        f"gate=True on {sum(gates)}/{n_reps} genuinely-null repetitions "
+        f"({false_positive_rate:.1%}) -- expected well below the nominal 2.5% "
+        "one-sided rate"
+    )
+
+
+def test_bootstrap_gate_true_under_a_strong_monotone_trend(tmp_path):
+    """A strong-trend fixture -- win rate climbing from 10% to 90% across a
+    complete K-set -- must reliably gate True."""
+    k = 4
+    n_pairs = 20
+    b = 39
+
+    def _biased_pair_scores(rng: random.Random, p_win: float) -> list[float]:
+        def _game() -> float:
+            return 1.0 if rng.random() < p_win else 0.0
+
+        return [_game() + _game() for _ in range(n_pairs)]
+
+    for rep in range(5):
+        root = tmp_path / f"trend-{rep}"
+        rng = random.Random(5_000_000 + rep)
+        for version in range(1, k + 1):
+            p_win = 0.1 + 0.8 * (version - 1) / (k - 1)  # 0.1 .. 0.9, strictly increasing
+            _write_member(root, version, [(7, "random", _biased_pair_scores(rng, p_win))])
+        snapshot = load_snapshot(root)
+        seed = bootstrap_seed(6_000_000 + rep)
+        replicate_ratings = list(bootstrap_replicates(snapshot, seed, b))
+        ci = order_statistic_ci(replicate_deltas(replicate_ratings), b)
+        assert delta_gate(ci) is True
+
+
+# ==============================================================================
+# 8. Doc <-> protocol-registry golden (tasks/m4/007, subtask 7.3)
+# ==============================================================================
+
+_DESIGN_DOC_PATH = (
+    Path(__file__).resolve().parent.parent / "metadocs" / "blokus-duo-az-design-v0_5.md"
+)
+_DOC_AMENDMENT_BRANCH = "docs/m4-pin-eval-protocol"
+_PINNED_PROTOCOL_HEADING = "Pre-registered protocol (M4 pins)"
+
+
+def test_protocol_registry_matches_the_literal_pinned_values():
+    """Always asserted, independent of the doc amendment's merge status -- the
+    exact values tasks/m4/001's amendment pins, mirrored as module constants
+    (core.eval_protocol) so the protocol cannot silently drift once production
+    games exist."""
+    assert eval_protocol.PROTOCOL_VERSION == 1
+    assert eval_protocol.PAIRS_PER_CELL == 24
+    assert eval_protocol.EVAL_SIMS == 512
+    assert eval_protocol.RUNG8_LAG_DIVISOR == 4
+    assert eval_protocol.RUNG8_EARLIEST_VERSION == 1
+    assert eval_protocol.BOOTSTRAP_B_PRODUCTION == 1999
+    assert eval_protocol.BOOTSTRAP_B_ADMISSIBLE_MODULUS == 40
+    assert eval_protocol.BOOTSTRAP_B_ADMISSIBLE_REMAINDER == 39
+    assert eval_protocol.BOOTSTRAP_CI_LOWER_QUANTILE == 0.025
+    assert eval_protocol.BOOTSTRAP_CI_UPPER_QUANTILE == 0.975
+    # The rank rule at the pinned production B: (1999+1)*0.025=50, (1999+1)*0.975=1950.
+    b_plus_one = eval_protocol.BOOTSTRAP_B_PRODUCTION + 1
+    lower_rank = b_plus_one * eval_protocol.BOOTSTRAP_CI_LOWER_QUANTILE
+    upper_rank = b_plus_one * eval_protocol.BOOTSTRAP_CI_UPPER_QUANTILE
+    assert (lower_rank, upper_rank) == (50.0, 1950.0)
+
+
+def _extract_number(pattern: str, text: str) -> str | None:
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1).replace(",", "")
+
+
+def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
+    """The doc<->constants golden: parses the pinned §9 'Pre-registered protocol
+    (M4 pins)' block and compares every parsed value against this module's own
+    constants. Arms itself automatically once tasks/m4/001's design-doc
+    amendment lands -- it currently lives on the not-yet-merged
+    docs/m4-pin-eval-protocol branch (core.eval_protocol's own module
+    docstring), so until that block exists in this tree, this test has nothing
+    to compare against and explicitly skips rather than failing on a doc
+    section that was never written here.
+    """
+    doc_text = _DESIGN_DOC_PATH.read_text(encoding="utf-8")
+    if _PINNED_PROTOCOL_HEADING not in doc_text:
+        pytest.skip(
+            "design doc has no section-9 'Pre-registered protocol (M4 pins)' block yet "
+            f"-- the amendment lives on the not-yet-merged {_DOC_AMENDMENT_BRANCH} branch "
+            "(see core.eval_protocol's module docstring)"
+        )
+
+    # Scope the search to the block itself: from the heading to the next
+    # section boundary ('---' or the next '## ' heading) -- never the whole doc.
+    start = doc_text.index(_PINNED_PROTOCOL_HEADING)
+    rest = doc_text[start:]
+    end_match = re.search(r"\n(?:---|## )", rest)
+    block = rest[: end_match.start()] if end_match else rest
+
+    pairs_per_cell = _extract_number(r"pairs[- ]per[- ]cell[^0-9]{0,20}(\d[\d,]*)", block)
+    assert pairs_per_cell is not None, f"could not find a pairs-per-cell pin in: {block!r}"
+    assert int(pairs_per_cell) == eval_protocol.PAIRS_PER_CELL
+
+    eval_sims = _extract_number(r"\bS\s*=\s*(\d[\d,]*)", block)
+    assert eval_sims is not None, f"could not find the eval-sims (S) pin in: {block!r}"
+    assert int(eval_sims) == eval_protocol.EVAL_SIMS
+
+    bootstrap_b = _extract_number(r"\bB\s*=\s*(\d[\d,]*)", block)
+    assert bootstrap_b is not None, f"could not find the bootstrap B pin in: {block!r}"
+    assert int(bootstrap_b) == eval_protocol.BOOTSTRAP_B_PRODUCTION
+
+    assert "0.025" in block and "0.975" in block, (
+        f"could not find the order-statistic rank-rule's quantiles in: {block!r}"
+    )
+
+    rung8_lag = _extract_number(r"K\s*/\s*(\d+)", block) or _extract_number(
+        r"lag[^0-9]{0,20}(\d+)", block
+    )
+    assert rung8_lag is not None, f"could not find the rung-8 lag divisor in: {block!r}"
+    assert int(rung8_lag) == eval_protocol.RUNG8_LAG_DIVISOR
