@@ -1062,7 +1062,10 @@ _DESIGN_DOC_PATH = (
     Path(__file__).resolve().parent.parent / "metadocs" / "blokus-duo-az-design-v0_5.md"
 )
 _DOC_AMENDMENT_BRANCH = "docs/m4-pin-eval-protocol"
-_PINNED_PROTOCOL_HEADING = "Pre-registered protocol (M4 pins)"
+# The bolded lead-in of the actual section-9 block. The bare phrase also appears
+# in the status-header changelog ("section 9 gains a ... block"), so anchoring on
+# the bold form keeps the parse scoped to the pins themselves.
+_PINNED_PROTOCOL_HEADING = "**Pre-registered protocol (M4 pins).**"
 
 
 def test_protocol_registry_matches_the_literal_pinned_values():
@@ -1127,7 +1130,7 @@ def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
     assert eval_sims is not None, f"could not find the eval-sims (S) pin in: {block!r}"
     assert int(eval_sims) == eval_protocol.EVAL_SIMS
 
-    bootstrap_b = _extract_number(r"\bB\s*=\s*(\d[\d,]*)", block)
+    bootstrap_b = _extract_number(r"`?\bB`?\s*=\s*(\d[\d,]*)", block)
     assert bootstrap_b is not None, f"could not find the bootstrap B pin in: {block!r}"
     assert int(bootstrap_b) == eval_protocol.BOOTSTRAP_B_PRODUCTION
 
@@ -1135,7 +1138,7 @@ def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
         f"could not find the order-statistic rank-rule's quantiles in: {block!r}"
     )
 
-    rung8_lag = _extract_number(r"K\s*/\s*(\d+)", block) or _extract_number(
+    rung8_lag = _extract_number(r"K`?\s*/\s*(\d+)", block) or _extract_number(
         r"lag[^0-9]{0,20}(\d+)", block
     )
     assert rung8_lag is not None, f"could not find the rung-8 lag divisor in: {block!r}"
