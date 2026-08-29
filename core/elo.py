@@ -4,12 +4,13 @@ Bradley–Terry/logistic ratings on the standard 400-point scale, fit by
 coordinate ascent over per-matchup aggregate scores (draws already counted
 0.5), with the anchor agent pinned at exactly 0 (rung 1 in the frozen ladder)
 and one virtual draw per unordered matchup so extreme small samples stay
-finite. This is M1.6 scaffolding — M4's pre-registered protocol supersedes it
-for the §1 verdict.
+finite. This is M1.6 scaffolding — M4's pre-registered protocol adopts it
+(virtual draw included) for the §1 verdict.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 
 from core.runner import PairResult
@@ -43,6 +44,7 @@ def fit_elo(
     anchor: str,
     tol: float = 1e-9,
     max_iter: int = 10_000,
+    initial_ratings: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Fit anchored Bradley–Terry Elo ratings from matchup aggregates.
 
@@ -57,14 +59,34 @@ def fit_elo(
         anchor: Agent name pinned at Elo 0 (the ladder's rung 1).
         tol: Convergence threshold on the largest single-rating move.
         max_iter: Hard cap on ascent sweeps.
+        initial_ratings: Optional starting ratings, keyed by agent name.
+            ``None`` (the default) reproduces the historical zero-start path
+            bit-for-bit (equivalent to passing ``dict.fromkeys(agents, 0.0)``
+            explicitly): every agent, anchor included, starts the ascent at
+            0.0. When given, coordinate ascent instead starts from these
+            values for every agent present in both ``initial_ratings`` and
+            the matchup graph (each bisection bracket already re-centers on
+            the *current* rating every sweep, so a different starting point
+            never changes which fixed point the ascent converges to — the
+            anchored, virtual-draw-regularized optimum is unique). An agent
+            in the matchup graph but absent from ``initial_ratings`` simply
+            starts at 0.0, same as the zero-start default; a key in
+            ``initial_ratings`` naming an agent outside the matchup graph is
+            silently ignored (nothing in the fit refers to it). ``anchor``'s
+            starting value is always forced to 0.0 regardless of what (if
+            anything) ``initial_ratings`` supplies for it, since the anchor
+            never moves during ascent and must return pinned at 0.0.
 
     Returns:
         Dict of agent name to Elo rating, with ``result[anchor] == 0.0``.
 
     Raises:
-        ValueError: If any matchup has ``n_games <= 0``, if ``anchor`` appears
-            in no matchup, or some agent is not connected to the anchor through
-            the matchup graph.
+        ValueError: If any matchup has ``n_games <= 0``; if ``anchor`` appears
+            in no matchup; if some agent is not connected to the anchor
+            through the matchup graph; or if ``initial_ratings`` contains a
+            non-finite or non-numeric value for some *non-anchor* agent in
+            the matchup graph -- a value keyed on ``anchor`` itself is never
+            validated, since it is always discarded in favor of 0.0.
     """
     # Fold in the virtual draw and collapse duplicate matchups.
     totals: dict[tuple[str, str], tuple[float, int]] = {}
@@ -93,6 +115,20 @@ def fit_elo(
         opponents[b].append((a, n - score_a, n))
 
     ratings = dict.fromkeys(agents, 0.0)
+    if initial_ratings is not None:
+        for name, value in initial_ratings.items():
+            if name not in ratings or name == anchor:
+                # Either outside the matchup graph (nothing to warm-start) or the
+                # anchor itself -- forced to 0.0 below regardless of what's supplied,
+                # so an invalid anchor value is ignored rather than validated.
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"initial_ratings[{name!r}] must be a finite float, got {value!r}")
+            if not math.isfinite(value):
+                raise ValueError(f"initial_ratings[{name!r}] must be finite, got {value!r}")
+            ratings[name] = float(value)
+        ratings[anchor] = 0.0  # the anchor is always pinned at 0, warm start or cold
+
     for _ in range(max_iter):
         biggest_move = 0.0
         for name in agents:
