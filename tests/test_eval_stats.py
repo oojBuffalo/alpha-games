@@ -27,6 +27,10 @@ from core.agents import RandomAgent
 from core.elo import fit_elo
 from core.eval_stats import (
     ANCHOR_AGENT,
+    bootstrap_replicate,
+    bootstrap_replicate_matches,
+    bootstrap_replicates,
+    bootstrap_seed,
     checkpoint_elo,
     elo_curve,
     elo_curve_path,
@@ -52,6 +56,7 @@ from core.observability import (
     segment_end_record,
     segment_start_record,
 )
+from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 # ---------------------------------------------------------------------------------
 # Fixture helpers -- a minimal, self-contained eval-store builder (mirrors
@@ -446,3 +451,106 @@ def test_elo_curve_orders_by_model_version_regardless_of_build_order(tmp_path):
     result = elo_curve(tmp_path, snapshot)
 
     assert [row["model_version"] for row in result["rows"]] == [1, 2]
+
+
+# ==============================================================================
+# 5. The within-cell paired-bootstrap resampler (tasks/m4/007, subtask 7.1)
+# ==============================================================================
+
+
+def _write_bootstrap_fixture(tmp_path):
+    """A small multi-cell, non-uniform-pair-count eval-store fixture.
+
+    Deliberately gives cells different original pair counts (4, 3, 4) so
+    "resample with replacement to the cell's own count" is exercised
+    meaningfully rather than vacuously with a single shared count everywhere.
+    """
+    _write_member(
+        tmp_path,
+        1,
+        [
+            (5, "random", [2.0, 1.0, 0.0, 2.0]),
+            (7, "random", [1.5, 1.0, 2.0]),
+        ],
+    )
+    _write_member(
+        tmp_path,
+        2,
+        [
+            (7, "random", [1.0, 0.5, 2.0, 1.5]),
+        ],
+    )
+
+
+def test_bootstrap_seed_matches_the_pinned_derivation():
+    assert bootstrap_seed(4242) == derive_seed(4242, PURPOSE_BOOTSTRAP)
+    assert bootstrap_seed(4242) != bootstrap_seed(4243)
+
+
+def test_replicate_reproduced_in_isolation_matches_the_full_run_exactly(tmp_path):
+    """Task 7.1's headline reproducibility guarantee: replicate b is recoverable
+    from (bootstrap_seed, b) alone, with no other replicate having ever run, and
+    is bit-for-bit identical to that same index inside a full B-replicate batch.
+    """
+    _write_bootstrap_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(4242)
+
+    full_run = list(bootstrap_replicates(snapshot, seed, 5))
+
+    for b in range(5):
+        isolated = bootstrap_replicate(snapshot, seed, b)
+        assert isolated == full_run[b]  # exact, not approximate
+
+
+def test_different_replicate_indices_give_different_resamples(tmp_path):
+    _write_bootstrap_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(11)
+
+    matches_by_b = [bootstrap_replicate_matches(snapshot, seed, b) for b in range(8)]
+    # Each replicate names the identical set of matchups (resampling never
+    # changes which candidate/opponent pairs appear -- only their scores) --
+    # but at least one replicate's aggregate scores must differ from another's,
+    # or the resampler is silently ignoring the seed.
+    agent_pairs = {(m[0], m[1]) for matches in matches_by_b for m in matches}
+    assert len(agent_pairs) == 3  # the fixture's 3 cells: rung5-v1-1, rung7-v1-1, rung7-v1-2
+    assert len({tuple(sorted(m[2] for m in matches)) for matches in matches_by_b}) > 1
+
+
+def test_warm_start_replicate_refit_matches_cold_start_within_fit_tolerance(tmp_path):
+    """Warm-starting from the point estimate (task 6's `initial_ratings`) must be a
+    pure speedup to the same anchored fixed point, never a different answer
+    (`core.elo.fit_elo`'s own docstring; verified directly for `fit_elo` in
+    `tests/test_eval_stats.py`'s own `initial_ratings` suite). Exact bit-for-bit
+    equality is deliberately not asserted here: cold and warm starts drive
+    `fit_elo`'s bisection from different initial `(lo, hi)` brackets, so each
+    per-agent search takes a different sequence of floating-point midpoints
+    before its per-sweep move drops below `fit_elo`'s own convergence tolerance
+    (`tol=1e-9`) -- the two fits converge on the same value to within roughly
+    that tolerance, not through the identical arithmetic path that would be
+    needed for bit-identical output.
+    """
+    _write_bootstrap_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(777)
+    b = 2
+
+    matches = bootstrap_replicate_matches(snapshot, seed, b)
+    cold = fit_elo(matches, anchor=ANCHOR_AGENT)
+    warm = bootstrap_replicate(snapshot, seed, b)
+
+    assert warm.keys() == cold.keys()
+    assert warm[ANCHOR_AGENT] == 0.0 == cold[ANCHOR_AGENT]
+    for name in cold:
+        assert warm[name] == pytest.approx(cold[name], abs=1e-6)
+
+
+def test_same_store_and_seed_give_bit_identical_replicate_ratings_across_two_runs(tmp_path):
+    _write_bootstrap_fixture(tmp_path)
+    seed = bootstrap_seed(99)
+
+    run_a = list(bootstrap_replicates(load_snapshot(tmp_path), seed, 7))
+    run_b = list(bootstrap_replicates(load_snapshot(tmp_path), seed, 7))
+
+    assert run_a == run_b  # exact, not approximate -- two independent snapshot loads

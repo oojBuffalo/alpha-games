@@ -1,8 +1,10 @@
-"""Anchored full-ladder Elo fit over an eval snapshot, and the §1 x-axis join
-(design doc §1, §9; tasks/m4/006).
+"""Anchored full-ladder Elo fit over an eval snapshot, the §1 x-axis join, and the
+within-cell paired-bootstrap resampler (design doc §1, §9; tasks/m4/006, 007).
 
-Two pieces, deliberately factored so task 7 (the bootstrap/inference half this
-task leaves room for) reuses both without a second fit implementation:
+Three pieces, deliberately factored so the bootstrap (task 7) reuses the fit
+without a second fit implementation, and the inference layer built on top of it
+(task 7.2's Δ̂/CIs/Mann-Kendall) reuses the resampler without a second resampling
+implementation:
 
 * **The fit.** :func:`snapshot_matches` aggregates every cell within an
   :class:`~core.eval_store.EvalSnapshot`'s *complete contiguous member
@@ -15,9 +17,6 @@ task leaves room for) reuses both without a second fit implementation:
   unplayed cell breaks the matchup graph's connectivity to the anchor, which
   surfaces here exactly as ``core.elo.fit_elo``'s own named-agent
   ``ValueError`` -- this module rebuilds no connectivity check of its own.
-  Task 7's per-replicate warm-started fits call ``core.elo.fit_elo`` directly
-  with ``initial_ratings`` over their own resampled match lists, reusing
-  :func:`snapshot_matches`'s output as the population to resample from.
 * **The join.** :func:`checkpoint_elo` extracts the rung-7 form's rating per
   member version, ordered by ``model_version`` (provenance order, never file
   mtime); :func:`elo_curve` pairs each with
@@ -33,20 +32,48 @@ task leaves room for) reuses both without a second fit implementation:
   not re-derived. matplotlib is deliberately not a dependency of this
   codebase; the provisional-vs-authoritative distinction over this series is
   task 7's concern, not this module's.
+* **The resample (task 7.1; task 1 pin 7).** :func:`bootstrap_seed` derives the
+  run's one recorded bootstrap seed; :func:`bootstrap_replicate_matches`
+  resamples every in-scope cell's pair records with replacement to the cell's
+  own pair count and re-aggregates them -- the same in-scope cell population
+  :func:`snapshot_matches` aggregates over (:func:`_snapshot_cell_records`),
+  resampled at the per-pair-record grain within each cell rather than at
+  ``Match``'s already-collapsed grain, since resampling *inside* a cell is the
+  pinned unit (a resampled ``Match`` still names the same candidate/opponent
+  pair, so the matchup graph's connectivity to the anchor never changes across
+  replicates -- only each edge's score). :func:`bootstrap_replicate` refits
+  that replicate through the unmodified ``core.elo.fit_elo``, warm-started from
+  the point estimate via its ``initial_ratings`` parameter (task 6's
+  extension) -- a pure speedup to the same fixed point, never a different
+  answer. :func:`bootstrap_replicates` is the batch form: one point-estimate
+  fit and one cell read, then ``B`` refits by index. Every replicate is
+  reproducible from ``(bootstrap_seed, b)`` alone, independent of any other
+  replicate ever having run -- task 7.2 builds Δ̂/CIs on top of this by mapping
+  :func:`checkpoint_elo` over each replicate's ratings dict.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import uuid
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 from core.elo import Match, fit_elo
-from core.eval_store import EvalSnapshot, eval_dir, iter_cells, read_cell, records_to_match
+from core.eval_store import (
+    EvalSnapshot,
+    PairRecord,
+    eval_dir,
+    iter_cells,
+    read_cell,
+    records_to_match,
+)
 from core.observability import reduce_run
+from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 #: The M1.6 frozen ladder's rung-1 anchor identity -- ``core.agents.RandomAgent.name``
 #: verbatim (a literal mirror, like ``core.eval_protocol.EVAL_SIMS``'s cross-module
@@ -77,8 +104,16 @@ def elo_curve_path(run_dir: Path | str) -> Path:
     return eval_dir(run_dir) / _ELO_CURVE_NAME
 
 
-def snapshot_matches(snapshot: EvalSnapshot) -> list[Match]:
-    """Aggregate an eval snapshot's in-scope cells into ``core.elo.Match`` aggregates.
+def _snapshot_cell_records(
+    snapshot: EvalSnapshot,
+) -> list[tuple[str, str, list[PairRecord]]]:
+    """Read every in-scope cell's identities and raw pair records.
+
+    Shared by :func:`snapshot_matches` (whole-cell aggregation, the point-estimate
+    population) and :func:`bootstrap_replicate_matches` (per-pair-record
+    resampling within each cell) -- both need exactly the same cell scope and
+    order, so the filter lives in one place rather than two copies that could
+    silently drift apart.
 
     Reads every cell the snapshot marks complete (``core.eval_store.iter_cells``)
     but keeps only those belonging to the snapshot's *complete contiguous member
@@ -87,30 +122,47 @@ def snapshot_matches(snapshot: EvalSnapshot) -> list[Match]:
     (``EvalSnapshot.completed_cell_ids``'s own docstring notes such cells are
     visible there -- "per-checkpoint live reporting reads this set directly" --
     precisely because they sit *outside* the contiguous prefix), so it is excluded
-    here rather than silently admitted into the §1 point estimate -- the "never
-    partial data" analysis-snapshot convention this task's fit is pinned to. A
-    cell that is merely scheduled (never completed at all) is already structurally
-    absent from the snapshot and never reaches this function in the first place.
+    here rather than silently admitted into the §1 point estimate or the
+    bootstrap -- the "never partial data" analysis-snapshot convention both are
+    pinned to (task 1 pin 9, P2.2). A cell that is merely scheduled (never
+    completed at all) is already structurally absent from the snapshot and never
+    reaches this function in the first place.
 
     Args:
         snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
 
     Returns:
-        One ``Match`` per in-scope cell, in sorted cell-id order. Order is
-        immaterial to the fit itself (``core.elo.fit_elo`` collapses duplicate
-        matchups and sums are order-independent) but kept deterministic for any
-        caller inspecting this list directly, task 7's bootstrap resampling
-        included.
+        ``(candidate_identity, opponent_identity, records)`` per in-scope cell, in
+        sorted cell-id order (``core.eval_store.iter_cells``'s own order) --
+        immaterial to the point-estimate fit itself (``core.elo.fit_elo``
+        collapses duplicate matchups and sums are order-independent) but pinned
+        deterministic for the bootstrap, whose single shared per-replicate
+        generator is threaded across cells in exactly this order (task 1 pin 7:
+        "cells iterated in sorted cell-id order").
     """
-    matches: list[Match] = []
+    cells: list[tuple[str, str, list[PairRecord]]] = []
     for path in iter_cells(snapshot):
         header, records = read_cell(path)
         if header.cell_id.candidate_version > snapshot.member_prefix:
             continue
-        matches.append(
-            records_to_match(header.candidate_identity, header.opponent_identity, records)
-        )
-    return matches
+        cells.append((header.candidate_identity, header.opponent_identity, records))
+    return cells
+
+
+def snapshot_matches(snapshot: EvalSnapshot) -> list[Match]:
+    """Aggregate an eval snapshot's in-scope cells into ``core.elo.Match`` aggregates.
+
+    Args:
+        snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
+
+    Returns:
+        One ``Match`` per in-scope cell (:func:`_snapshot_cell_records`'s own
+        scope), in sorted cell-id order.
+    """
+    return [
+        records_to_match(candidate_identity, opponent_identity, records)
+        for candidate_identity, opponent_identity, records in _snapshot_cell_records(snapshot)
+    ]
 
 
 def fit_snapshot_elo(
@@ -139,6 +191,186 @@ def fit_snapshot_elo(
             leaves its candidate or opponent identity unreachable).
     """
     return fit_elo(snapshot_matches(snapshot), anchor=ANCHOR_AGENT, initial_ratings=initial_ratings)
+
+
+# ---------------------------------------------------------------------------------
+# The within-cell paired-bootstrap resampler (task 7.1; task 1 pin 7).
+# ---------------------------------------------------------------------------------
+
+
+def bootstrap_seed(eval_seed: int) -> int:
+    """Derive the run's one recorded bootstrap seed (design doc §12 M4's "its own
+    recorded seed"; task 1 pin 7).
+
+    Derived once, from the run's evaluation seed, and recorded downstream (the
+    verdict artifact) rather than re-derived from ``eval_seed`` at every call site
+    -- every replicate's own stream is in turn derived from *this* seed (see
+    :func:`bootstrap_replicate_matches`), never from ``eval_seed`` directly, so
+    the whole bootstrap is reproducible from the one recorded integer.
+
+    Args:
+        eval_seed: The run's evaluation seed (``core.runconfig.EvalConfig.eval_seed``).
+
+    Returns:
+        ``derive_seed(eval_seed, core.seeding.PURPOSE_BOOTSTRAP)``.
+    """
+    return derive_seed(eval_seed, PURPOSE_BOOTSTRAP)
+
+
+def _resample_cell(rng: random.Random, records: Sequence[PairRecord]) -> list[PairRecord]:
+    """Resample one cell's pair records with replacement to its own pair count.
+
+    Args:
+        rng: The replicate's shared generator, consumed in the caller's fixed
+            cell order (see :func:`_resample_matches`).
+        records: The cell's stored pair records -- the population drawn from.
+
+    Returns:
+        ``len(records)`` records drawn independently and uniformly at random,
+        with replacement, from ``records`` (task 1 pin 7's within-cell bootstrap
+        unit: a cell never grows or shrinks under resampling). ``[]`` if
+        ``records`` is empty.
+    """
+    if not records:
+        return []
+    return rng.choices(records, k=len(records))
+
+
+def _resample_matches(
+    cells: Sequence[tuple[str, str, Sequence[PairRecord]]], seed: int
+) -> list[Match]:
+    """Resample every cell once, under one seed, and re-aggregate into ``Match`` objects.
+
+    One ``random.Random(seed)`` is threaded across every cell **in the order
+    ``cells`` is given** -- callers must supply :func:`_snapshot_cell_records`'s
+    own sorted-cell-id order, never a set or a re-sort here, so that a draw
+    landing on one cell can never silently shift onto another (task 1 pin 7:
+    "cells iterated in sorted cell-id order"). A resampled ``Match`` always names
+    the same ``(candidate_identity, opponent_identity)`` pair as the cell it came
+    from -- only its aggregate score and (in general) its per-pair composition
+    change -- so the matchup graph's connectivity to the anchor is identical to
+    the point estimate's across every replicate; resampling can never disconnect
+    an agent that the point estimate reached.
+
+    Args:
+        cells: ``(candidate_identity, opponent_identity, records)`` per in-scope
+            cell, in sorted cell-id order (:func:`_snapshot_cell_records`).
+        seed: This replicate's own derived seed.
+
+    Returns:
+        One resampled ``Match`` per entry in ``cells``, in the same order.
+    """
+    rng = random.Random(seed)
+    return [
+        records_to_match(candidate_identity, opponent_identity, _resample_cell(rng, records))
+        for candidate_identity, opponent_identity, records in cells
+    ]
+
+
+def bootstrap_replicate_matches(snapshot: EvalSnapshot, bootstrap_seed: int, b: int) -> list[Match]:
+    """Resample replicate ``b``'s in-scope cells from ``snapshot`` into ``Match`` objects.
+
+    Replicate ``b`` draws its own generator from ``derive_seed(bootstrap_seed,
+    "replicate", b)`` (task 1 pin 7) -- independent of every other replicate's
+    stream (a fresh ``random.Random`` per call, never a shared or advanced one),
+    so replicate ``b`` is reproducible from ``(bootstrap_seed, b)`` alone, without
+    any other replicate ever having been computed. Within each of ``snapshot``'s
+    in-scope cells (:func:`_snapshot_cell_records`'s member-prefix scope --
+    partial cells never enter, task 1 pin 9), the cell's pair records are
+    resampled with replacement to the cell's own original pair count and
+    re-aggregated (:func:`_resample_matches`).
+
+    Args:
+        snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
+        bootstrap_seed: The run's recorded bootstrap seed (:func:`bootstrap_seed`).
+        b: The replicate's index (0-based).
+
+    Returns:
+        One resampled ``Match`` per in-scope cell, in sorted cell-id order.
+    """
+    seed = derive_seed(bootstrap_seed, "replicate", b)
+    return _resample_matches(_snapshot_cell_records(snapshot), seed)
+
+
+def bootstrap_replicate(
+    snapshot: EvalSnapshot,
+    bootstrap_seed: int,
+    b: int,
+    *,
+    point_estimate: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Fit replicate ``b``'s anchored Elo ratings, warm-started from the point estimate.
+
+    Reproducible from ``(snapshot, bootstrap_seed, b)`` alone: a single replicate
+    can be recomputed in isolation, with no other replicate ever having run, and
+    matches that same replicate's ratings inside a full
+    :func:`bootstrap_replicates` run bit-for-bit -- same seed derivation, same
+    in-scope cells, same warm start.
+
+    Args:
+        snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
+        bootstrap_seed: The run's recorded bootstrap seed (:func:`bootstrap_seed`).
+        b: The replicate's index (0-based).
+        point_estimate: The snapshot's point-estimate ratings
+            (:func:`fit_snapshot_elo`), forwarded to ``core.elo.fit_elo`` as
+            ``initial_ratings`` (task 6's extension, S2.3) -- a pure speedup to
+            the same anchored fixed point, never a different answer (``fit_elo``'s
+            own docstring: the ascent's fixed point does not depend on where it
+            starts). ``None`` (the default) computes the point estimate fresh
+            from ``snapshot``, so this function is usable standing entirely on
+            its own; a caller refitting many replicates
+            (:func:`bootstrap_replicates`) fits the point estimate once and
+            passes it through instead of repeating that fit ``B`` times.
+
+    Returns:
+        This replicate's fitted ratings dict -- same shape as
+        :func:`fit_snapshot_elo`'s own return value.
+
+    Raises:
+        ValueError: Propagated from ``core.elo.fit_elo`` if ``snapshot`` has no
+            matchup at all, or some agent is disconnected from
+            :data:`ANCHOR_AGENT` -- resampling never changes which agents are
+            connected (see :func:`_resample_matches`), so this can only fire here
+            if the point estimate itself would also raise it.
+    """
+    if point_estimate is None:
+        point_estimate = fit_snapshot_elo(snapshot)
+    matches = bootstrap_replicate_matches(snapshot, bootstrap_seed, b)
+    return fit_elo(matches, anchor=ANCHOR_AGENT, initial_ratings=point_estimate)
+
+
+def bootstrap_replicates(
+    snapshot: EvalSnapshot, bootstrap_seed: int, B: int
+) -> Iterator[dict[str, float]]:
+    """Yield ``B`` bootstrap replicates' anchored Elo ratings, deterministically, by index.
+
+    Reads ``snapshot``'s in-scope cells and fits its point estimate exactly once
+    (never re-read or re-fit per replicate), then yields replicate ``0`` through
+    ``B - 1`` in order. Each yielded value is identical to what
+    :func:`bootstrap_replicate` computes for that same index in isolation (same
+    cells, same seed derivation, same warm start) -- this function exists purely
+    to amortize the one-time snapshot read and point-estimate fit across many
+    replicates, not to compute anything a caller could not get by calling
+    :func:`bootstrap_replicate` ``B`` times.
+
+    Args:
+        snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
+        bootstrap_seed: The run's recorded bootstrap seed (:func:`bootstrap_seed`).
+        B: How many replicates to yield. This function accepts any non-negative
+            count; validating ``B`` against the pinned admissible-``B`` rule
+            (task 1 pin 7: ``B ≡ 39 mod 40``) is task 7.2's concern, not this
+            resampling engine's.
+
+    Yields:
+        Each replicate's fitted ratings dict (:func:`bootstrap_replicate`'s own
+        return shape), for ``b`` in ``range(B)``, in increasing order.
+    """
+    point_estimate = fit_snapshot_elo(snapshot)
+    cells = _snapshot_cell_records(snapshot)
+    for b in range(B):
+        seed = derive_seed(bootstrap_seed, "replicate", b)
+        matches = _resample_matches(cells, seed)
+        yield fit_elo(matches, anchor=ANCHOR_AGENT, initial_ratings=point_estimate)
 
 
 def checkpoint_elo(ratings: dict[str, float]) -> list[tuple[int, float]]:
