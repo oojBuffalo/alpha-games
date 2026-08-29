@@ -12,6 +12,7 @@ import pytest
 from core import RandomAgent
 from core.agents import Agent
 from core.runner import play_game, play_pairs
+from core.seeding import derive_seed
 from games.tictactoe import TicTacToe
 
 GAME = TicTacToe()
@@ -153,3 +154,44 @@ def test_play_pairs_rejects_a_zero_game_match():
     for bad in (0, -1):
         with pytest.raises(ValueError):
             play_pairs(GAME, rand, rand, n_pairs=bad, seed=0)
+
+
+# --- index-keyed pair seeds and resumable windows (M4 §5.1) -------------------
+
+
+def test_pair_seed_is_the_index_keyed_derivation():
+    # pair_seed is a pure function of (seed, pair_index) -- recomputing it via
+    # core.seeding.derive_seed must match the value the runner recorded.
+    results = play_pairs(
+        GAME, lambda s: RandomAgent(s), lambda s: RandomAgent(s), n_pairs=5, seed=42
+    )
+    for pair in results:
+        assert pair.pair_seed == derive_seed(42, "pair", pair.pair_index)
+    # Distinct per pair -- a stronger form of the mirrored/distinct-seed
+    # property test_play_pairs_swaps_seats_and_reuses_the_pair_seed checks at
+    # the factory-call level.
+    assert len({pair.pair_seed for pair in results}) == 5
+
+
+def test_play_pairs_resumption_reproduces_an_uninterrupted_run():
+    # Index-keyed seeds are pure functions of (seed, pair_index), independent
+    # of stream position, so a resumed window must reproduce byte-for-byte
+    # (here: field-for-field) what an uninterrupted run would have played --
+    # this is the exact-resumption contract the eval store leans on.
+    args = (GAME, lambda s: RandomAgent(s), lambda s: RandomAgent(s))
+    seed = 2024
+    full = play_pairs(*args, n_pairs=10, seed=seed)
+    head = play_pairs(*args, n_pairs=4, seed=seed)
+    tail = play_pairs(*args, n_pairs=6, seed=seed, start_pair_index=4)
+    assert head + tail == full
+    assert [pair.pair_index for pair in tail] == list(range(4, 10))
+    assert [pair.pair_index for pair in head] == list(range(0, 4))
+
+
+def test_play_pairs_rejects_a_negative_start_pair_index():
+    # There is no pair before index 0 to resume from.
+    def rand(s):
+        return RandomAgent(s)
+
+    with pytest.raises(ValueError):
+        play_pairs(GAME, rand, rand, n_pairs=1, seed=0, start_pair_index=-1)
