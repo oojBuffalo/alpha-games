@@ -47,6 +47,12 @@ PURPOSE_TIE_BREAK = "tie-break"
 PURPOSE_AUGMENTATION = "augmentation"
 PURPOSE_WINDOW_SAMPLING = "replay-sampling"
 
+#: M4's eval-harness purpose (design doc §12 M4's "its own recorded seed"; tasks/m4/001
+#: pin 7, tasks/m4/007): ``core.eval_stats.bootstrap_seed`` derives the §1 paired-
+#: bootstrap's own seed as ``derive_seed(eval_seed, PURPOSE_BOOTSTRAP)`` -- independent
+#: of every self-play purpose above, which all fan out from the run seed instead.
+PURPOSE_BOOTSTRAP = "bootstrap"
+
 
 def _encode(part: Label) -> bytes:
     """Encode one label part as unambiguous, self-delimiting bytes.
