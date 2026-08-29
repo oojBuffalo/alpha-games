@@ -119,6 +119,20 @@ class _OpeningRestricted(Game):
     def value_targets(self):
         return self._inner.value_targets
 
+    @property
+    def orientation_table_hash(self):
+        # Concrete on the ABC (default None -- see core/game.py), so an
+        # inherited version would silently report "no orientation table" for
+        # a Blokus-family inner game instead of failing -- delegate
+        # explicitly, like every other declared-capability member here.
+        return self._inner.orientation_table_hash
+
+    @property
+    def encoding_conventions(self):
+        # Concrete on the ABC (default {}), same silent-drop hazard as
+        # orientation_table_hash above -- delegate explicitly.
+        return self._inner.encoding_conventions
+
     def initial_state(self):
         return self._initial
 
