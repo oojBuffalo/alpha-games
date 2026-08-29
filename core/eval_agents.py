@@ -20,6 +20,13 @@ checkpoint. :func:`load_eval_network` makes that step explicit and
 un-skippable, and ``tests/test_eval_agents.py``'s distinct-weights golden
 proves the weights actually moved.
 
+Rung 8 (historical checkpoints as frozen opponents, §9) adds no new agent
+form: a historical opponent for checkpoint ``v`` is simply
+:class:`SearchAgent` in its rung-7 form, instantiated from an older
+published ``ckpt-<u>.pt`` — see :func:`historical_opponents` (the version
+selector) and :func:`historical_opponent_factory` (the pre-load-asserted
+factory) at the bottom of this module.
+
 **Reconstructing the architecture without a stored ``NetworkConfig`` field.**
 ``core.checkpoint.CheckpointBundle`` bundles ``run_config`` (``RunConfig``, no
 network-shape fields — see ``core/runconfig.py``'s ``TrainingConfig``) and
@@ -42,10 +49,17 @@ the architecture it trained," not a re-derivation of D5 defaults.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from pathlib import Path
 
 from core.agents import Agent
-from core.checkpoint import CheckpointBundle, load_checkpoint
+from core.checkpoint import (
+    CheckpointBundle,
+    FingerprintMismatchError,
+    load_checkpoint,
+    published_checkpoint_path,
+)
 from core.game import Action, Game, State
 from core.mcts import MCTS, Evaluator
 from core.network import Network, NetworkConfig, make_network_evaluator
@@ -404,3 +418,191 @@ def rung_search_agent_factory(
         return SearchAgent(evaluator, model_version, form=form, sims=sims)
 
     return factory
+
+
+# --- rung 8: historical checkpoints as frozen opponents (§9, §12 M4) -------------------
+#
+# Not a new agent form -- a scheduling category over the rung-7 form above.
+# A historical opponent for candidate checkpoint v is exactly
+# SearchAgent(form=7) built from an older ckpt-<u>.pt, so its identity stays
+# f"rung7-v1-{u}" whether u was ever itself a candidate or only ever appears
+# as an opponent: core.elo.fit_elo's canonical-key matchup collapsing then
+# links the whole checkpoint sequence into one connected Bradley-Terry graph
+# without this module doing anything Elo-specific at all. Historical
+# opponents are frozen by construction (immutable ckpt-<u>.pt files, plus
+# SearchAgent's own frozen-v1-form discipline) -- no re-rating of past games,
+# and no re-rating machinery is built here.
+
+
+def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: int) -> list[int]:
+    """Select rung-8 historical-opponent versions for one candidate checkpoint.
+
+    Implements the pinned rule (``tasks/m4/001``, pin 5): the opponents of
+    candidate ``v`` are ``{v - 1, v - ceil(K/4), 1}``, intersected with
+    ``[1, v - 1]`` and with the versions actually available, deduplicated,
+    ascending.
+
+    **Why ``k_total`` is a required, explicit keyword -- never inferred from**
+    **``versions``:** the live member list a real run scores against is a
+    *growing prefix* (more checkpoints exist by the time a later candidate is
+    evaluated than existed for an earlier one). Deriving the ``ceil(K/4)``
+    lag from ``len(versions)`` or ``max(versions)`` would make the very same
+    candidate's opponent set depend on *when* this function happened to be
+    called during the run -- silently breaking "a candidate's opponent set is
+    a pure function of the candidate" for every downstream record-store/Elo
+    consumer. ``k_total`` must therefore always be the run's fixed total
+    checkpoint count (``tasks/m3/001``'s pinned ``K``), supplied by the
+    caller every time, never recomputed from this call's ``versions``.
+
+    This function's domain is strictly the run's member versions ``1..K``
+    (``tasks/m3/001``'s boundary pins): version ``0`` -- the published,
+    recorded seed init -- is never a member and never an eligible opponent,
+    and neither are the rolling ``resume.pt`` snapshot or the ``latest``
+    pointer (those never produce an integer version at all --
+    ``core.checkpoint.list_published_versions``'s ``ckpt-<digits>.pt``-only
+    glob already excludes them, but *does* include a published ``ckpt-0.pt``
+    since that module intentionally records v0 as an artifact). Task 9 owns
+    computing the actual member list from the run directory/config; this
+    function only *enforces* that domain on whatever list it is handed --
+    belt-and-suspenders against a caller passing raw
+    ``list_published_versions`` output straight through.
+
+    Args:
+        versions: The run's member versions actually available, in any
+            order. Every element must be ``>= 1``; v0 or any other
+            non-member id is a domain violation, not silently dropped.
+        candidate: The checkpoint version being evaluated. Must appear in
+            ``versions``.
+        k_total: The run's total, fixed checkpoint count ``K``, used to
+            compute the ``ceil(K/4)`` lag (see above for why this is never
+            derived from ``versions``).
+
+    Returns:
+        The selected opponent versions: ascending, deduplicated, never
+        ``candidate`` itself, and never a version outside
+        ``[1, candidate - 1]`` or outside ``versions``.
+
+    Raises:
+        ValueError: If ``k_total < 1``; if any element of ``versions`` is
+            ``< 1`` (a v0 or otherwise non-member id entered the domain); or
+            if ``candidate`` is not itself a member of ``versions``.
+    """
+    if k_total < 1:
+        raise ValueError(f"k_total must be >= 1, got {k_total}")
+    invalid = sorted({v for v in versions if v < 1})
+    if invalid:
+        raise ValueError(
+            f"versions must contain member checkpoint ids 1..K only -- got non-member "
+            f"id(s) {invalid} (version 0, and any snapshot/latest artifact, must never "
+            "enter this function's domain; task 9's member-list computation is "
+            "responsible for excluding them before calling this function)"
+        )
+    if candidate not in versions:
+        raise ValueError(
+            f"candidate {candidate} is not a member of the supplied versions {sorted(versions)}"
+        )
+    lag = math.ceil(k_total / 4)
+    wanted = {candidate - 1, candidate - lag, 1}
+    available = set(versions)
+    return sorted(u for u in wanted if 1 <= u < candidate and u in available)
+
+
+def assert_historical_checkpoint_matches_live_game(path: Path | str, game: Game) -> None:
+    """Pre-load fingerprint assert for a rung-8 historical opponent (§12 M4).
+
+    §12 M4 spells out an explicit guard: "before loading historical
+    checkpoints (rung 8): assert the orientation-table hash matches (the M3
+    read-side path)." :func:`core.checkpoint.load_checkpoint` already
+    recomputes and compares the *full* artifact fingerprint -- orientation
+    hash included -- the instant any checkpoint is loaded, historical or
+    candidate alike, and raises before returning anything
+    (:class:`~core.checkpoint.FingerprintMismatchError`). Calling this
+    function before instantiating a historical opponent is deliberate
+    belt-and-suspenders over that loader guard, not a substitute for it: the
+    doc singles out the historical path specifically because a stale
+    historical checkpoint is uniquely dangerous relative to the candidate
+    one -- it sits untouched on disk across arbitrarily many later
+    checkpoints and possible orientation-table regenerations, reachable at
+    any later point in the run, whereas the candidate's own checkpoint is
+    loaded and validated the moment it is produced. Naming this as its own
+    step at the scheduling layer means an old checkpoint written under a
+    different orientation table is impossible to seat as an opponent, with
+    an error that says why *before* any game is played against it.
+
+    This reuses ``load_checkpoint`` verbatim as the "build-and-compare"
+    helper (it builds ``game``'s live fingerprint via
+    ``core.artifact_fingerprint.build_fingerprint`` and compares it against
+    the checkpoint's stored one via ``compare_fingerprints`` -- never a
+    second, separate comparison implemented here) and re-raises only to
+    attach the one piece of context ``compare_fingerprints`` cannot know on
+    its own: which checkpoint file was being validated. The re-raised
+    message therefore always names both the checkpoint ``path`` and the
+    original field-level stored-vs-live detail -- the disagreeing
+    orientation hash's stored and live values included, whenever
+    ``orientation_hash`` is (as expected for this failure mode) among the
+    mismatched fields.
+
+    Args:
+        path: The historical checkpoint file (``ckpt-<old_version>.pt``) to
+            validate before it is seated as an opponent.
+        game: The live game/adapter this evaluation run is scored against.
+
+    Raises:
+        FileNotFoundError: If ``path`` does not exist.
+        core.checkpoint.CheckpointFormatError: If the payload is malformed or
+            carries an unsupported schema version.
+        core.checkpoint.FingerprintMismatchError: If the stored fingerprint
+            disagrees with ``game``'s live one on any field. The message
+            names ``path`` plus every mismatched field's stored and live
+            values.
+    """
+    try:
+        load_checkpoint(path, game)
+    except FingerprintMismatchError as exc:
+        raise FingerprintMismatchError(
+            f"rung-8 pre-load fingerprint assert failed for historical checkpoint "
+            f"{path} -- refusing to seat it as an opponent: {exc}"
+        ) from exc
+
+
+def historical_opponent_factory(
+    ckpt_dir: Path | str,
+    game: Game,
+    old_version: int,
+    device: str = "cpu",
+    sims: int = EVAL_SIMS,
+) -> AgentFactory:
+    """Build the rung-8 ``AgentFactory`` for one historical opponent version.
+
+    Composes the two pieces above in the order §12 M4 requires: the pre-load
+    fingerprint assert (:func:`assert_historical_checkpoint_matches_live_game`)
+    runs first and raises before anything is instantiated; only then is the
+    checkpoint handed to :func:`rung_search_agent_factory` in its rung-7 form
+    -- the exact same factory :func:`historical_opponents`' callers use for a
+    checkpoint's *own* rung-7 evaluation, so a version appearing as both a
+    candidate and a later opponent shares one identity string by construction
+    (``f"rung7-v1-{old_version}"``), not by convention.
+
+    Args:
+        ckpt_dir: The run's checkpoint directory (``core.checkpoint``'s
+            ``ckpt-<version>.pt`` namespace).
+        game: The live game/adapter to validate and evaluate against.
+        old_version: The historical checkpoint's version ``u`` (one element
+            of :func:`historical_opponents`' return value).
+        device: Torch device for inference.
+        sims: Simulations per move (default :data:`EVAL_SIMS`, the pinned
+            rung-7 ``v1`` budget).
+
+    Returns:
+        A ``seed -> SearchAgent`` factory (rung-7 form) for
+        ``ckpt-<old_version>.pt``, matching ``core.runner.AgentFactory``'s
+        shape exactly like :func:`rung_search_agent_factory`'s.
+
+    Raises:
+        core.checkpoint.FingerprintMismatchError: If the pre-load assert
+            fails (see :func:`assert_historical_checkpoint_matches_live_game`).
+        FileNotFoundError: If ``ckpt-<old_version>.pt`` does not exist.
+    """
+    path = published_checkpoint_path(ckpt_dir, old_version)
+    assert_historical_checkpoint_matches_live_game(path, game)
+    return rung_search_agent_factory(path, game, form=7, device=device, sims=sims)

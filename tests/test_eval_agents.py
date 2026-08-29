@@ -24,6 +24,17 @@ on unrelated states/games do not cross-contaminate); a protocol assert that
 no construction path yields root noise; and a slow-marker sanity match
 recovering minimax moves on TTT through the agent seam with a value-perfect
 stub evaluator (the M0 oracle pattern, ``tests/test_mcts_minimax.py``).
+
+And for rung 8 (task 4, historical checkpoints as frozen opponents): the
+pinned selection rule reproduced on synthetic version lists including every
+listed edge (first member, fewer available versions than wanted, never the
+candidate itself, the domain rejection of v0/non-members, determinism over a
+growing prefix, and that ``k_total`` -- never ``len(versions)``/``max`` -- is
+what the lag is computed from); the pre-load fingerprint assert failing the
+cell with the checkpoint path and both the stored and live orientation hash
+named, before any agent is even constructed; snapshot/``latest`` files never
+reaching the selector at all; and the identity-sharing/connected-Elo-graph
+golden tying it back to task 3's rung-7 factory and ``core.elo.fit_elo``.
 """
 
 from __future__ import annotations
@@ -38,11 +49,22 @@ import torch
 import core.eval_agents as eval_agents_module
 from core import RandomAgent
 from core.artifact_fingerprint import FingerprintMismatchError
-from core.checkpoint import build_bundle, write_published_checkpoint
+from core.checkpoint import (
+    build_bundle,
+    list_published_versions,
+    published_checkpoint_path,
+    write_latest_pointer,
+    write_published_checkpoint,
+    write_resume_snapshot,
+)
+from core.elo import fit_elo
 from core.eval_agents import (
     EVAL_SIMS,
     NetworkPolicyAgent,
     SearchAgent,
+    assert_historical_checkpoint_matches_live_game,
+    historical_opponent_factory,
+    historical_opponents,
     load_eval_network,
     rung5_agent_factory,
     rung_search_agent_factory,
@@ -662,3 +684,213 @@ def test_rung7_agent_recovers_minimax_moves_with_a_value_perfect_evaluator():
         )
         tested += 1
     assert tested > 100  # sanity: many distinct endgames actually exercised
+
+
+# =========================================================================================
+# Rung 8: historical checkpoints as frozen opponents (task 4)
+# =========================================================================================
+
+
+# --- historical_opponents: the pinned rule + edges -------------------------------------
+
+
+def test_historical_opponents_reproduces_the_pinned_rule_and_edges():
+    # k_total=8 -> lag = ceil(8 / 4) = 2, so the pinned set is {v-1, v-2, 1}.
+    versions = tuple(range(1, 11))  # a full 1..10 member list
+
+    assert historical_opponents(versions, candidate=1, k_total=8) == []  # first member: empty
+    assert historical_opponents(versions, candidate=2, k_total=8) == [1]  # {1, 0, 1} -> {1}
+    assert historical_opponents(versions, candidate=3, k_total=8) == [1, 2]  # {2, 1, 1}
+    assert historical_opponents(versions, candidate=5, k_total=8) == [1, 3, 4]  # {4, 3, 1}
+    assert historical_opponents(versions, candidate=10, k_total=8) == [1, 8, 9]  # {9, 8, 1}
+
+    for candidate in versions:  # never selects the candidate itself, for every candidate
+        assert candidate not in historical_opponents(versions, candidate=candidate, k_total=8)
+
+
+def test_historical_opponents_reduced_when_fewer_versions_are_available():
+    # candidate=5 at k_total=8 wants {4, 3, 1}, but only 1 and 5 are on disk so far.
+    assert historical_opponents([1, 5], candidate=5, k_total=8) == [1]
+    assert historical_opponents([1, 4, 5], candidate=5, k_total=8) == [1, 4]
+
+
+def test_historical_opponents_uses_the_explicit_k_total_never_len_or_max_of_versions():
+    versions = tuple(range(1, 10))  # len(versions) == 9, max(versions) == 9
+
+    # k_total=40 -> lag = ceil(40 / 4) = 10 -> candidate - lag = 9 - 10 = -1, out of range.
+    result = historical_opponents(versions, candidate=9, k_total=40)
+    assert result == [1, 8]
+    # Had the lag been (wrongly) derived from len(versions)==9, ceil(9/4)=3 would
+    # have put 9-3=6 in the set too -- it must never appear.
+    assert 6 not in result
+
+
+def test_historical_opponents_deterministic_over_a_growing_prefix():
+    short = tuple(range(1, 10))
+    longer = tuple(range(1, 26))  # more checkpoints published later in the run
+    result_short = historical_opponents(short, candidate=9, k_total=40)
+    result_longer = historical_opponents(longer, candidate=9, k_total=40)
+    assert result_short == result_longer == [1, 8]
+
+
+def test_historical_opponents_rejects_v0_even_when_present_in_versions():
+    with pytest.raises(ValueError, match="non-member"):
+        historical_opponents([0, 1, 2, 3], candidate=3, k_total=8)
+
+
+def test_historical_opponents_rejects_a_candidate_absent_from_versions():
+    with pytest.raises(ValueError, match="not a member"):
+        historical_opponents([1, 2, 3], candidate=7, k_total=8)
+
+
+def test_historical_opponents_rejects_a_nonpositive_k_total():
+    with pytest.raises(ValueError, match="k_total"):
+        historical_opponents([1, 2], candidate=2, k_total=0)
+
+
+def test_snapshot_and_latest_files_are_never_offered_as_historical_opponents(tmp_path):
+    """A run dir carrying v0, a rolling ``resume.pt``, and a ``latest``
+    pointer alongside members 1-3: ``list_published_versions`` already
+    structurally excludes ``resume.pt``/``latest`` (neither matches the
+    ``ckpt-<digits>.pt`` glob), and this function's own domain check rejects
+    the v0 it *does* return -- so neither ever reaches the returned opponent
+    set."""
+    ckpt_dir = tmp_path / "run"
+    for v in (0, 1, 2, 3):
+        _write_checkpoint(tmp_path, MICRO, version=v, seed=v + 1, sub_dir="run")
+
+    torch.manual_seed(99)
+    net = Network(_tiny_network_config(MICRO))
+    optimizer = make_optimizer(net, lr=1e-2)
+    scaler = make_scaler("cpu")
+    snapshot_bundle = build_bundle(
+        version=3,
+        learner_step=0,
+        game=MICRO,
+        run_config={},
+        net=net,
+        optimizer=optimizer,
+        scaler=scaler,
+        metrics={},
+    )
+    write_resume_snapshot(ckpt_dir, snapshot_bundle)
+    write_latest_pointer(ckpt_dir, 3)
+    assert (ckpt_dir / "resume.pt").exists()
+    assert (ckpt_dir / "latest").exists()
+
+    on_disk = list_published_versions(ckpt_dir)
+    assert on_disk == (0, 1, 2, 3)  # v0 is a recorded artifact, present on disk
+
+    with pytest.raises(ValueError, match="non-member"):
+        historical_opponents(on_disk, candidate=3, k_total=8)
+
+    # task 9's real job -- excluding v0 before this function ever sees the
+    # list -- still leaves resume.pt/latest with no way in: they never
+    # produced an integer version to begin with.
+    members_only = tuple(v for v in on_disk if v != 0)
+    assert historical_opponents(members_only, candidate=3, k_total=8) == [1, 2]
+
+
+# --- pre-load fingerprint assert: fails the cell before any agent is built -------------
+
+
+def _tamper_orientation_hash(path):
+    """Rewrite a published checkpoint's stored ``orientation_hash`` in place.
+
+    Mirrors ``tests/test_checkpoint.py``'s ``schema_version`` tampering
+    pattern (load the raw payload, mutate one field, re-save) -- simulating a
+    real historical checkpoint written back when the orientation table hashed
+    differently, without touching any other fingerprint field.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    fingerprint = dict(payload["fingerprint"])
+    fingerprint["orientation_hash"] = "tampered-" + str(fingerprint["orientation_hash"])
+    payload["fingerprint"] = fingerprint
+    torch.save(payload, path)
+
+
+def test_assert_historical_checkpoint_matches_live_game_names_path_and_both_hashes(tmp_path):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    live_hash = MICRO.orientation_table_hash
+    _tamper_orientation_hash(path)
+
+    with pytest.raises(FingerprintMismatchError) as excinfo:
+        assert_historical_checkpoint_matches_live_game(path, MICRO)
+
+    message = str(excinfo.value)
+    assert str(path) in message  # the checkpoint path is named
+    assert "orientation_hash" in message  # the field that disagreed is named
+    assert f"tampered-{live_hash}" in message  # the stored hash
+    assert live_hash in message  # the live hash
+
+
+def test_historical_opponent_factory_fails_the_cell_before_any_agent_is_built(
+    tmp_path, monkeypatch
+):
+    ckpt_dir = tmp_path / "run"
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1, sub_dir="run")
+    _tamper_orientation_hash(path)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "rung_search_agent_factory must never run once the pre-load assert has failed"
+        )
+
+    monkeypatch.setattr(eval_agents_module, "rung_search_agent_factory", _boom)
+
+    with pytest.raises(FingerprintMismatchError):
+        eval_agents_module.historical_opponent_factory(ckpt_dir, MICRO, old_version=1)
+
+
+def test_historical_opponent_factory_succeeds_when_the_fingerprint_matches(tmp_path):
+    ckpt_dir = tmp_path / "run"
+    _write_checkpoint(tmp_path, MICRO, version=1, seed=1, sub_dir="run")
+    factory = historical_opponent_factory(ckpt_dir, MICRO, old_version=1, sims=1)
+    agent = factory(seed=0)
+    assert agent.name == "rung7-v1-1"
+
+
+# --- identity-sharing golden + connected Elo graph -------------------------------------
+
+
+def test_identity_sharing_and_connected_elo_graph_with_random_anchor(tmp_path):
+    """A version appearing both as task 3's own candidate and as a rung-8
+    historical opponent shares one agent name -- and a small two-checkpoint
+    fixture, fed as synthetic match records, yields a connected Elo graph
+    through the real ``fit_elo`` anchored on rung 1 (``"random"``, the M1.6
+    anchor -- ``core.agents.RandomAgent.name``)."""
+    ckpt_dir = tmp_path / "run"
+    _write_checkpoint(tmp_path, MICRO, version=1, seed=1, sub_dir="run")
+    _write_checkpoint(tmp_path, MICRO, version=2, seed=2, sub_dir="run")
+
+    # Identity-sharing golden: version 1 built via task 3's own rung-7
+    # factory vs. built as a rung-8 historical opponent -- same name.
+    candidate_factory_v1 = rung_search_agent_factory(
+        published_checkpoint_path(ckpt_dir, 1), MICRO, form=7, sims=1
+    )
+    historical_factory_v1 = historical_opponent_factory(ckpt_dir, MICRO, old_version=1, sims=1)
+    name_v1_as_candidate = candidate_factory_v1(seed=0).name
+    name_v1_as_opponent = historical_factory_v1(seed=0).name
+    assert name_v1_as_candidate == name_v1_as_opponent == "rung7-v1-1"
+    assert RandomAgent(seed=0).name == "random"  # the M1.6 anchor id, unchanged
+
+    candidate_factory_v2 = rung_search_agent_factory(
+        published_checkpoint_path(ckpt_dir, 2), MICRO, form=7, sims=1
+    )
+    name_v2 = candidate_factory_v2(seed=0).name
+    assert name_v2 == "rung7-v1-2"
+
+    # A small two-checkpoint fixture: candidate v2's rung-8 opponent set is
+    # exactly {1} (k_total=2 -> lag=ceil(2/4)=1 -> {1, 1, 1}).
+    assert historical_opponents([1, 2], candidate=2, k_total=2) == [1]
+
+    # Synthetic match records (§ Test Strategy: "feed synthetic match
+    # records") connecting v2 to the anchor and to its rung-8 opponent v1 --
+    # the whole three-node graph must fit without a connectivity error.
+    matches = [
+        ("random", name_v2, 1.5, 3),
+        (name_v2, name_v1_as_opponent, 2.0, 3),
+    ]
+    ratings = fit_elo(matches, anchor="random")
+    assert set(ratings) == {"random", name_v2, "rung7-v1-1"}
+    assert ratings["random"] == 0.0
