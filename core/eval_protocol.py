@@ -91,6 +91,32 @@ EVAL_SIMS = 512
 RUNG8_LAG_DIVISOR = 4
 RUNG8_EARLIEST_VERSION = 1
 
+# --- bootstrap / Mann-Kendall statistical conventions (tasks/m4/001 pin 7, tasks/m4/007) -----
+
+#: The pinned production bootstrap replicate count (tasks/m4/001 pin 7): ``B = 1,999``,
+#: satisfying §1's "B ≈ 2,000" while keeping both order-statistic ranks below integral
+#: (``(B+1)*0.025 = 50``, ``(B+1)*0.975 = 1,950``). ``core.eval_stats``'s CI/gate
+#: functions take ``B`` as a parameter defaulting to this value; an authoritative
+#: verdict (task 7.3) requires ``B == BOOTSTRAP_B_PRODUCTION`` exactly.
+BOOTSTRAP_B_PRODUCTION = 1999
+
+#: The admissible-``B`` rank rule (tasks/m4/001 pin 7): both order-statistic ranks
+#: ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE`` / ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE`` are
+#: integral exactly when ``(B + 1)`` is a multiple of this modulus -- equivalently
+#: ``B % BOOTSTRAP_B_ADMISSIBLE_MODULUS == BOOTSTRAP_B_ADMISSIBLE_REMAINDER``
+#: (``B ≡ 39 mod 40``: 39, 79, ..., 1,999). A ``B`` failing this check is rejected
+#: loudly by ``core.eval_stats.order_statistic_ci`` rather than silently rounded.
+BOOTSTRAP_B_ADMISSIBLE_MODULUS = 40
+BOOTSTRAP_B_ADMISSIBLE_REMAINDER = 39
+
+#: The single order-statistic CI rule's two quantiles (tasks/m4/001 pin 7): the 95%
+#: interval's endpoints sit at ranks ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE`` and
+#: ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE`` (1-indexed order statistics of the sorted
+#: replicate values) -- the one convention used at every admissible ``B``, never a
+#: second quantile rule.
+BOOTSTRAP_CI_LOWER_QUANTILE = 0.025
+BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
+
 #: Every covered constant, by name -- the input to :func:`protocol_fingerprint`.
 #: Additive only (see the module docstring): a later task adds keys here, never
 #: repurposes one to mean something else.
@@ -105,6 +131,11 @@ REGISTRY: dict[str, Any] = {
     "eval_sims": EVAL_SIMS,
     "rung8_lag_divisor": RUNG8_LAG_DIVISOR,
     "rung8_earliest_version": RUNG8_EARLIEST_VERSION,
+    "bootstrap_b_production": BOOTSTRAP_B_PRODUCTION,
+    "bootstrap_b_admissible_modulus": BOOTSTRAP_B_ADMISSIBLE_MODULUS,
+    "bootstrap_b_admissible_remainder": BOOTSTRAP_B_ADMISSIBLE_REMAINDER,
+    "bootstrap_ci_lower_quantile": BOOTSTRAP_CI_LOWER_QUANTILE,
+    "bootstrap_ci_upper_quantile": BOOTSTRAP_CI_UPPER_QUANTILE,
 }
 
 

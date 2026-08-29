@@ -1,10 +1,10 @@
-"""Anchored full-ladder Elo fit over an eval snapshot, the §1 x-axis join, and the
-within-cell paired-bootstrap resampler (design doc §1, §9; tasks/m4/006, 007).
+"""Anchored full-ladder Elo fit over an eval snapshot, the §1 x-axis join, the
+within-cell paired-bootstrap resampler, and the Delta/CI/Mann-Kendall inference
+layer built on top of it (design doc §1, §9; tasks/m4/006, 007).
 
-Three pieces, deliberately factored so the bootstrap (task 7) reuses the fit
-without a second fit implementation, and the inference layer built on top of it
-(task 7.2's Δ̂/CIs/Mann-Kendall) reuses the resampler without a second resampling
-implementation:
+Four pieces, deliberately factored so the bootstrap (task 7.1) reuses the fit
+without a second fit implementation, and the inference layer (task 7.2) reuses
+the resampler without a second resampling implementation:
 
 * **The fit.** :func:`snapshot_matches` aggregates every cell within an
   :class:`~core.eval_store.EvalSnapshot`'s *complete contiguous member
@@ -48,22 +48,46 @@ implementation:
   answer. :func:`bootstrap_replicates` is the batch form: one point-estimate
   fit and one cell read, then ``B`` refits by index. Every replicate is
   reproducible from ``(bootstrap_seed, b)`` alone, independent of any other
-  replicate ever having run -- task 7.2 builds Δ̂/CIs on top of this by mapping
-  :func:`checkpoint_elo` over each replicate's ratings dict.
+  replicate ever having run.
+* **The inference layer (task 7.2; task 1 pins 7-8).** :func:`delta_hat`
+  computes §1's Delta contrast -- ``mean(Elo, final ceil(K/3)) - mean(Elo,
+  first ceil(K/3))`` (:func:`delta_windows`) -- over one complete, contiguous
+  ``1..K`` rung-7 curve; the identical function computes both the
+  original-sample Delta-hat and, via :func:`replicate_deltas` mapping
+  :func:`checkpoint_elo` over each of :func:`bootstrap_replicates`'s ratings
+  dicts, every replicate's Delta_b. :func:`order_statistic_ci` is the one
+  admissible-``B`` order-statistic CI rule (ranks ``(B+1)*0.025``/
+  ``(B+1)*0.975``), used unchanged for both Delta's CI (:func:`delta_gate`
+  reads its lower endpoint) and :func:`per_checkpoint_ci`'s per-version
+  columns -- the same ``B`` replicates, no second resample. :func:`mann_kendall`
+  is the pure-stdlib, tie/continuity-corrected trend test, reported but never
+  gating. None of this module decides *whether* a snapshot is the complete
+  K-set eligible for a Delta at all -- that gate, the provisional-vs-
+  authoritative distinction, and ``verdict.json`` assembly are task 7.3's.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
 import uuid
-from collections.abc import Iterator, Sequence
+from collections import Counter
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from core.elo import Match, fit_elo
+from core.eval_protocol import (
+    BOOTSTRAP_B_ADMISSIBLE_MODULUS,
+    BOOTSTRAP_B_ADMISSIBLE_REMAINDER,
+    BOOTSTRAP_B_PRODUCTION,
+    BOOTSTRAP_CI_LOWER_QUANTILE,
+    BOOTSTRAP_CI_UPPER_QUANTILE,
+)
 from core.eval_store import (
     EvalSnapshot,
     PairRecord,
@@ -392,6 +416,302 @@ def checkpoint_elo(ratings: dict[str, float]) -> list[tuple[int, float]]:
             versions.append((int(match.group(1)), elo))
     versions.sort(key=lambda pair: pair[0])
     return versions
+
+
+# ---------------------------------------------------------------------------------
+# Delta-hat, the admissible-B order-statistic CIs, and per-checkpoint CIs
+# (task 7.2; design doc §1, §9 pin 7-8).
+# ---------------------------------------------------------------------------------
+
+
+def delta_windows(K: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return §1's first-third and final-third 1-indexed member-version windows.
+
+    Defined only over a *complete* K-member series (task 1 pin 8: "no prefix
+    Delta is ever computed") -- members are numbered ``1..K`` (``v0`` is
+    excluded from the K-member set, §6.2's checkpoint/publish boundary rule),
+    so both windows are plain slices of that contiguous range, never derived
+    from anything a prefix snapshot could supply on its own.
+
+    Args:
+        K: The complete series length (member count).
+
+    Returns:
+        ``(first_versions, final_versions)``: the first ``ceil(K/3)`` member
+        versions ``(1, ..., ceil(K/3))`` and the final ``ceil(K/3)`` member
+        versions ``(K - ceil(K/3) + 1, ..., K)`` -- the two windows §1's Delta
+        averages over. Documented boundary examples: ``K=3 -> ((1,), (3,))``;
+        ``K=4 -> ((1, 2), (3, 4))``; ``K=5 -> ((1, 2), (4, 5))``.
+
+    Raises:
+        ValueError: If ``K < 1``.
+    """
+    if K < 1:
+        raise ValueError(f"K must be >= 1, got {K}")
+    window = -(-K // 3)  # ceil(K / 3), pure-integer -- never a float rounding path.
+    first_versions = tuple(range(1, window + 1))
+    final_versions = tuple(range(K - window + 1, K + 1))
+    return first_versions, final_versions
+
+
+def delta_hat(curve: Sequence[tuple[int, float]]) -> float:
+    """Delta-hat: the original-sample §1 contrast over one complete rung-7 Elo curve.
+
+    The same formula computes both the reported point estimate (over the
+    point-estimate curve) and every bootstrap replicate's Delta_b (over that
+    replicate's own curve, task 1 pin 7) -- there is exactly one Delta
+    computation in this module, never two.
+
+    Args:
+        curve: ``(model_version, elo)`` pairs -- exactly
+            :func:`checkpoint_elo`'s own return shape -- which this function
+            requires to cover member versions ``1..K`` contiguously (``K =
+            len(curve)``; task 1 pin 8's "complete K-set" precondition). A
+            caller must never invoke this over an incomplete prefix; passing
+            one raises rather than silently averaging over the wrong window.
+
+    Returns:
+        ``mean(elo over the final ceil(K/3) versions) - mean(elo over the
+        first ceil(K/3) versions)`` (:func:`delta_windows`).
+
+    Raises:
+        ValueError: If ``curve`` is empty, or its versions are not exactly
+            ``{1, ..., len(curve)}`` (a non-contiguous or incomplete series).
+    """
+    if not curve:
+        raise ValueError("delta_hat requires a non-empty checkpoint curve")
+    K = len(curve)
+    elo_by_version = dict(curve)
+    if set(elo_by_version) != set(range(1, K + 1)):
+        raise ValueError(
+            f"delta_hat requires a complete, contiguous 1..{K} member series "
+            f"(task 1 pin 8: no prefix Delta is ever computed); got versions "
+            f"{sorted(elo_by_version)}"
+        )
+    first_versions, final_versions = delta_windows(K)
+    first_mean = sum(elo_by_version[v] for v in first_versions) / len(first_versions)
+    final_mean = sum(elo_by_version[v] for v in final_versions) / len(final_versions)
+    return final_mean - first_mean
+
+
+def replicate_deltas(replicate_ratings: Iterable[dict[str, float]]) -> list[float]:
+    """Delta_b for every bootstrap replicate's fitted ratings.
+
+    Args:
+        replicate_ratings: One fitted ratings dict per replicate (e.g.
+            :func:`bootstrap_replicates`'s own yield), each spanning the same
+            complete K-member series as the point estimate.
+
+    Returns:
+        ``delta_hat(checkpoint_elo(ratings))`` per replicate, in the same
+        order -- no second resample, only the already-fitted ratings each
+        replicate carries.
+
+    Raises:
+        ValueError: Propagated from :func:`delta_hat` if some replicate's
+            rung-7 curve is not a complete, contiguous ``1..K`` series.
+    """
+    return [delta_hat(checkpoint_elo(ratings)) for ratings in replicate_ratings]
+
+
+def _validate_admissible_B(B: int) -> None:
+    """Raise ``ValueError`` unless ``B`` is admissible under the pinned rank rule.
+
+    Admissible means both order-statistic ranks
+    ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE`` and ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE``
+    land on an integer -- equivalently ``B % BOOTSTRAP_B_ADMISSIBLE_MODULUS ==
+    BOOTSTRAP_B_ADMISSIBLE_REMAINDER`` (``B ≡ 39 mod 40``: 39, 79, ..., 1,999;
+    task 1 pin 7).
+
+    Args:
+        B: The candidate replicate count.
+
+    Raises:
+        ValueError: If ``B`` is not a positive int admissible under the rule
+            above.
+    """
+    if (
+        isinstance(B, bool)
+        or not isinstance(B, int)
+        or B < BOOTSTRAP_B_ADMISSIBLE_REMAINDER
+        or B % BOOTSTRAP_B_ADMISSIBLE_MODULUS != BOOTSTRAP_B_ADMISSIBLE_REMAINDER
+    ):
+        raise ValueError(
+            f"B={B!r} is not admissible: the order-statistic CI rule requires both ranks "
+            f"(B+1)*{BOOTSTRAP_CI_LOWER_QUANTILE} and (B+1)*{BOOTSTRAP_CI_UPPER_QUANTILE} to "
+            f"be integral, i.e. B % {BOOTSTRAP_B_ADMISSIBLE_MODULUS} == "
+            f"{BOOTSTRAP_B_ADMISSIBLE_REMAINDER} (B ≡ 39 mod 40: 39, 79, ..., 1999; "
+            f"production default {BOOTSTRAP_B_PRODUCTION})"
+        )
+
+
+def order_statistic_ci(
+    values: Sequence[float], B: int = BOOTSTRAP_B_PRODUCTION
+) -> tuple[float, float]:
+    """The pinned 95% order-statistic CI over ``B`` bootstrap replicate values.
+
+    The one quantile convention used at every admissible ``B`` (task 1 pin 7):
+    endpoints at ranks ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE`` and
+    ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE`` -- 1-indexed order statistics of the
+    sorted values -- never a second rule for a reduced-``B`` test. Used both
+    for Delta's CI (over :func:`replicate_deltas`'s output) and, unchanged,
+    for :func:`per_checkpoint_ci`'s per-version columns -- one CI rule, two
+    call sites, never two formulas.
+
+    Args:
+        values: The replicate statistic values (Delta_b, or one checkpoint's
+            per-replicate rating); must have exactly ``B`` entries.
+        B: Replicate count; must be admissible (:func:`_validate_admissible_B`).
+            Defaults to the pinned production value
+            (``core.eval_protocol.BOOTSTRAP_B_PRODUCTION``).
+
+    Returns:
+        ``(lower, upper)``: the ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE``-th and
+        ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE``-th order statistics (1-indexed)
+        of ``sorted(values)``.
+
+    Raises:
+        ValueError: If ``B`` is not admissible, or ``len(values) != B``.
+    """
+    _validate_admissible_B(B)
+    if len(values) != B:
+        raise ValueError(f"order_statistic_ci requires exactly B={B} values, got {len(values)}")
+    ordered = sorted(values)
+    lower_rank = (B + 1) * BOOTSTRAP_CI_LOWER_QUANTILE
+    upper_rank = (B + 1) * BOOTSTRAP_CI_UPPER_QUANTILE
+    # _validate_admissible_B already guarantees both ranks are exact integers.
+    lower = ordered[int(round(lower_rank)) - 1]
+    upper = ordered[int(round(upper_rank)) - 1]
+    return lower, upper
+
+
+def delta_gate(ci: tuple[float, float]) -> bool:
+    """Success = the Delta CI lies strictly above 0 (task 1's pre-registered gate).
+
+    Args:
+        ci: A :func:`order_statistic_ci` result over :func:`replicate_deltas`.
+
+    Returns:
+        ``ci[0] > 0.0`` -- the lower CI endpoint alone determines the gate,
+        since ``order_statistic_ci`` already guarantees ``ci[0] <= ci[1]``.
+    """
+    return ci[0] > 0.0
+
+
+def per_checkpoint_ci(
+    replicate_ratings: Sequence[dict[str, float]], B: int = BOOTSTRAP_B_PRODUCTION
+) -> list[tuple[int, tuple[float, float]]]:
+    """Per-checkpoint (rung-7 model_version) 95% CIs from the same ``B`` replicates.
+
+    The same :func:`order_statistic_ci` rule applied column-wise over each
+    member version's ``B`` per-replicate ratings -- no second resample (task
+    1 pin 7's "per-checkpoint CIs are the same rule over the same replicates'
+    per-version ratings"). Resampling never disconnects an agent the point
+    estimate reached (:func:`bootstrap_replicate_matches`'s own docstring), so
+    every replicate names the identical set of rung-7 member versions; this
+    function reads that version set from the union across replicates so a
+    caller's contract violation (a replicate missing a version) surfaces as a
+    ``KeyError`` naming the offending version rather than a silently
+    truncated report.
+
+    Args:
+        replicate_ratings: Exactly ``B`` replicate fitted-ratings dicts (e.g.
+            a materialized list of :func:`bootstrap_replicates`'s own yield).
+        B: Replicate count; must be admissible. Defaults to the pinned
+            production value.
+
+    Returns:
+        ``(model_version, (lower, upper))`` pairs, ordered by ``model_version``
+        ascending.
+
+    Raises:
+        ValueError: If ``B`` is not admissible, or ``len(replicate_ratings) !=
+            B``.
+        KeyError: If some replicate's rung-7 curve is missing a member version
+            another replicate carries.
+    """
+    if len(replicate_ratings) != B:
+        raise ValueError(
+            f"per_checkpoint_ci requires exactly B={B} replicates, got {len(replicate_ratings)}"
+        )
+    per_replicate_curves = [dict(checkpoint_elo(ratings)) for ratings in replicate_ratings]
+    versions = sorted({version for curve in per_replicate_curves for version in curve})
+    return [
+        (version, order_statistic_ci([curve[version] for curve in per_replicate_curves], B))
+        for version in versions
+    ]
+
+
+@dataclass(frozen=True)
+class MannKendallResult:
+    """One Mann-Kendall trend-test reading over a point-estimate Elo sequence.
+
+    Reported, never gating (task 1 pin 7) -- a secondary, functional-form-free
+    check on the evaluated prefix's checkpoint Elo sequence, never the §1
+    pre-registered contrast itself.
+
+    Attributes:
+        n: The sequence length actually evaluated.
+        insufficient_data: ``True`` iff ``n < 3`` -- the pinned degenerate
+            case (no z/p, never a trend claim); ``s``/``z``/``p`` are all
+            ``None`` exactly when this is ``True``.
+        s: The classic Mann-Kendall S statistic, or ``None`` if
+            ``insufficient_data``.
+        z: The continuity-corrected z statistic, or ``None`` if
+            ``insufficient_data``.
+        p: The two-sided normal-approximation p-value, or ``None`` if
+            ``insufficient_data``.
+    """
+
+    n: int
+    insufficient_data: bool
+    s: int | None
+    z: float | None
+    p: float | None
+
+
+def mann_kendall(values: Sequence[float]) -> MannKendallResult:
+    """Mann-Kendall trend test over a point-estimate Elo sequence, pure stdlib.
+
+    Classic S (sum of pairwise signs), tie-corrected variance, continuity-
+    corrected ``z = (S - sign(S)) / sigma``, two-sided normal-approximation p
+    (task 1 pin 7). Two degenerate cases are pinned rather than left to the
+    implementation: fewer than 3 points is insufficient data (no trend claim
+    at all); every observation tied forces the tie-corrected variance to 0
+    (and, with it, ``S = 0``, since every pairwise comparison is a tie) --
+    handled explicitly so no division-by-zero path exists, returning ``z =
+    0.0, p = 1.0`` directly rather than routing through the general formula.
+
+    Args:
+        values: The evaluated prefix's point-estimate Elo sequence, in
+            checkpoint order (ascending ``model_version``).
+
+    Returns:
+        A :class:`MannKendallResult` -- ``insufficient_data=True`` (``s=z=p=
+        None``) if ``len(values) < 3``; otherwise a populated ``(s, z, p)``.
+    """
+    n = len(values)
+    if n < 3:
+        return MannKendallResult(n=n, insufficient_data=True, s=None, z=None, p=None)
+
+    s = 0
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            diff = values[j] - values[i]
+            s += (diff > 0.0) - (diff < 0.0)
+
+    tie_counts = Counter(values)
+    tie_term = sum(t * (t - 1) * (2 * t + 5) for t in tie_counts.values())
+    variance_numerator = n * (n - 1) * (2 * n + 5) - tie_term
+    if variance_numerator <= 0:
+        # Every observation tied forces S = 0 (pin 7) -- no division-by-zero path.
+        return MannKendallResult(n=n, insufficient_data=False, s=0, z=0.0, p=1.0)
+
+    sigma = math.sqrt(variance_numerator / 18.0)
+    sign_s = (s > 0) - (s < 0)
+    z = (s - sign_s) / sigma
+    p = math.erfc(abs(z) / math.sqrt(2.0))  # == 2 * (1 - Phi(|z|)), stabler near the tail.
+    return MannKendallResult(n=n, insufficient_data=False, s=s, z=z, p=p)
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:

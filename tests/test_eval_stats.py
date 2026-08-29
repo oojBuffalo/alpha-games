@@ -18,6 +18,7 @@ Four layers:
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 
@@ -25,16 +26,25 @@ import pytest
 
 from core.agents import RandomAgent
 from core.elo import fit_elo
+from core.eval_protocol import BOOTSTRAP_B_PRODUCTION
 from core.eval_stats import (
     ANCHOR_AGENT,
+    MannKendallResult,
     bootstrap_replicate,
     bootstrap_replicate_matches,
     bootstrap_replicates,
     bootstrap_seed,
     checkpoint_elo,
+    delta_gate,
+    delta_hat,
+    delta_windows,
     elo_curve,
     elo_curve_path,
     fit_snapshot_elo,
+    mann_kendall,
+    order_statistic_ci,
+    per_checkpoint_ci,
+    replicate_deltas,
     snapshot_matches,
 )
 from core.eval_store import (
@@ -554,3 +564,214 @@ def test_same_store_and_seed_give_bit_identical_replicate_ratings_across_two_run
     run_b = list(bootstrap_replicates(load_snapshot(tmp_path), seed, 7))
 
     assert run_a == run_b  # exact, not approximate -- two independent snapshot loads
+
+
+# ==============================================================================
+# 6. Delta-hat, the admissible-B order-statistic CIs, per-checkpoint CIs, and
+#    Mann-Kendall (tasks/m4/007, subtask 7.2)
+# ==============================================================================
+
+
+# --- delta_windows: the ceil(K/3) boundary sets ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("k", "expected"),
+    [
+        (3, ((1,), (3,))),
+        (4, ((1, 2), (3, 4))),
+        (5, ((1, 2), (4, 5))),
+    ],
+)
+def test_delta_windows_documented_boundary_sets(k, expected):
+    assert delta_windows(k) == expected
+
+
+def test_delta_windows_rejects_non_positive_k():
+    with pytest.raises(ValueError):
+        delta_windows(0)
+    with pytest.raises(ValueError):
+        delta_windows(-1)
+
+
+# --- delta_hat: the original-sample statistic --------------------------------------
+
+
+def test_delta_hat_matches_hand_computed_window_means():
+    # K=5 -> windows (1,2) and (4,5); mean(40,50) - mean(10,20) = 45 - 15 = 30.
+    curve = [(1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)]
+    assert delta_hat(curve) == pytest.approx(30.0)
+
+
+def test_delta_hat_is_indifferent_to_curve_order():
+    shuffled = [(3, 30.0), (1, 10.0), (5, 50.0), (2, 20.0), (4, 40.0)]
+    assert delta_hat(shuffled) == pytest.approx(30.0)
+
+
+def test_delta_hat_rejects_empty_curve():
+    with pytest.raises(ValueError):
+        delta_hat([])
+
+
+def test_delta_hat_rejects_a_non_contiguous_or_incomplete_series():
+    # Only versions {1, 3} present -- not the complete, contiguous 1..K set
+    # (task 1 pin 8: no prefix Delta is ever computed).
+    with pytest.raises(ValueError, match="complete, contiguous"):
+        delta_hat([(1, 10.0), (3, 30.0)])
+
+
+# --- replicate_deltas: Delta_b mapped over each replicate's own curve --------------
+
+
+def test_replicate_deltas_maps_delta_hat_over_each_replicates_ratings():
+    replicate_ratings = [
+        {
+            ANCHOR_AGENT: 0.0,
+            "rung7-v1-1": 0.0,
+            "rung7-v1-2": 10.0,
+            "rung7-v1-3": 20.0,
+            "rung7-v1-4": 30.0,
+            "rung7-v1-5": 40.0,
+        },
+        {
+            ANCHOR_AGENT: 0.0,
+            "rung7-v1-1": 100.0,
+            "rung7-v1-2": 100.0,
+            "rung7-v1-3": 100.0,
+            "rung7-v1-4": 100.0,
+            "rung7-v1-5": 100.0,
+        },
+    ]
+    # Replicate 0: windows (1,2)/(4,5) -> mean(30,40) - mean(0,10) = 35 - 5 = 30.
+    # Replicate 1: every version tied at 100 -> Delta = 0.
+    assert replicate_deltas(replicate_ratings) == [pytest.approx(30.0), pytest.approx(0.0)]
+
+
+# --- order_statistic_ci: the admissible-B rank rule --------------------------------
+
+
+def test_order_statistic_ci_at_b39_picks_ranks_1_and_39_with_ties():
+    # 39 values: five ties at the minimum (0), then 1..34 -- deliberately
+    # unsorted on input. Ranks (B+1)*0.025=1 and (B+1)*0.975=39 are exactly the
+    # overall min and max of the 39-element sample.
+    values = list(range(1, 35)) + [0.0] * 5
+    assert len(values) == 39
+    assert order_statistic_ci(values, 39) == (0.0, 34.0)
+
+
+def test_order_statistic_ci_rejects_non_admissible_b():
+    with pytest.raises(ValueError):
+        order_statistic_ci(list(range(100)), 100)
+    with pytest.raises(ValueError):
+        order_statistic_ci(list(range(2000)), 2000)
+
+
+def test_order_statistic_ci_rejects_wrong_length_input():
+    with pytest.raises(ValueError):
+        order_statistic_ci(list(range(10)), 39)
+
+
+def test_order_statistic_ci_defaults_to_the_pinned_production_b():
+    default_b = inspect.signature(order_statistic_ci).parameters["B"].default
+    assert default_b == BOOTSTRAP_B_PRODUCTION == 1999
+
+
+def test_1999_is_admissible_and_2000_is_not():
+    # Production B: ranks (1999+1)*0.025=50, (1999+1)*0.975=1950 -- both integral.
+    order_statistic_ci([0.0] * 1999, 1999)  # must not raise
+    with pytest.raises(ValueError):
+        order_statistic_ci([0.0] * 2000, 2000)
+
+
+# --- delta_gate: strictly-above-0 -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ci", "expected"),
+    [
+        ((0.5, 10.0), True),
+        ((-0.1, 10.0), False),
+        ((0.0, 5.0), False),  # exactly 0 is not "strictly above"
+    ],
+)
+def test_delta_gate(ci, expected):
+    assert delta_gate(ci) is expected
+
+
+# --- per_checkpoint_ci: the same rule, same replicates, no second resample --------
+
+
+def test_per_checkpoint_ci_applies_the_same_rule_column_wise_no_second_resample():
+    replicate_ratings = [
+        {ANCHOR_AGENT: 0.0, "rung7-v1-2": float(2 * b), "rung7-v1-1": float(b)} for b in range(39)
+    ]
+    result = per_checkpoint_ci(replicate_ratings, 39)
+    # v1's column is 0..38 (min/max at ranks 1/39); v2's is 0,2,...,76.
+    assert result == [(1, (0.0, 38.0)), (2, (0.0, 76.0))]
+
+
+def test_per_checkpoint_ci_rejects_wrong_replicate_count():
+    replicate_ratings = [{ANCHOR_AGENT: 0.0, "rung7-v1-1": 0.0}] * 10
+    with pytest.raises(ValueError):
+        per_checkpoint_ci(replicate_ratings, 39)
+
+
+def test_per_checkpoint_ci_defaults_to_the_pinned_production_b():
+    default_b = inspect.signature(per_checkpoint_ci).parameters["B"].default
+    assert default_b == BOOTSTRAP_B_PRODUCTION
+
+
+# --- mann_kendall: classic S, tie/continuity-corrected z, two-sided p -------------
+
+
+def test_mann_kendall_golden_without_ties():
+    # values [1, 3, 2, 5]: pairwise signs +,+,+,-,+,+ -> S = 4.
+    # variance = (4*3*13)/18 = 8.666...7; sigma = 2.943920288775949.
+    # z = (4 - 1)/sigma = 1.0190493307301363; p = erfc(z/sqrt(2)).
+    result = mann_kendall([1.0, 3.0, 2.0, 5.0])
+    assert result.insufficient_data is False
+    assert result.n == 4
+    assert result.s == 4
+    assert result.z == pytest.approx(1.0190493307301363)
+    assert result.p == pytest.approx(0.308179547467054)
+
+
+def test_mann_kendall_golden_with_ties():
+    # values [1, 2, 2, 3]: pairwise signs +,+,+,0,+,+ -> S = 5.
+    # tie term = 2*1*9 = 18; variance = (156 - 18)/18 = 7.666...7.
+    result = mann_kendall([1.0, 2.0, 2.0, 3.0])
+    assert result.insufficient_data is False
+    assert result.n == 4
+    assert result.s == 5
+    assert result.z == pytest.approx(1.4446302370292303)
+    assert result.p == pytest.approx(0.1485617748918687)
+
+
+def test_mann_kendall_golden_with_ties_and_a_downward_trend():
+    # The mirror image of the previous case: S and z flip sign, p is unchanged.
+    result = mann_kendall([3.0, 2.0, 2.0, 1.0])
+    assert result.s == -5
+    assert result.z == pytest.approx(-1.4446302370292303)
+    assert result.p == pytest.approx(0.1485617748918687)
+
+
+def test_mann_kendall_all_tied_forces_s_zero_z_zero_p_one():
+    result = mann_kendall([7.0, 7.0, 7.0, 7.0, 7.0])
+    assert result.insufficient_data is False
+    assert result.n == 5
+    assert result.s == 0
+    assert result.z == 0.0
+    assert result.p == 1.0
+
+
+def test_mann_kendall_below_three_points_is_insufficient_data():
+    result = mann_kendall([1.0, 2.0])
+    assert result == MannKendallResult(n=2, insufficient_data=True, s=None, z=None, p=None)
+
+
+def test_mann_kendall_never_claims_a_trend_when_insufficient():
+    result = mann_kendall([1.0])
+    assert result.insufficient_data is True
+    assert result.s is None
+    assert result.z is None
+    assert result.p is None
