@@ -8,8 +8,8 @@ resume/relaunch pattern, but for a different kind of process: not a training
 run, but a long-lived reader/player that watches one already-launched run
 and appends to ``core.eval_store``'s per-cell record store.
 
-This module owns exactly four things (the watch/resume/catch-up loop over
-the runner itself, and the report/CLI integration, are later subtasks):
+This module owns six things (the report/CLI integration is a later subtask,
+9.3):
 
 * :class:`EvalConfig` -- one eval harness launch's full protocol, loaded from
   JSON with the same loud, eager validation ``core.runconfig.RunConfig`` uses.
@@ -30,6 +30,17 @@ the runner itself, and the report/CLI integration, are later subtasks):
   :func:`cell_seed`) -- one member's full required cell-id set (forms x the
   game's declared network-free rungs, plus rung-8 historical matchups for
   form 7), and the per-cell seed each cell's games are played under.
+* The watch/resume/catch-up loop itself (:func:`run_watch_loop`, subtask
+  9.2) -- the single long-lived process that turns the arithmetic above into
+  actual played games: poll the watched run for schedulable members, register
+  each one's required cells in the task-5 manifest, and play every cell not
+  yet complete (or resume a partial one at its next missing pair) through
+  ``core.runner.play_pairs``, idempotently, across arbitrarily many kills and
+  relaunches.
+* The eval-lag observable (:func:`eval_lag`, subtask 9.2) -- how far behind
+  the harness's own scoring is relative to the watched run's newest published
+  member, for 9.3's reporting and the M5.5 liveness check (design doc §9 pin
+  11).
 
 **Game-generic by construction:** this module never imports ``games.*`` and
 never names a game-specific agent or balancer. Every function that needs a
@@ -43,20 +54,46 @@ mirroring exactly how ``games.registry.build_game_factory`` resolves a
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import re
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.checkpoint import list_published_versions
-from core.eval_agents import historical_opponents
+from core.artifact_fingerprint import build_fingerprint
+from core.checkpoint import list_published_versions, published_checkpoint_path
+from core.eval_agents import (
+    NetworkPolicyAgent,
+    SearchAgent,
+    historical_opponent_factory,
+    historical_opponents,
+    load_eval_network,
+)
 from core.eval_profile import EvalProfile
 from core.eval_protocol import PROTOCOL_VERSION, protocol_fingerprint
 from core.eval_stats import _validate_admissible_B
-from core.eval_store import build_cell_id, eval_dir
+from core.eval_store import (
+    CellId,
+    append_pair_record,
+    build_cell_id,
+    build_header,
+    cell_path,
+    complete_cell,
+    eval_dir,
+    is_cell_complete,
+    load_snapshot,
+    open_cell_for_write,
+    pair_result_to_record,
+    parse_cell_id,
+    register_member,
+)
+from core.game import Game
+from core.mcts import Evaluator
 from core.replay_shard import _atomic_write_json
-from core.run_identity import read_stored_config
+from core.run_identity import read_run_record, read_stored_config
 from core.runconfig import _check_keys, _int, _non_empty, _positive, _str
+from core.runner import AgentFactory, play_pairs
 from core.seeding import PURPOSE_EVAL, derive_seed
 
 # --- EvalConfig ----------------------------------------------------------------
@@ -726,3 +763,437 @@ def cell_seed(eval_seed: int, cell_id: str) -> int:
         The cell's seed, in ``[0, 2**64)``.
     """
     return derive_seed(eval_seed, PURPOSE_EVAL, cell_id)
+
+
+# --- watch/resume/catch-up loop (tasks/m4/009 subtask 9.2) ---------------------
+#
+# The long-lived process itself: poll the watched run for member checkpoints
+# not yet complete in the task-5 manifest, play every missing cell through
+# core.runner.play_pairs, and survive being killed and relaunched idempotently
+# -- a resumed cell picks up at its next missing pair
+# (core.eval_store.open_cell_for_write's own contract), and a checkpoint
+# published while this process was down is simply on disk the next time
+# schedulable_versions() looks. This process is the sole writer of run_dir's
+# eval manifest for the duration of one run_watch_loop call -- the m3
+# task-11 single-writer discipline, applied to the eval namespace.
+
+
+@dataclass
+class _CandidateCache:
+    """One :func:`run_watch_loop` call's checkpoint-load cache (memory stance).
+
+    :func:`core.eval_agents.load_eval_network` reconstructs a checkpoint's exact
+    trained architecture and restores its weights from disk -- expensive to
+    repeat for every cell a version appears in. This cache loads a given
+    candidate version's evaluator **exactly once** and reuses it to build every
+    one of that version's rung-5/6/7 agents directly
+    (:class:`~core.eval_agents.NetworkPolicyAgent` /
+    :class:`~core.eval_agents.SearchAgent`) -- the same one-load-per-checkpoint
+    contract ``rung5_agent_factory``/``rung_search_agent_factory`` each give on
+    their own, inlined here so the *one* loaded evaluator is shared across all
+    three forms instead of being reloaded once per form.
+
+    A rung-8 historical opponent is cached separately, one entry per opponent
+    version, built through :func:`core.eval_agents.historical_opponent_factory`
+    -- deliberately never sharing an entry with that same version's own
+    candidate-role load above, even though both would restore byte-identical
+    weights: the historical path's pre-load fingerprint assert exists
+    specifically to re-verify a checkpoint at the moment it is seated as an
+    opponent (a version scored as a candidate long ago and only much later
+    reused as someone else's opponent is exactly the staleness window that
+    assert guards -- see
+    :func:`core.eval_agents.assert_historical_checkpoint_matches_live_game`),
+    and folding it into the candidate cache would silently skip that
+    re-verification whenever a version's candidate load happened to already be
+    warm.
+
+    **Memory stance:** entries here are never evicted. Every loaded net is a
+    small, batch-1-inference CPU model at production scale (D5's 8x128 trunk),
+    and a production run's full membership is only ``K = 30`` versions, so the
+    unbounded growth over one run is a deliberate, bounded trade against the
+    complexity of deciding what can be freed while other cells might still
+    reference it. The cache's lifetime is exactly one :func:`run_watch_loop`
+    call: a real process kill and relaunch -- the scenario this loop exists to
+    survive -- starts a fresh, empty cache next time and simply pays the reload
+    cost again for whatever had already been loaded before the kill.
+
+    Attributes:
+        ckpt_dir: The watched run's checkpoint directory.
+        game: The live game/adapter every load is validated and evaluated
+            against.
+        device: Torch device for inference.
+        eval_sims: The rung-6/7 (and rung-8) search-form simulation budget *S*.
+    """
+
+    ckpt_dir: Path
+    game: Game
+    device: str
+    eval_sims: int
+    _candidates: dict[int, tuple[Evaluator, int]] = field(default_factory=dict, init=False)
+    _historical: dict[int, AgentFactory] = field(default_factory=dict, init=False)
+
+    def candidate_factory(self, version: int, form: int) -> AgentFactory:
+        """Return the ``AgentFactory`` for one candidate version's rung ``form``.
+
+        Loads ``version``'s evaluator on first use only (any form); every
+        later call for the same version, at any of the three forms, reuses it.
+
+        Args:
+            version: The candidate checkpoint's version.
+            form: ``5``, ``6``, or ``7``.
+
+        Returns:
+            A ``seed -> Agent`` factory matching ``core.runner.AgentFactory``.
+
+        Raises:
+            ValueError: If ``form`` is not ``5``, ``6``, or ``7``.
+        """
+        if form not in (5, 6, 7):
+            raise ValueError(f"form must be 5, 6, or 7, got {form}")
+        if version not in self._candidates:
+            path = published_checkpoint_path(self.ckpt_dir, version)
+            self._candidates[version] = load_eval_network(path, self.game, self.device)
+        evaluator, model_version = self._candidates[version]
+
+        if form == 5:
+
+            def factory(seed: int) -> NetworkPolicyAgent:
+                del seed  # Rung 5 has no per-agent RNG state.
+                return NetworkPolicyAgent(evaluator, model_version)
+
+        else:
+
+            def factory(seed: int) -> SearchAgent:
+                del seed  # Rungs 6/7 have no per-agent RNG state.
+                return SearchAgent(evaluator, model_version, form=form, sims=self.eval_sims)
+
+        return factory
+
+    def historical_factory(self, version: int) -> AgentFactory:
+        """Return the rung-8 ``AgentFactory`` for historical opponent ``version``.
+
+        Built through :func:`core.eval_agents.historical_opponent_factory` on
+        first use only -- its pre-load fingerprint assert therefore runs
+        exactly once per version, the first time it is seated as an opponent
+        in this process; every later call for the same version reuses the
+        already-built factory.
+
+        Args:
+            version: The historical checkpoint's version.
+
+        Returns:
+            A ``seed -> SearchAgent`` factory (rung-7 form).
+
+        Raises:
+            core.checkpoint.FingerprintMismatchError: If the pre-load assert
+                fails (first use only -- see
+                :func:`core.eval_agents.assert_historical_checkpoint_matches_live_game`).
+        """
+        if version not in self._historical:
+            self._historical[version] = historical_opponent_factory(
+                self.ckpt_dir, self.game, version, device=self.device, sims=self.eval_sims
+            )
+        return self._historical[version]
+
+
+_HISTORICAL_OPPONENT_PATTERN = re.compile(r"^rung7-v1-(\d+)$")
+
+
+def _historical_opponent_version(opponent_id: str) -> int | None:
+    """Invert :func:`agent_identity`'s rung-7 form for a historical opponent.
+
+    Args:
+        opponent_id: A cell's opponent identity string.
+
+    Returns:
+        The historical checkpoint version ``opponent_id`` names, or ``None``
+        if it does not match the ``f"rung7-v1-{version}"`` pattern at all
+        (i.e. it is one of the profile's own network-free rung identities,
+        e.g. ``"random"``).
+    """
+    match = _HISTORICAL_OPPONENT_PATTERN.match(opponent_id)
+    return int(match.group(1)) if match else None
+
+
+def _resolve_opponent_factory(
+    opponent_id: str, rung_identities: Mapping[str, AgentFactory], cache: _CandidateCache
+) -> AgentFactory:
+    """Resolve one cell's opponent identity string to the factory that builds it.
+
+    Args:
+        opponent_id: The cell's opponent identity (a frozen network-free
+            rung's identity, or a rung-8 historical ``"rung7-v1-<u>"`` one).
+        rung_identities: ``{profile.rung_identity(r): profile.network_free_rungs[r]
+            for r in profile.rungs()}`` -- every frozen rung this game declares.
+        cache: This loop's checkpoint-load cache (used for the historical case
+            only).
+
+    Returns:
+        The opponent's ``AgentFactory``.
+
+    Raises:
+        ValueError: If ``opponent_id`` matches neither a declared network-free
+            rung identity nor the rung-8 historical pattern -- an id this
+            process's own scheduling arithmetic (:func:`required_cell_ids`)
+            could never have produced, so this signals a store/profile
+            mismatch rather than an expected runtime case.
+    """
+    if opponent_id in rung_identities:
+        return rung_identities[opponent_id]
+    historical_version = _historical_opponent_version(opponent_id)
+    if historical_version is not None:
+        return cache.historical_factory(historical_version)
+    raise ValueError(
+        f"opponent id {opponent_id!r} is neither one of the profile's declared "
+        f"network-free rung identities {sorted(rung_identities)} nor a rung-8 "
+        "historical identity"
+    )
+
+
+def _play_pending_cell(
+    run_dir: Path,
+    run_id: str,
+    config: EvalConfig,
+    game: Game,
+    profile: EvalProfile,
+    parsed: CellId,
+    candidate_factory: AgentFactory,
+    opponent_factory: AgentFactory,
+    candidate_fingerprint: Mapping[str, Any],
+) -> int:
+    """Play one required cell to completion, resuming a partial one if needed.
+
+    Args:
+        run_dir: The watched run's root directory.
+        run_id: The watched run's identity
+            (``core.run_identity.read_run_record(run_dir).run_id``).
+        config: This launch's resolved :class:`EvalConfig`.
+        game: The live game/adapter to play on.
+        profile: The game's declared eval profile (for its opening balancer).
+        parsed: The cell's parsed identity (``candidate_version`` included).
+        candidate_factory: The candidate agent's factory (mirrored-pair "A").
+        opponent_factory: The opponent agent's factory (mirrored-pair "B").
+        candidate_fingerprint: The live game's artifact fingerprint
+            (``core.artifact_fingerprint.build_fingerprint(game)``).
+
+    Returns:
+        The number of pairs newly played and appended this call -- ``0`` for a
+        cell whose file already had every pair recorded but was not yet marked
+        complete in the manifest (e.g. a crash between the last append and
+        :func:`core.eval_store.complete_cell` on a prior attempt).
+    """
+    cell_id = parsed.to_string()
+    header = build_header(
+        run_id=run_id,
+        cell_id=parsed,
+        candidate_identity=agent_identity(parsed.rung, parsed.candidate_version),
+        opponent_identity=parsed.opponent_id,
+        eval_config=config.as_eval_config_snapshot(),
+        candidate_fingerprint=candidate_fingerprint,
+    )
+    start_index = open_cell_for_write(run_dir, header)
+    remaining = config.pairs_per_cell - start_index
+    played = 0
+    if remaining > 0:
+        file_path = cell_path(run_dir, cell_id)
+        results = play_pairs(
+            game,
+            candidate_factory,
+            opponent_factory,
+            n_pairs=remaining,
+            seed=cell_seed(config.eval_seed, cell_id),
+            opening_balancer=profile.opening_balancer,
+            start_pair_index=start_index,
+        )
+        for result in results:
+            append_pair_record(file_path, pair_result_to_record(result))
+            played += 1
+    complete_cell(run_dir, cell_id)
+    return played
+
+
+@dataclass(frozen=True)
+class WatchLoopResult:
+    """Summary of one :func:`run_watch_loop` call.
+
+    Attributes:
+        polls: Number of poll cycles this call executed (always >= 1).
+        pairs_played: Total mirrored pairs actually played and appended during
+            this call (``0`` for a poll that found only already-complete work
+            or nothing schedulable at all).
+        completed_members: Every member version whose full required cell set
+            was complete as of the last poll cycle, ascending -- includes a
+            member that was already complete before this call started, not
+            only ones finished during it.
+        stopped_reason: Why the loop returned: ``"single_pass"`` (exactly one
+            poll, regardless of completeness), ``"k_complete"`` (every member
+            ``1..K`` is complete), or ``"idle"`` (``max_idle_polls``
+            consecutive polls in a row played no new pairs).
+    """
+
+    polls: int
+    pairs_played: int
+    completed_members: tuple[int, ...]
+    stopped_reason: str
+
+
+def run_watch_loop(
+    run_dir: Path | str,
+    config: EvalConfig,
+    profile: EvalProfile,
+    game: Game,
+    *,
+    poll_interval: float = 1.0,
+    max_idle_polls: int | None = None,
+    single_pass: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+) -> WatchLoopResult:
+    """Run the M4 watch/resume/catch-up loop over one watched run (§9; 9.2).
+
+    Resolves ``config`` against any already-recorded launch provenance first
+    (:func:`resolve_eval_launch` -- refuses on a material/protocol difference,
+    exactly as a fresh process relaunch must), then repeatedly: reads the
+    watched run's currently-schedulable member versions
+    (:func:`schedulable_versions`); for each, registers its full required
+    cell-id set in the task-5 manifest (:func:`core.eval_store.register_member`
+    -- idempotent, so a member seen again on a later poll is a no-op) and plays
+    every cell not yet complete, resuming a partial one at its next missing
+    pair (:func:`core.eval_store.open_cell_for_write`'s own contract) rather
+    than replaying it from the start. A cell already marked complete is never
+    reopened, and this process is the sole writer of ``run_dir``'s eval
+    manifest for the duration of the call (the m3 task-11 single-writer
+    discipline, applied to the eval namespace).
+
+    A checkpoint published to ``run_dir`` while this function was not running
+    (or in between two of its polls) needs no special handling: the very next
+    poll's :func:`schedulable_versions` call simply finds it on disk and
+    schedules it like any other member.
+
+    Args:
+        run_dir: The watched run's root directory.
+        config: This launch's resolved :class:`EvalConfig`.
+        profile: The watched game's declared eval profile
+            (``games.registry.build_eval_profile`` at the script layer --
+            this function never imports ``games.*`` itself).
+        game: The watched game's live adapter instance, matching ``profile``
+            and the watched run's own encoding surface.
+        poll_interval: Seconds to sleep between polls (never consulted when
+            ``single_pass`` is set, and never on the final poll before
+            returning for any other stop reason).
+        max_idle_polls: Stop after this many consecutive polls that played no
+            new pairs at all, or run indefinitely (subject to the
+            all-members-complete stop condition below) when ``None``.
+        single_pass: Run exactly one poll cycle and return, regardless of
+            completeness -- the test-facing "process whatever is on disk right
+            now, once" mode; a caller also uses two separate calls in this
+            mode to model a kill/relaunch or a downtime/catch-up scenario.
+        sleep: Injected sleep function (tests pass a no-op or a call-recording
+            stub; production leaves this at the default, :func:`time.sleep`).
+
+    Returns:
+        A :class:`WatchLoopResult` summarizing the call.
+
+    Raises:
+        EvalRelaunchRefusedError: If ``config`` disagrees with already-recorded
+            provenance on a material field or the protocol stamp.
+        FileNotFoundError: If the watched run has no recorded ``config.json``
+            or ``run_record.json`` yet (:func:`watched_k_total`,
+            ``core.run_identity.read_run_record``).
+    """
+    resolve_eval_launch(run_dir, config)
+    run_dir = Path(run_dir)
+    run_id = read_run_record(run_dir).run_id
+    k_total = watched_k_total(run_dir)
+    ckpt_dir = checkpoint_dir(run_dir)
+    candidate_fingerprint = build_fingerprint(game)
+    rung_identities = {
+        profile.rung_identity(rung): profile.network_free_rungs[rung] for rung in profile.rungs()
+    }
+    cache = _CandidateCache(
+        ckpt_dir=ckpt_dir, game=game, device=config.device, eval_sims=config.eval_sims
+    )
+
+    polls = 0
+    idle_polls = 0
+    total_pairs_played = 0
+    completed_members: set[int] = set()
+    stopped_reason = "single_pass"
+
+    while True:
+        polls += 1
+        available = schedulable_versions(run_dir, k_total)
+        pairs_this_poll = 0
+
+        for version in available:
+            required = required_cell_ids(version, profile, available, k_total, config.forms)
+            register_member(run_dir, version, required)
+            pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
+            if not pending:
+                completed_members.add(version)
+                continue
+            for cid in pending:
+                parsed = parse_cell_id(cid)
+                candidate_factory = cache.candidate_factory(version, parsed.rung)
+                opponent_factory = _resolve_opponent_factory(
+                    parsed.opponent_id, rung_identities, cache
+                )
+                pairs_this_poll += _play_pending_cell(
+                    run_dir,
+                    run_id,
+                    config,
+                    game,
+                    profile,
+                    parsed,
+                    candidate_factory,
+                    opponent_factory,
+                    candidate_fingerprint,
+                )
+            completed_members.add(version)
+
+        total_pairs_played += pairs_this_poll
+
+        if single_pass:
+            break
+        if len(completed_members) >= k_total:
+            stopped_reason = "k_complete"
+            break
+        if pairs_this_poll == 0:
+            idle_polls += 1
+            if max_idle_polls is not None and idle_polls >= max_idle_polls:
+                stopped_reason = "idle"
+                break
+        else:
+            idle_polls = 0
+        sleep(poll_interval)
+
+    return WatchLoopResult(
+        polls=polls,
+        pairs_played=total_pairs_played,
+        completed_members=tuple(sorted(completed_members)),
+        stopped_reason=stopped_reason,
+    )
+
+
+def eval_lag(run_dir: Path | str, k_total: int) -> int:
+    """Return the harness's current backlog, in checkpoints (§9; the M5.5 liveness check).
+
+    ``newest published member - newest snapshot-complete member``: the highest
+    member version currently schedulable (:func:`schedulable_versions`,
+    structurally capped at ``k_total``) minus the eval snapshot's contiguous
+    complete-member prefix
+    (:attr:`core.eval_store.EvalSnapshot.member_prefix` -- the identical
+    boundary the §1 report's own K-set completeness gate uses, so "caught up"
+    here means exactly what "the report is authoritative" means there).
+
+    Args:
+        run_dir: The watched run's root directory.
+        k_total: The run's fixed, total checkpoint count *K*.
+
+    Returns:
+        The lag, in checkpoints -- ``0`` while nothing is published yet, or
+        once every currently-published member is fully scored.
+    """
+    available = schedulable_versions(run_dir, k_total)
+    newest_published = available[-1] if available else 0
+    member_prefix = load_snapshot(run_dir).member_prefix
+    return max(0, newest_published - member_prefix)
