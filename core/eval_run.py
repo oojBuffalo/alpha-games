@@ -8,8 +8,8 @@ resume/relaunch pattern, but for a different kind of process: not a training
 run, but a long-lived reader/player that watches one already-launched run
 and appends to ``core.eval_store``'s per-cell record store.
 
-This module owns six things (the report/CLI integration is a later subtask,
-9.3):
+This module owns seven things (the CLI face itself,
+``scripts/run_eval.py``, is subtask 9.3):
 
 * :class:`EvalConfig` -- one eval harness launch's full protocol, loaded from
   JSON with the same loud, eager validation ``core.runconfig.RunConfig`` uses.
@@ -41,6 +41,18 @@ This module owns six things (the report/CLI integration is a later subtask,
   the harness's own scoring is relative to the watched run's newest published
   member, for 9.3's reporting and the M5.5 liveness check (design doc §9 pin
   11).
+* The report-hook seam and the feasibility bench (:func:`run_watch_loop`'s
+  ``on_member_complete`` parameter, and :func:`bench_candidate` /
+  :class:`BenchResult`; subtask 9.3, second pass P2.6) -- the plumbing
+  ``scripts/run_eval.py`` needs and this module alone can supply without
+  duplicating any of the arithmetic/cache machinery above: a callback fired
+  exactly when a member transitions to complete during a live poll (so a
+  caller regenerates the §1 report artifacts with zero manual steps), and a
+  read-and-measure-only mode that plays a small pair count against the
+  newest published member at the configured production budget to report
+  real seconds/game, games/hour, and the projected per-checkpoint cost
+  against the watched run's own publish cadence -- the task 1 pin 11
+  feasibility number, measured rather than asserted.
 
 **Game-generic by construction:** this module never imports ``games.*`` and
 never names a game-specific agent or balancer. Every function that needs a
@@ -90,6 +102,7 @@ from core.eval_store import (
 )
 from core.game import Game
 from core.mcts import Evaluator
+from core.observability import reduce_run
 from core.replay_shard import _atomic_write_json
 from core.run_identity import read_run_record, read_stored_config
 from core.runconfig import _check_keys, _int, _non_empty, _positive, _str
@@ -1047,6 +1060,7 @@ def run_watch_loop(
     max_idle_polls: int | None = None,
     single_pass: bool = False,
     sleep: Callable[[float], None] = time.sleep,
+    on_member_complete: Callable[[int], None] | None = None,
 ) -> WatchLoopResult:
     """Run the M4 watch/resume/catch-up loop over one watched run (§9; 9.2).
 
@@ -1089,6 +1103,17 @@ def run_watch_loop(
             mode to model a kill/relaunch or a downtime/catch-up scenario.
         sleep: Injected sleep function (tests pass a no-op or a call-recording
             stub; production leaves this at the default, :func:`time.sleep`).
+        on_member_complete: Optional callback fired with a member's version
+            immediately after *this call* finishes playing its last pending
+            cell -- i.e. exactly the members that transition from incomplete
+            to complete during this call, never one already complete when a
+            poll examined it (that member's ``pending`` list is empty, so the
+            loop never reaches the callback for it). Subtask 9.3's "loop
+            hook": a caller wires this to regenerate the §1 report artifacts
+            from a fresh snapshot after every checkpoint the harness itself
+            just finished scoring, with zero manual steps. ``None`` (the
+            default) fires nothing -- this function's own scheduling/playing
+            behavior is identical either way.
 
     Returns:
         A :class:`WatchLoopResult` summarizing the call.
@@ -1149,6 +1174,8 @@ def run_watch_loop(
                     candidate_fingerprint,
                 )
             completed_members.add(version)
+            if on_member_complete is not None:
+                on_member_complete(version)
 
         total_pairs_played += pairs_this_poll
 
@@ -1197,3 +1224,227 @@ def eval_lag(run_dir: Path | str, k_total: int) -> int:
     newest_published = available[-1] if available else 0
     member_prefix = load_snapshot(run_dir).member_prefix
     return max(0, newest_published - member_prefix)
+
+
+# --- feasibility bench (tasks/m4/009 subtask 9.3; second pass P2.6) ------------
+#
+# The M4 exit feasibility number behind task 1 pin 11's operational liveness
+# bound: real throughput, measured against the newest published member's real
+# required cells, at the configured production S and device -- never a
+# synthetic stand-in network or a hand-waved sim-per-second estimate. This
+# writes nothing: no cell file, no manifest entry, no provenance touch --
+# ``scripts/run_eval.py --bench`` is a read-and-measure-only mode, never a
+# second, parallel writer to the harness's own eval store.
+
+
+@dataclass(frozen=True)
+class BenchResult:
+    """One ``--bench`` measurement's full, printable result (task 1 pin 11).
+
+    Attributes:
+        candidate_version: The member checkpoint benched against -- the
+            newest currently schedulable version (§9's "the production S",
+            benched against real, current-scale play rather than an
+            arbitrary or earliest member).
+        eval_sims: The rung-6/7 simulation budget *S* actually used
+            (``EvalConfig.eval_sims`` -- the configured production value,
+            never a reduced bench-only budget).
+        device: The torch device actually used (``EvalConfig.device``).
+        pairs_per_cell: The *production* pairs-per-cell value
+            (``EvalConfig.pairs_per_cell``) the projection below scales by --
+            never the smaller count actually sampled here.
+        bench_pairs_per_cell: How many mirrored pairs were actually sampled
+            per required cell during this measurement (small; a caller's own
+            ``n_pairs``).
+        cells_benched: How many cells the candidate's full required-cell set
+            has (:func:`required_cell_ids`) -- every one of them sampled once
+            at ``bench_pairs_per_cell`` pairs.
+        games_played: Total games actually played (``2 * bench_pairs_per_cell
+            * cells_benched`` -- each pair plays two seat-swapped games).
+        elapsed_seconds: Total wall-clock time spent playing them.
+        seconds_per_game: ``elapsed_seconds / games_played``.
+        games_per_hour: ``3600 / seconds_per_game``.
+        games_per_checkpoint: The projected games one full required-cell set
+            plays at the *production* ``pairs_per_cell`` (``cells_benched *
+            pairs_per_cell * 2``) -- never the smaller sampled count.
+        projected_hours_per_checkpoint: ``games_per_checkpoint *
+            seconds_per_game / 3600`` -- the pin-11 feasibility number itself.
+        publish_cadence_hours: The watched run's own average GPU-hour gap
+            between consecutive published members' ``checkpoint_published``
+            markers (the §1 x-axis join), or ``None`` if fewer than two
+            members have published yet (an undefined cadence, never a
+            fabricated ``0.0``).
+        feasible: ``projected_hours_per_checkpoint <= publish_cadence_hours``,
+            or ``None`` when ``publish_cadence_hours`` is itself ``None`` (an
+            undefined comparison, never coerced to ``True``/``False``).
+    """
+
+    candidate_version: int
+    eval_sims: int
+    device: str
+    pairs_per_cell: int
+    bench_pairs_per_cell: int
+    cells_benched: int
+    games_played: int
+    elapsed_seconds: float
+    seconds_per_game: float
+    games_per_hour: float
+    games_per_checkpoint: int
+    projected_hours_per_checkpoint: float
+    publish_cadence_hours: float | None
+    feasible: bool | None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return this result as a flat, JSON-serializable dict."""
+        return {
+            "candidate_version": self.candidate_version,
+            "eval_sims": self.eval_sims,
+            "device": self.device,
+            "pairs_per_cell": self.pairs_per_cell,
+            "bench_pairs_per_cell": self.bench_pairs_per_cell,
+            "cells_benched": self.cells_benched,
+            "games_played": self.games_played,
+            "elapsed_seconds": self.elapsed_seconds,
+            "seconds_per_game": self.seconds_per_game,
+            "games_per_hour": self.games_per_hour,
+            "games_per_checkpoint": self.games_per_checkpoint,
+            "projected_hours_per_checkpoint": self.projected_hours_per_checkpoint,
+            "publish_cadence_hours": self.publish_cadence_hours,
+            "feasible": self.feasible,
+        }
+
+
+def _publish_cadence_hours(run_dir: Path, k_total: int) -> float | None:
+    """Return the watched run's average GPU-hour gap between published members.
+
+    Args:
+        run_dir: The watched run's root directory.
+        k_total: The run's fixed, total checkpoint count *K* -- members
+            beyond it (structurally impossible) or version 0 are never part
+            of this average.
+
+    Returns:
+        The mean of consecutive-member GPU-hour gaps (the §1 x-axis join's
+        own ``gpu_hours`` coordinate, ``core.observability.reduce_run``), or
+        ``None`` if fewer than two members ``1..k_total`` have a
+        ``checkpoint_published`` marker yet -- an undefined cadence with only
+        zero or one data point, never a fabricated ``0.0``.
+    """
+    reduced = reduce_run(run_dir)
+    versions = sorted(v for v in reduced.checkpoints if 1 <= v <= k_total)
+    if len(versions) < 2:
+        return None
+    gpu_hours = [reduced.checkpoints[v][2] for v in versions]
+    gaps = [later - earlier for earlier, later in zip(gpu_hours, gpu_hours[1:], strict=False)]
+    return sum(gaps) / len(gaps)
+
+
+def bench_candidate(
+    run_dir: Path | str,
+    config: EvalConfig,
+    profile: EvalProfile,
+    game: Game,
+    *,
+    n_pairs: int = 1,
+) -> BenchResult:
+    """Measure real throughput against the newest published member (§9 pin 11).
+
+    Plays ``n_pairs`` mirrored pairs of every cell the newest schedulable
+    member currently requires (:func:`required_cell_ids`, over the exact same
+    checkpoint-load cache and opponent-resolution machinery
+    :func:`run_watch_loop` itself uses -- the identical real cost a live poll
+    would pay), at the configured production simulation budget and device,
+    and reports the measured throughput plus the projected per-checkpoint
+    cost against the watched run's own publish cadence. Writes nothing: no
+    cell file, no manifest entry -- this is a read-and-measure-only mode,
+    entirely disjoint from the harness's own eval store.
+
+    Args:
+        run_dir: The watched run's root directory.
+        config: The harness's resolved :class:`EvalConfig` (``eval_sims``,
+            ``device``, and ``pairs_per_cell`` drive this measurement and its
+            projection; ``forms``/``eval_seed`` select and seed the sampled
+            cells exactly as a live poll would).
+        profile: The watched game's declared eval profile.
+        game: The watched game's live adapter instance.
+        n_pairs: Mirrored pairs to sample per required cell (small; the
+            *production* ``pairs_per_cell`` from ``config`` is used only for
+            the projection, never actually played here).
+
+    Returns:
+        The measured :class:`BenchResult`.
+
+    Raises:
+        ValueError: If ``n_pairs < 1``, or if no member checkpoint is
+            schedulable yet (:func:`schedulable_versions`) -- there is
+            nothing real to bench against.
+    """
+    if n_pairs < 1:
+        raise ValueError(f"n_pairs must be >= 1, got {n_pairs}")
+    run_dir = Path(run_dir)
+    k_total = watched_k_total(run_dir)
+    available = schedulable_versions(run_dir, k_total)
+    if not available:
+        raise ValueError(
+            f"no schedulable member checkpoint under {run_dir!r} yet -- --bench needs at "
+            "least one published checkpoint to measure real throughput against"
+        )
+    candidate_version = available[-1]
+    required = required_cell_ids(candidate_version, profile, available, k_total, config.forms)
+
+    rung_identities = {
+        profile.rung_identity(rung): profile.network_free_rungs[rung] for rung in profile.rungs()
+    }
+    cache = _CandidateCache(
+        ckpt_dir=checkpoint_dir(run_dir),
+        game=game,
+        device=config.device,
+        eval_sims=config.eval_sims,
+    )
+
+    games_played = 0
+    start = time.perf_counter()
+    for cid in required:
+        parsed = parse_cell_id(cid)
+        candidate_factory = cache.candidate_factory(candidate_version, parsed.rung)
+        opponent_factory = _resolve_opponent_factory(parsed.opponent_id, rung_identities, cache)
+        results = play_pairs(
+            game,
+            candidate_factory,
+            opponent_factory,
+            n_pairs=n_pairs,
+            seed=cell_seed(config.eval_seed, cid),
+            opening_balancer=profile.opening_balancer,
+        )
+        games_played += 2 * len(results)
+    elapsed = time.perf_counter() - start
+
+    seconds_per_game = elapsed / games_played
+    games_per_hour = 3600.0 / seconds_per_game
+    cells_benched = len(required)
+    games_per_checkpoint = cells_benched * config.pairs_per_cell * 2
+    projected_hours_per_checkpoint = games_per_checkpoint * seconds_per_game / 3600.0
+
+    publish_cadence_hours = _publish_cadence_hours(run_dir, k_total)
+    feasible = (
+        None
+        if publish_cadence_hours is None
+        else projected_hours_per_checkpoint <= publish_cadence_hours
+    )
+
+    return BenchResult(
+        candidate_version=candidate_version,
+        eval_sims=config.eval_sims,
+        device=config.device,
+        pairs_per_cell=config.pairs_per_cell,
+        bench_pairs_per_cell=n_pairs,
+        cells_benched=cells_benched,
+        games_played=games_played,
+        elapsed_seconds=elapsed,
+        seconds_per_game=seconds_per_game,
+        games_per_hour=games_per_hour,
+        games_per_checkpoint=games_per_checkpoint,
+        projected_hours_per_checkpoint=projected_hours_per_checkpoint,
+        publish_cadence_hours=publish_cadence_hours,
+        feasible=feasible,
+    )

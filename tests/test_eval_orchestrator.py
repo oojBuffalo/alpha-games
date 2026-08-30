@@ -19,14 +19,31 @@ was not running, and one published *between* two live polls), the
 relaunch byte-identical-cell-file equivalence, two-independent-runs
 determinism, the eval-lag observable against a hand-built manifest, and
 protocol asserts (no root noise, pinned sims) on the agents the loop's own
-checkpoint-load cache constructs. The report/CLI integration is a later
-subtask (9.3).
+checkpoint-load cache constructs.
+
+Subtask 9.3 (below the 9.2 section marker) covers the CLI face
+(``scripts/run_eval.py``) and the milestone's own acceptance criterion: a
+tiny, *real* ``scripts/run_selfplay.py`` run (genuine multiprocessing, the m3
+task-12 pattern) with the eval harness running concurrently in a background
+thread, driven through the exact same ``run_watch_loop``/``bench_candidate``
+plumbing the script calls -- every member ending complete in the manifest,
+cell files round-tripping, the §1 report artifacts appearing with `delta:
+null` before the K-set completes and Delta/CI/gate present (but
+`authoritative: false` at a reduced test `B`, `true` only at the pinned
+production `B`) after -- plus fast, non-``slow`` unit coverage of the report
+hook, the bench measurement, and the ``--report``/``--plateau``/``--bench``
+CLI wiring against hand-built (no-real-play) stores, mirroring
+``tests/test_eval_stats.py``'s own fixture conventions.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import json
+import sys
+import threading
+from pathlib import Path
 
 import pytest
 import torch
@@ -44,12 +61,14 @@ from core.checkpoint import (
 from core.eval_profile import EvalProfile
 from core.eval_run import (
     RUNG8_CANDIDATE_FORM,
+    BenchResult,
     EvalConfig,
     EvalRelaunchRefusedError,
     WatchLoopResult,
     _CandidateCache,
     _resolve_opponent_factory,
     agent_identity,
+    bench_candidate,
     cell_seed,
     checkpoint_dir,
     eval_lag,
@@ -58,6 +77,13 @@ from core.eval_run import (
     resolve_eval_launch,
     run_watch_loop,
     schedulable_versions,
+)
+from core.eval_stats import (
+    PLATEAU_OUTCOME_INSUFFICIENT_DATA,
+    PlateauResult,
+    build_verdict,
+    elo_curve_path,
+    verdict_path,
 )
 from core.eval_store import (
     CellId,
@@ -71,10 +97,13 @@ from core.eval_store import (
     complete_cell,
     load_snapshot,
     open_cell_for_write,
+    read_cell,
     register_member,
 )
 from core.mcts import MCTS
+from core.metrics import EpochMetricsWriter
 from core.network import Network, NetworkConfig
+from core.observability import CHECKPOINT_PUBLISHED_KIND
 from core.run_identity import (
     ENTRY_CONDITION,
     LAUNCH_SCHEMA_VERSION,
@@ -957,3 +986,514 @@ def test_watch_loop_refuses_a_relaunch_with_a_changed_material_field(tmp_path):
     changed_config = _eval_config(run_dir, eval_sims=64)
     with pytest.raises(EvalRelaunchRefusedError, match="eval_sims"):
         run_watch_loop(run_dir, changed_config, FAST_PROFILE, GAME, single_pass=True)
+
+
+# ==============================================================================
+# 9.3: the CLI face (scripts/run_eval.py) and the concurrent acceptance run
+# (tasks/m4/009.3)
+# ==============================================================================
+#
+# Two kinds of coverage, deliberately split for speed and determinism:
+#
+# * The **acceptance run** below (``slow``) is the milestone's own acceptance
+#   criterion: a tiny, *real* ``scripts/run_selfplay.py`` run (genuine
+#   multiprocessing, the m3 task-12 pattern) with the eval harness running
+#   concurrently in a background thread -- membership completeness, the
+#   task-5 cell round-trip, and the provisional-then-authoritative report
+#   distinction, all against evidence the concurrency itself produced.
+# * The **report-hook / bench / plateau / partial-cell-golden** tests further
+#   below are fast and fully deterministic: they exercise the exact same
+#   ``core.eval_run``/``core.eval_stats`` machinery the acceptance run and
+#   ``scripts/run_eval.py`` both stand on, but over hand-built (no-real-play)
+#   stores -- mirroring ``tests/test_eval_stats.py``'s own fixture
+#   conventions -- rather than by trying to win a race against a second live
+#   process. Nothing about the *correctness* of the report/plateau/bench
+#   layer depends on a live concurrent run; only the milestone's own
+#   end-to-end coupling claim does, and that is exactly what the acceptance
+#   run alone is for.
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_script_module(name: str, path: Path):
+    """Import a ``scripts/`` module by file path (``scripts/`` is not a package).
+
+    Mirrors ``tests/test_run_entrypoint.py``'s own ``_load_run_selfplay``
+    helper -- kept local per this file's existing no-cross-test-import
+    convention.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+rs = _load_script_module("run_selfplay", ROOT / "scripts" / "run_selfplay.py")
+run_eval = _load_script_module("run_eval", ROOT / "scripts" / "run_eval.py")
+
+
+def _selfplay_raw(tmp_path, *, checkpoint_count: int, publish_interval: int) -> dict:
+    """The pinned micro-Blokus run config, tiny-fied for a bounded real run.
+
+    Mirrors ``tests/test_run_entrypoint.py``'s own ``_base_raw`` exactly
+    (``replay_warmup_positions`` kept high so the D5 replay-ratio
+    ceiling/floor stays dormant, per that helper's own docstring) -- kept
+    local rather than imported across test files.
+    """
+    raw = json.loads(MICRO_RUN_CONFIG_PATH.read_text())
+    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+    raw["self_play"] = {**raw["self_play"], "sims": 128}
+    training = dict(raw["training"])
+    training.update(
+        publish_interval=publish_interval,
+        checkpoint_count=checkpoint_count,
+        replay_warmup_positions=10_000,
+        batch_size=4,
+        replay_window=2000,
+        learning_rate=1e-3,
+        warmup_steps=0,
+        cosine_total_steps=100,
+    )
+    raw["training"] = training
+    raw["run_dir"] = str(tmp_path / "selfplay_runs")
+    raw["num_actors"] = 1
+    raw["device"] = "cpu"
+    raw["schema_version"] = LAUNCH_SCHEMA_VERSION
+    raw["runtime"] = {
+        "refresh_poll_interval": 0.02,
+        "pacing_poll_interval": 0.02,
+        "ceiling_poll_interval": 0.02,
+    }
+    return raw
+
+
+def _only_run_dir(runs_root):
+    dirs = list(runs_root.iterdir())
+    assert len(dirs) == 1, dirs
+    return dirs[0]
+
+
+@pytest.mark.slow
+def test_acceptance_concurrent_run_scores_every_member_end_to_end(tmp_path):
+    """The milestone's own acceptance criterion (tasks/m4/009 Description):
+    "a tiny end-to-end run whose §1 report computes with zero manual steps."
+
+    A real, tiny M3 self-play run (K=2 publishes) launched with
+    ``scripts/run_selfplay.py`` (genuine multiprocessing), with the eval
+    harness running concurrently in a background thread over the exact
+    ``core.eval_run.run_watch_loop`` plumbing ``scripts/run_eval.py`` itself
+    calls. The harness's own ``on_member_complete`` hook captures a §1 report
+    at the instant each member transitions to complete -- race-free by
+    construction: the hook fires synchronously, before this same poll's
+    ``for version in available`` loop ever reaches a later version, so the
+    report captured when member 1 completes reflects *exactly* member 1's
+    evidence regardless of how far training has meanwhile progressed on disk.
+    """
+    raw = _selfplay_raw(tmp_path, checkpoint_count=2, publish_interval=2)
+    selfplay_cfg_path = tmp_path / "selfplay_cfg.json"
+    selfplay_cfg_path.write_text(json.dumps(raw))
+    net_config = _tiny_network_config(GAME)
+
+    launched = rs.cmd_launch(
+        selfplay_cfg_path,
+        max_games_per_actor=12,
+        block=False,
+        now=1_700_000_000.0,
+        network_config=net_config,
+    )
+    run_dir = _only_run_dir(tmp_path / "selfplay_runs")
+
+    eval_config = _eval_config(
+        run_dir, pairs_per_cell=2, eval_sims=4, forms=(5, 6, 7), bootstrap_b=39
+    )
+    eval_cfg_path = tmp_path / "eval_cfg.json"
+    eval_cfg_path.write_text(json.dumps(eval_config.to_dict()))
+
+    captured_reports: dict[int, dict] = {}
+    errors: list[BaseException] = []
+
+    def _capture_hook(version: int) -> None:
+        captured_reports[version] = build_verdict(str(run_dir), B=eval_config.bootstrap_b)
+
+    def _run_harness() -> None:
+        try:
+            game, profile = run_eval._resolve_watched_game(str(run_dir))
+            run_watch_loop(
+                run_dir,
+                eval_config,
+                profile,
+                game,
+                poll_interval=0.05,
+                max_idle_polls=3000,  # a generous (~150s) safety net, never expected to fire
+                on_member_complete=_capture_hook,
+            )
+        except BaseException as exc:  # noqa: BLE001 -- surfaced on the main thread below.
+            errors.append(exc)
+
+    harness_thread = threading.Thread(target=_run_harness, daemon=True)
+    harness_thread.start()
+    try:
+        rs.wait_for_completion(launched)
+        harness_thread.join(timeout=200)
+    finally:
+        if harness_thread.is_alive():
+            launched.shutdown()  # best-effort: never leave a live process behind on failure.
+
+    assert not harness_thread.is_alive(), "eval harness did not finish within the test timeout"
+    if errors:
+        raise errors[0]
+
+    k_total = 2
+    assert set(captured_reports) == {1, 2}
+
+    # -- membership: every member ends complete in the manifest ---------------
+    snapshot = load_snapshot(run_dir)
+    assert snapshot.member_prefix == k_total
+
+    # -- cell files pass the task-5 round-trip ---------------------------------
+    assert snapshot.completed_cell_ids  # non-trivial: real cells were really played
+    for cell_id in sorted(snapshot.completed_cell_ids):
+        header, records = read_cell(cell_path(run_dir, cell_id))
+        assert header.cell_id.to_string() == cell_id
+        assert len(records) == eval_config.pairs_per_cell
+
+    # -- provisional (delta: null, no gate) before the K-set completes --------
+    provisional = captured_reports[1]
+    assert provisional["checkpoints_evaluated"] == 1
+    assert provisional["k_target"] == k_total
+    assert provisional["delta"] is None
+    assert provisional["authoritative"] is False
+    assert "gate" not in json.dumps(provisional["delta"])  # delta itself is just `null`
+
+    # -- Delta/CI/gate present once the K-set completes; authoritative iff B ==
+    #    the pinned production B (task 7 pin 8; the distinction this stage
+    #    exists to prove) -----------------------------------------------------
+    final_test_b = captured_reports[k_total]
+    assert final_test_b["checkpoints_evaluated"] == k_total == final_test_b["k_target"]
+    assert final_test_b["bootstrap_b"] == 39
+    assert final_test_b["delta"] is not None
+    assert set(final_test_b["delta"]) == {"delta_hat", "ci", "gate"}
+    assert final_test_b["authoritative"] is False  # B=39, not the pinned production B
+
+    final_production_b = build_verdict(run_dir, B=eval_protocol.BOOTSTRAP_B_PRODUCTION)
+    assert final_production_b["checkpoints_evaluated"] == k_total
+    assert final_production_b["bootstrap_b"] == eval_protocol.BOOTSTRAP_B_PRODUCTION
+    assert final_production_b["delta"] is not None
+    assert final_production_b["authoritative"] is True
+
+    assert eval_lag(run_dir, k_total) == 0
+
+    # -- the script's own CLI wiring, smoke-level, over the same real run -----
+    report_payload = run_eval.cmd_report(eval_cfg_path)
+    assert report_payload["eval_lag"] == 0
+    assert report_payload["verdict"]["checkpoints_evaluated"] == k_total
+    assert report_payload["verdict"]["authoritative"] is False
+    rendered_report = run_eval._render_report(report_payload)
+    assert "authoritative: False" in rendered_report
+
+    plateau_result = run_eval.cmd_plateau(eval_cfg_path)
+    assert plateau_result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA  # K=2 << window M=8
+    rendered_plateau = run_eval._render_plateau(plateau_result)
+    assert rendered_plateau.splitlines()[0] == f"outcome: {PLATEAU_OUTCOME_INSUFFICIENT_DATA}"
+
+    bench_result = run_eval.cmd_bench(eval_cfg_path, n_pairs=1)
+    assert bench_result.candidate_version == k_total  # newest published member
+    assert bench_result.games_played > 0
+    assert bench_result.seconds_per_game > 0.0
+
+
+# --- fast, hand-built-store coverage (mirrors tests/test_eval_stats.py's own fixtures) --
+
+
+def _write_checkpoint_markers(run_dir, versions):
+    """Write one ``checkpoint_published`` marker per member version.
+
+    Mirrors ``tests/test_eval_stats.py``'s own local ``_write_checkpoint_markers``
+    helper -- kept local per this file's existing no-cross-test-import
+    convention. The minimal metrics fixture ``elo_curve``/``build_verdict``
+    need: ``core.observability.reduce_run`` needs no GPU segments or actor
+    deltas to compute ``net_evals``/``gpu_hours`` (both default to ``0.0``
+    with none on disk) -- only a marker per scored member version.
+    """
+    learner = EpochMetricsWriter(run_dir, "learner")
+    for i, version in enumerate(sorted(versions), start=1):
+        learner.append(
+            {
+                "kind": CHECKPOINT_PUBLISHED_KIND,
+                "model_version": version,
+                "learner_step": 10 * i,
+                "timestamp": float(i),
+            }
+        )
+
+
+def _write_scored_member(run_dir, member_version, scores, *, opponent_id="random"):
+    """Register and complete one member's single rung-7-vs-anchor cell.
+
+    The minimal fixture ``build_verdict``/``detect_plateau`` need to fit: one
+    cell connecting the candidate to ``core.eval_stats.ANCHOR_AGENT``
+    (``"random"``).
+    """
+    header = _lag_header(
+        candidate_version=member_version, rung=7, opponent_id=opponent_id, n_pairs=len(scores)
+    )
+    register_member(run_dir, member_version, [header.cell_id.to_string()])
+    _lag_fill_and_complete(run_dir, header, scores)
+
+
+def _hand_built_store(run_dir, *, checkpoint_count: int, scored_versions, eval_seed: int = 999):
+    """A run directory with real provenance + a hand-built, fully-scored eval store.
+
+    No checkpoint files, no real play -- purely for exercising the
+    report/plateau layer's own reading and rendering (the acceptance run
+    above is what exercises the real play path end to end).
+    """
+    _write_run_provenance(run_dir, checkpoint_count=checkpoint_count, eval_seed=eval_seed)
+    for version in scored_versions:
+        _write_scored_member(run_dir, version, [1.0, 1.5])
+    _write_checkpoint_markers(run_dir, scored_versions)
+
+
+def _write_eval_config_file(path, config: EvalConfig):
+    path.write_text(json.dumps(config.to_dict()))
+    return path
+
+
+# --- run_watch_loop's report-hook seam -------------------------------------------
+
+
+def test_on_member_complete_fires_exactly_once_per_newly_completed_member(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=2)
+    config = _eval_config(run_dir)
+    calls: list[int] = []
+
+    run_watch_loop(
+        run_dir, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
+    )
+    assert calls == [1, 2]
+
+    # A member already complete before a poll examines it never re-fires the
+    # hook (its `pending` list is empty -- the loop never reaches the callback
+    # for it): a second, idempotent pass calls the hook zero more times.
+    calls.clear()
+    run_watch_loop(
+        run_dir, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
+    )
+    assert calls == []
+
+
+def test_run_watch_loop_defaults_to_no_hook_at_all(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=1)
+    result = run_watch_loop(run_dir, _eval_config(run_dir), FAST_PROFILE, GAME, single_pass=True)
+    assert result.completed_members == (1,)  # no TypeError, no hook required
+
+
+# --- bench_candidate / --bench -----------------------------------------------------
+
+
+def test_bench_candidate_measures_the_newest_published_member(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=2)  # real provenance + two real checkpoints
+    config = _eval_config(run_dir, pairs_per_cell=3)
+
+    result = bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=1)
+
+    assert isinstance(result, BenchResult)
+    assert result.candidate_version == 2  # newest schedulable, not the earliest
+    assert result.eval_sims == config.eval_sims
+    assert result.device == config.device
+    assert result.pairs_per_cell == config.pairs_per_cell
+    assert result.bench_pairs_per_cell == 1
+    assert result.cells_benched > 0
+    assert result.games_played == result.cells_benched * 1 * 2
+    assert result.elapsed_seconds > 0.0
+    assert result.seconds_per_game == pytest.approx(result.elapsed_seconds / result.games_played)
+    assert result.games_per_hour == pytest.approx(3600.0 / result.seconds_per_game)
+    assert result.games_per_checkpoint == result.cells_benched * config.pairs_per_cell * 2
+    assert result.projected_hours_per_checkpoint == pytest.approx(
+        result.games_per_checkpoint * result.seconds_per_game / 3600.0
+    )
+    # No metrics markers exist at all in this fixture -- an undefined cadence,
+    # never a fabricated 0.0, and therefore an undefined feasibility verdict.
+    assert result.publish_cadence_hours is None
+    assert result.feasible is None
+
+
+def test_bench_candidate_rejects_with_no_published_member_yet(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_run_provenance(run_dir, checkpoint_count=1, eval_seed=1)
+    checkpoint_dir(run_dir).mkdir(parents=True)  # no ckpt-*.pt inside
+    config = _eval_config(run_dir)
+    with pytest.raises(ValueError, match="no schedulable member checkpoint"):
+        bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=1)
+
+
+def test_bench_candidate_rejects_non_positive_n_pairs(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=1)
+    config = _eval_config(run_dir)
+    with pytest.raises(ValueError, match="n_pairs"):
+        bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=0)
+
+
+def test_publish_cadence_hours_averages_consecutive_gpu_hour_gaps(tmp_path, monkeypatch):
+    class _FakeReduced:
+        checkpoints = {1: (10, 100, 2.0), 2: (20, 200, 5.0), 3: (30, 300, 9.0)}
+
+    monkeypatch.setattr(eval_run, "reduce_run", lambda run_dir: _FakeReduced())
+    assert eval_run._publish_cadence_hours(tmp_path, k_total=3) == pytest.approx((3.0 + 4.0) / 2)
+
+
+def test_publish_cadence_hours_none_with_fewer_than_two_members(tmp_path, monkeypatch):
+    class _FakeReduced:
+        checkpoints = {1: (10, 100, 2.0)}
+
+    monkeypatch.setattr(eval_run, "reduce_run", lambda run_dir: _FakeReduced())
+    assert eval_run._publish_cadence_hours(tmp_path, k_total=3) is None
+
+
+def test_publish_cadence_hours_ignores_versions_beyond_k_total(tmp_path, monkeypatch):
+    class _FakeReduced:
+        checkpoints = {1: (10, 100, 2.0), 2: (20, 200, 5.0), 99: (999, 999, 999.0)}
+
+    monkeypatch.setattr(eval_run, "reduce_run", lambda run_dir: _FakeReduced())
+    assert eval_run._publish_cadence_hours(tmp_path, k_total=2) == pytest.approx(3.0)
+
+
+def test_render_bench_includes_every_documented_field(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=1)
+    config = _eval_config(run_dir)
+    result = bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=1)
+
+    rendered = run_eval._render_bench(result)
+
+    for token in (
+        "candidate_version",
+        "device",
+        "eval_sims",
+        "cells_benched",
+        "games_played",
+        "seconds_per_game",
+        "games_per_hour",
+        "projected per checkpoint",
+        "publish_cadence_hours",
+        "feasible",
+    ):
+        assert token in rendered
+
+
+# --- scripts/run_eval.py: --report / --plateau, against a hand-built store --------
+
+
+def test_cmd_report_shows_null_delta_before_the_k_set_completes(tmp_path):
+    run_dir = tmp_path / "run"
+    _hand_built_store(run_dir, checkpoint_count=2, scored_versions=[1])
+    config = _make_config(str(run_dir))
+    cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
+
+    payload = run_eval.cmd_report(cfg_path)
+
+    assert payload["verdict"]["checkpoints_evaluated"] == 1
+    assert payload["verdict"]["k_target"] == 2
+    assert payload["verdict"]["delta"] is None
+    assert payload["verdict"]["authoritative"] is False
+    assert "delta: null" in run_eval._render_report(payload)
+
+
+def test_cmd_report_shows_delta_and_the_authoritative_distinction_once_complete(tmp_path):
+    run_dir = tmp_path / "run"
+    _hand_built_store(run_dir, checkpoint_count=1, scored_versions=[1])
+    config = _make_config(str(run_dir), bootstrap_b=39)
+    cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
+
+    payload = run_eval.cmd_report(cfg_path)
+
+    assert payload["eval_lag"] == 0
+    assert payload["verdict"]["checkpoints_evaluated"] == 1 == payload["verdict"]["k_target"]
+    assert payload["verdict"]["delta"] is not None
+    assert payload["verdict"]["authoritative"] is False  # B=39, not the pinned production B
+    rendered = run_eval._render_report(payload)
+    assert "eval_lag: 0" in rendered
+    assert "authoritative: False" in rendered
+
+
+def test_cmd_plateau_smoke_reports_insufficient_data_tri_state_rendered_not_coerced(tmp_path):
+    run_dir = tmp_path / "run"
+    _hand_built_store(run_dir, checkpoint_count=1, scored_versions=[1])
+    config = _make_config(str(run_dir))
+    cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
+
+    result = run_eval.cmd_plateau(cfg_path)
+
+    assert isinstance(result, PlateauResult)
+    assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+
+    rendered = run_eval._render_plateau(result)
+    # The tri-state is rendered as its own literal name -- never coerced to a
+    # True/False-shaped string anywhere on its own line.
+    assert rendered.splitlines()[0] == f"outcome: {PLATEAU_OUTCOME_INSUFFICIENT_DATA}"
+    assert "True" not in rendered.splitlines()[0]
+    assert "False" not in rendered.splitlines()[0]
+
+
+# --- partial-cell report golden (P2.2): never opens a mid-write cell --------------
+
+
+def test_report_with_a_cell_mid_write_never_opens_it_and_matches_last_complete_prefix(tmp_path):
+    """A report generated while a later member's cell is mid-write must never
+    open that cell's file, and must byte-equal the report generated from the
+    last complete prefix.
+
+    Registering member 2's required cell set and partially writing (header +
+    one of its two declared pairs, never ``complete_cell``-ed) into exactly
+    one of its cells changes nothing ``load_snapshot`` can see: a "scheduled"
+    (not "complete") cell contributes to neither ``completed_cell_ids`` nor
+    the fit, so the second report is computed from *exactly* the same
+    evidence as the first -- and if ``load_snapshot`` had tried to open the
+    partial file for its post-hoc pair-count cross-check (the check completed
+    cells alone are subject to), it would raise ``ManifestError`` (the file
+    has only 1 of its declared 2 pairs); the absence of that error is itself
+    proof the partial file was never opened.
+    """
+    run_dir = tmp_path / "run"
+    _hand_built_store(run_dir, checkpoint_count=2, scored_versions=[1])
+    b = 39
+
+    report_before = build_verdict(run_dir, B=b)
+    verdict_bytes_before = verdict_path(run_dir).read_bytes()
+    elo_curve_bytes_before = elo_curve_path(run_dir).read_bytes()
+
+    header2 = _lag_header(candidate_version=2, rung=7, opponent_id="random", n_pairs=2)
+    register_member(run_dir, 2, [header2.cell_id.to_string()])
+    path2 = cell_path(run_dir, header2.cell_id.to_string())
+    next_index = open_cell_for_write(run_dir, header2)
+    append_pair_record(
+        path2,
+        PairRecord(
+            pair_index=next_index,
+            pair_seed=next_index,
+            score_a=1.0,
+            games=(
+                GameRecordSnapshot(plies=1, opening=0),
+                GameRecordSnapshot(plies=1, opening=0),
+            ),
+        ),
+    )
+    # Deliberately never complete_cell()'d: this cell stays "scheduled" --
+    # a real, on-disk, mid-write cell -- for the rest of this test.
+
+    report_after = build_verdict(run_dir, B=b)
+
+    assert report_after == report_before
+    assert verdict_path(run_dir).read_bytes() == verdict_bytes_before
+    assert elo_curve_path(run_dir).read_bytes() == elo_curve_bytes_before
+
+    # And via the script's own --report entrypoint too.
+    config = _make_config(str(run_dir), bootstrap_b=b)
+    cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
+    payload = run_eval.cmd_report(cfg_path)
+    assert payload["verdict"] == report_after == report_before
