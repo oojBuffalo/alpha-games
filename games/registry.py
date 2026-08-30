@@ -29,8 +29,10 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+from core.eval_profile import EvalProfile
 from core.game import Game
 from core.runconfig import RunConfig, available_games
+from games.blokus_duo import EVAL_PROFILE as _BLOKUS_EVAL_PROFILE
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.config import BlokusConfig
 from games.connect4 import Connect4
@@ -185,3 +187,46 @@ if _discovered != _registered:
         "games.registry is out of sync with games/: "
         f"discovered={sorted(_discovered)} registered={sorted(_registered)}"
     )
+
+
+# name -> the adapter's declared EvalProfile (design doc §9, §12 M1.6/M4; tasks/m4/009).
+# Unlike GAME_FACTORIES above, this is *not* required to cover every entry in
+# ``games/`` -- an adapter with no M4 eval ladder yet simply has no entry, and
+# core.eval_run's orchestrator only ever needs the one game it is actually
+# watching a run for. Registering an eval profile is still a games/-only diff:
+# core/ never names a game here, and never imports games.registry itself.
+EVAL_PROFILES: dict[str, EvalProfile] = {
+    "blokus_duo": _BLOKUS_EVAL_PROFILE,
+}
+
+
+def registered_eval_profiles() -> tuple[str, ...]:
+    """Return every game name with a declared M4 eval profile, sorted.
+
+    Returns:
+        The sorted keys of :data:`EVAL_PROFILES`.
+    """
+    return tuple(sorted(EVAL_PROFILES))
+
+
+def build_eval_profile(game: str) -> EvalProfile:
+    """Resolve a game name to its declared :class:`~core.eval_profile.EvalProfile`.
+
+    Args:
+        game: An adapter package name, e.g. ``"blokus_duo"``.
+
+    Returns:
+        The adapter's declared eval profile.
+
+    Raises:
+        ValueError: If ``game`` has no registered eval profile (either an
+            unknown game entirely, or a real adapter that simply declares no
+            M4 eval ladder yet).
+    """
+    try:
+        return EVAL_PROFILES[game]
+    except KeyError:
+        raise ValueError(
+            f"no eval profile registered for game {game!r}; games with a declared "
+            f"eval profile are {list(registered_eval_profiles())}"
+        ) from None

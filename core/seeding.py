@@ -53,6 +53,16 @@ PURPOSE_WINDOW_SAMPLING = "replay-sampling"
 #: of every self-play purpose above, which all fan out from the run seed instead.
 PURPOSE_BOOTSTRAP = "bootstrap"
 
+#: M4's eval-orchestrator purpose (tasks/m4/009): ``core.eval_run.cell_seed`` derives
+#: one cell's seed as ``derive_seed(eval_seed, PURPOSE_EVAL, cell_id)`` -- independent
+#: of :data:`PURPOSE_BOOTSTRAP` above (a different M4 stream: this one seeds the
+#: mirrored games a cell actually plays, not the §1 bootstrap resampler) and, like
+#: every M4 purpose, fanned out from the harness's own ``eval_seed`` rather than the
+#: run seed. The literal string must equal ``core.eval_protocol.SEED_LABEL_EVAL`` --
+#: that registry pins the *shape* of this derivation as a covered protocol constant,
+#: this constant is the code that actually performs it.
+PURPOSE_EVAL = "eval"
+
 
 def _encode(part: Label) -> bytes:
     """Encode one label part as unambiguous, self-delimiting bytes.
