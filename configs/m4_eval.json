@@ -1,0 +1,14 @@
+{
+  "_doc": "M4 eval-harness config -- the real concurrent evaluation harness for the M3 full-Blokus (14x14) acceptance run (metadocs/blokus-duo-az-design-v0_5.md, section 9 amendment; tasks/m4/001/009). pairs_per_cell/eval_sims/rung8_lag_divisor/rung8_earliest_version/bootstrap_b are the pinned task-1 protocol values -- they must equal core.eval_protocol.PAIRS_PER_CELL/EVAL_SIMS/RUNG8_LAG_DIVISOR/RUNG8_EARLIEST_VERSION/BOOTSTRAP_B_PRODUCTION exactly (tests/test_eval_orchestrator.py's config<->doc agreement golden); a genuine re-pin changes the doc first, then this file and core/eval_protocol.py together. run_dir names the watched run's concrete directory (core.run_identity.run_root's output, e.g. 'runs/blokus_duo/<run-id>') -- the value below is the family root configs/blokus_duo.json also names, a placeholder until a real production run is launched under it; a real invocation points this at that run's actual concrete directory. eval_seed is deliberately independent of configs/blokus_duo.json's run_seed (4096) and distinct from its evaluation.eval_seed (97531, an unrelated M2.5-era protocol) -- the M2.5 core.runconfig.EvaluationConfig.eval_seed precedent for 'its own recorded seed', applied to this harness instead. device is cpu: the concurrent harness shares the single GPU with the learner and must not starve it (M5 owns batched inference); an offline re-scoring pass may pass cuda instead.",
+
+  "run_dir": "runs/blokus_duo",
+  "pairs_per_cell": 24,
+  "eval_sims": 512,
+  "rung8_lag_divisor": 4,
+  "rung8_earliest_version": 1,
+  "forms": [5, 6, 7],
+  "eval_seed": 271828,
+  "device": "cpu",
+  "bootstrap_b": 1999,
+  "schema_version": 1
+}
