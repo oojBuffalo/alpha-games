@@ -117,6 +117,58 @@ BOOTSTRAP_B_ADMISSIBLE_REMAINDER = 39
 BOOTSTRAP_CI_LOWER_QUANTILE = 0.025
 BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
 
+# --- profiled-plateau rule constants (design doc §12 M4; tasks/m4/008) ------------
+#
+# The six constants pinned together as one predicate, each with the doc amendment's
+# own one-sentence rationale (mirrored here verbatim rather than paraphrased, so the
+# doc<->constants golden in tests/test_eval_stats.py has a stable sentence to anchor
+# on): "profiled plateau" gates every M6 lever go/no-go and the §13 ceiling
+# declaration (`core.eval_stats.detect_plateau`), so -- like every other convention
+# in this registry -- changing any one of them is a protocol-version bump, never a
+# silent edit.
+
+#: Window length -- `M` evaluated member checkpoints (pin: window). About a quarter
+#: of `K` = 30: long enough for Mann-Kendall to have real power at
+#: :data:`PLATEAU_MK_ALPHA`, short enough to answer "has progress stopped recently"
+#: rather than "on average over the whole run."
+PLATEAU_WINDOW_M = 8
+
+#: Mann-Kendall two-sided significance level for the windowed trend test (pin: trend
+#: test). Non-significant means `p >= PLATEAU_MK_ALPHA`, the same 95% convention §1
+#: and §9 already use throughout, so the plateau rule introduces no second
+#: confidence level.
+PLATEAU_MK_ALPHA = 0.05
+
+#: The named windowed contrast's half-window split rule (pin: named windowed
+#: contrast) -- `Δ_window = mean(Elo, newest ceil(M/2) window members) -
+#: mean(Elo, oldest ceil(M/2) window members)`, computed on the point estimate with
+#: its CI over the *same* bootstrap replicates via the *same* admissible-B
+#: order-statistic rank rule as the §1 Δ. Recorded as a descriptive label (like the
+#: seed-label constants above) rather than a second numeric constant, since the
+#: split point is always `ceil(M/2)` of whatever `M` is pinned above -- this is
+#: explicitly *not* §1's Δ, which exists only over the complete K-set.
+PLATEAU_HALF_WINDOW_RULE = "ceil(M/2)"
+
+#: CI-width threshold, in Elo points -- the windowed-contrast CI must be strictly
+#: below this (pin: CI-width threshold). An order of magnitude below the Elo gains
+#: typical of the early run, so "flat" means flat relative to real signal rather
+#: than an artifact of a loose interval; achievable at the pin-1 evidence density
+#: (≈288-360 pairs/checkpoint) without a special-cased evaluation budget.
+PLATEAU_CI_WIDTH_THRESHOLD_ELO = 75.0
+
+#: Minimum GPU-hour span the window's `M` members must cover (pin: GPU-hour
+#: window), from the §1 x-axis join (§12 M3's observability counters), so a
+#: plateau can never be declared over a burst of cheap, closely-spaced checkpoints.
+PLATEAU_GPU_HOURS_MIN = 8.0
+
+#: Anti-flap confirmation count -- the full conjunction (MK non-significant AND CI
+#: width below threshold AND GPU-hour span at or above the minimum) must hold at
+#: this many consecutive evaluated member checkpoints (pin: anti-flap confirmation)
+#: before PLATEAU is declared; a single satisfying snapshot is NO-PLATEAU, pending
+#: confirmation, so an isolated flat-looking reading can never flip an irreversible
+#: M6 lever decision on its own.
+PLATEAU_CONFIRMATION_COUNT = 2
+
 #: Every covered constant, by name -- the input to :func:`protocol_fingerprint`.
 #: Additive only (see the module docstring): a later task adds keys here, never
 #: repurposes one to mean something else.
@@ -136,6 +188,12 @@ REGISTRY: dict[str, Any] = {
     "bootstrap_b_admissible_remainder": BOOTSTRAP_B_ADMISSIBLE_REMAINDER,
     "bootstrap_ci_lower_quantile": BOOTSTRAP_CI_LOWER_QUANTILE,
     "bootstrap_ci_upper_quantile": BOOTSTRAP_CI_UPPER_QUANTILE,
+    "plateau_window_m": PLATEAU_WINDOW_M,
+    "plateau_mk_alpha": PLATEAU_MK_ALPHA,
+    "plateau_half_window_rule": PLATEAU_HALF_WINDOW_RULE,
+    "plateau_ci_width_threshold_elo": PLATEAU_CI_WIDTH_THRESHOLD_ELO,
+    "plateau_gpu_hours_min": PLATEAU_GPU_HOURS_MIN,
+    "plateau_confirmation_count": PLATEAU_CONFIRMATION_COUNT,
 }
 
 

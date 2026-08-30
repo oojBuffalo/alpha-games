@@ -18,6 +18,7 @@ Four layers:
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
@@ -33,7 +34,12 @@ from core.elo import fit_elo
 from core.eval_protocol import BOOTSTRAP_B_PRODUCTION
 from core.eval_stats import (
     ANCHOR_AGENT,
+    PLATEAU_OUTCOME_INSUFFICIENT_DATA,
+    PLATEAU_OUTCOME_NO_PLATEAU,
+    PLATEAU_OUTCOME_PLATEAU,
     MannKendallResult,
+    PlateauResult,
+    WindowCondition,
     bootstrap_replicate,
     bootstrap_replicate_matches,
     bootstrap_replicates,
@@ -43,6 +49,7 @@ from core.eval_stats import (
     delta_gate,
     delta_hat,
     delta_windows,
+    detect_plateau,
     elo_curve,
     elo_curve_path,
     fit_snapshot_elo,
@@ -1143,3 +1150,632 @@ def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
     )
     assert rung8_lag is not None, f"could not find the rung-8 lag divisor in: {block!r}"
     assert int(rung8_lag) == eval_protocol.RUNG8_LAG_DIVISOR
+
+
+# ==============================================================================
+# 9. detect_plateau: the profiled-plateau rule (tasks/m4/008; design doc §12 M4)
+# ==============================================================================
+#
+# Fixture-building helpers below are deliberately additional to (never a rewrite
+# of) section 4's `_write_checkpoint_markers`/`_build_real_shape_metrics_fixture`:
+# the plateau rule needs GPU-hour *segments* (§1's x-axis join's `gpu_hours`
+# coordinate), which those two never exercise (both leave gpu_hours at 0.0).
+#
+# Every randomized fixture below fixes its own `random.Random(seed)` and was
+# picked by direct search over (seed, n_pairs) for the one sub-condition it is
+# named after to land on the intended side of its pinned threshold while every
+# other sub-condition lands on the *other* side -- so each test isolates the one
+# clause it claims to. This mirrors the module's own existing style
+# (`_null_pair_scores`/`_biased_pair_scores` above): a deterministic seed is not
+# a fragile magic number here, since core.eval_stats's whole pipeline (Bradley-
+# Terry coordinate ascent, Mann-Kendall, the order-statistic CI) is pure and
+# reproducible -- the same seed always reproduces the same booleans on any
+# machine.
+
+
+def _win_rate_pair_scores(rng: random.Random, p_win: float, n_pairs: int) -> list[float]:
+    """``n_pairs`` i.i.d. pair scores at win probability ``p_win`` (mirrors the
+    module's own ``_biased_pair_scores``/``_null_pair_scores`` inline helpers,
+    pulled to module scope since several plateau fixtures below share it)."""
+
+    def _game() -> float:
+        return 1.0 if rng.random() < p_win else 0.0
+
+    return [_game() + _game() for _ in range(n_pairs)]
+
+
+def _write_gpu_segmented_checkpoint_markers(
+    run_dir, versions: list[int], *, seconds_per_version: float
+) -> None:
+    """One ``checkpoint_published`` marker per version, each preceded by a closed
+    GPU segment of ``seconds_per_version`` seconds -- so ``reduce_run``'s (and
+    therefore ``elo_curve``'s) cumulative ``gpu_hours`` coordinate advances by a
+    known, controllable amount between consecutive members. Unlike section 4's
+    ``_write_checkpoint_markers`` (deliberately left at ``gpu_hours = 0.0``
+    everywhere, since the Delta/CI/MK tests it serves never read that column),
+    the plateau rule's GPU-hour-span sub-condition is the whole point here.
+
+    Args:
+        run_dir: The run directory.
+        versions: Member versions to publish, in the order to space them.
+        seconds_per_version: Wall-clock seconds of GPU segment time inserted
+            before each marker -- ``len(versions) - 1`` such gaps separate the
+            first and last marker, so a window's GPU-hour span is exactly
+            ``(len(window) - 1) * seconds_per_version / 3600``.
+    """
+    orch = EpochMetricsWriter(run_dir, "orchestrator")
+    learner = EpochMetricsWriter(run_dir, "learner")
+    t = 0.0
+    orch.append(segment_start_record(device="cpu", timestamp=t))
+    for i, version in enumerate(versions, start=1):
+        t += seconds_per_version
+        orch.append(segment_end_record(timestamp=t))
+        _append_checkpoint_published(learner, version=version, learner_step=10 * i, timestamp=t)
+        t += 1.0
+        orch.append(segment_start_record(device="cpu", timestamp=t))
+    orch.append(segment_end_record(timestamp=t + 1.0))
+
+
+def _build_plateau_fixture(
+    run_dir,
+    scores_by_version: dict,
+    *,
+    seconds_per_version: float = 4200.0,
+    k_target: int = 30,
+    eval_seed: int = 4242,
+    refresh_elo_curve: bool = True,
+):
+    """Build a complete eval-store + config + (optionally) ``elo_curve.json``
+    fixture for one member per ``scores_by_version`` key, each a single rung-7
+    vs. ``"random"`` cell -- everything :func:`detect_plateau` reads.
+
+    Args:
+        run_dir: The run directory.
+        scores_by_version: ``{model_version: pair_scores}``.
+        seconds_per_version: Forwarded to
+            :func:`_write_gpu_segmented_checkpoint_markers`.
+        k_target: ``training.checkpoint_count`` written to ``config.json``.
+        eval_seed: ``evaluation.eval_seed`` written to ``config.json`` (also
+            what :func:`detect_plateau` derives its ``bootstrap_seed`` from).
+        refresh_elo_curve: If ``True`` (the default), write
+            ``eval/elo_curve.json`` from the resulting snapshot -- the task-7
+            artifact :func:`detect_plateau` reads its GPU-hours join from.
+            ``False`` leaves it unwritten, for the missing-artifact
+            insufficient-data tests.
+
+    Returns:
+        The loaded :class:`~core.eval_store.EvalSnapshot`.
+    """
+    for version, scores in scores_by_version.items():
+        _write_member(run_dir, version, [(7, "random", scores)])
+    _write_gpu_segmented_checkpoint_markers(
+        run_dir, sorted(scores_by_version), seconds_per_version=seconds_per_version
+    )
+    _write_run_config(run_dir, checkpoint_count=k_target, eval_seed=eval_seed)
+    snapshot = load_snapshot(run_dir)
+    if refresh_elo_curve:
+        elo_curve(run_dir, snapshot)
+    return snapshot
+
+
+# --- registry: the six plateau constants' literal pinned values -------------------
+
+
+def test_plateau_registry_constants_match_the_literal_pinned_values():
+    assert eval_protocol.PLATEAU_WINDOW_M == 8
+    assert eval_protocol.PLATEAU_MK_ALPHA == 0.05
+    assert eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO == 75.0
+    assert eval_protocol.PLATEAU_GPU_HOURS_MIN == 8.0
+    assert eval_protocol.PLATEAU_CONFIRMATION_COUNT == 2
+    assert "plateau_window_m" in eval_protocol.REGISTRY
+    assert "plateau_half_window_rule" in eval_protocol.REGISTRY
+
+
+def test_plateau_registry_constants_are_covered_by_the_protocol_fingerprint(monkeypatch):
+    before = eval_protocol.protocol_fingerprint()
+    monkeypatch.setitem(eval_protocol.REGISTRY, "plateau_window_m", 999)
+    after = eval_protocol.protocol_fingerprint()
+    assert before != after
+
+
+# --- doc <-> constants golden: the amended §12 M4 plateau bullet ------------------
+
+_PLATEAU_BULLET_HEADING = "**Plateau-detection rule (operationalize the M6 gate)"
+_PLATEAU_BULLET_END = "\n  - **Bootstrap seed"
+
+
+def test_protocol_registry_matches_the_amended_design_doc_plateau_bullet():
+    """The doc<->constants golden for task 8's amendment: this tree already
+    carries the committed plateau rule (unlike task 7's pins golden above, this
+    one is not conditionally skipped) -- parses §12 M4's plateau-detection-rule
+    bullet and compares every one of its numeric constants against
+    ``core.eval_protocol``'s own module constants. Tolerant of prose: anchored
+    on the bolded bullet heading and its own sub-bullet labels, not exact
+    phrasing elsewhere in the paragraph.
+    """
+    doc_text = _DESIGN_DOC_PATH.read_text(encoding="utf-8")
+    assert _PLATEAU_BULLET_HEADING in doc_text, (
+        "design doc §12 M4 has no 'Plateau-detection rule' bullet -- expected the "
+        "tasks/m4/008 doc-first amendment to already be committed in this tree"
+    )
+    start = doc_text.index(_PLATEAU_BULLET_HEADING)
+    rest = doc_text[start:]
+    end_match = re.search(re.escape(_PLATEAU_BULLET_END), rest)
+    block = rest[: end_match.start()] if end_match else rest
+
+    window_m = _extract_number(r"`M`\s*=\s*(\d[\d,]*)\s*evaluated member", block)
+    assert window_m is not None, f"could not find the window-length M pin in: {block!r}"
+    assert int(window_m) == eval_protocol.PLATEAU_WINDOW_M
+
+    alpha = _extract_number(r"α`\s*=\s*([\d.]+)", block)
+    assert alpha is not None, f"could not find the Mann-Kendall alpha pin in: {block!r}"
+    assert float(alpha) == eval_protocol.PLATEAU_MK_ALPHA
+
+    threshold = _extract_number(r"strictly below\s*(\d[\d,]*)\s*Elo points", block)
+    assert threshold is not None, f"could not find the CI-width threshold pin in: {block!r}"
+    assert float(threshold) == eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO
+
+    gpu_hours = _extract_number(r"span\s*≥\s*(\d[\d,]*)\s*GPU-hours", block)
+    assert gpu_hours is not None, f"could not find the GPU-hour window pin in: {block!r}"
+    assert float(gpu_hours) == eval_protocol.PLATEAU_GPU_HOURS_MIN
+
+    assert re.search(r"\btwo\b consecutive", block, re.IGNORECASE), (
+        f"could not find the anti-flap confirmation-count pin in: {block!r}"
+    )
+    assert eval_protocol.PLATEAU_CONFIRMATION_COUNT == 2
+
+    # The amendment must retire the "Δ-CI width" sketch's ambiguity by naming a
+    # windowed contrast explicitly distinct from §1's Delta (tasks/m4/008 detail).
+    assert "not" in block and "§1" in block, (
+        f"could not find the 'explicitly not §1's Delta' disambiguation in: {block!r}"
+    )
+    # The insufficient-data clause must be present as its own named case.
+    assert "insufficient-data" in block.lower() or "INSUFFICIENT-DATA" in block, (
+        f"could not find the insufficient-data clause in: {block!r}"
+    )
+
+
+# --- tri-state structural contract: never a bool, never coerced -------------------
+
+
+def test_plateau_outcome_values_are_the_three_named_strings():
+    outcomes = {
+        PLATEAU_OUTCOME_PLATEAU,
+        PLATEAU_OUTCOME_NO_PLATEAU,
+        PLATEAU_OUTCOME_INSUFFICIENT_DATA,
+    }
+    assert outcomes == {"plateau", "no_plateau", "insufficient_data"}
+
+
+def test_plateau_result_implements_no_dunder_bool():
+    """The tri-state outcome must only ever be read by comparing ``outcome``
+    against a named value -- never by accidental truthiness coercion."""
+    assert "__bool__" not in PlateauResult.__dict__
+    assert "__bool__" not in WindowCondition.__dict__
+
+
+# --- insufficient-data: a window shorter than M ------------------------------------
+
+
+def test_window_shorter_than_m_is_insufficient_data(tmp_path):
+    for version in range(1, 8):  # 7 < PLATEAU_WINDOW_M (8) -- no config/elo_curve needed.
+        _write_member(tmp_path, version, [(7, "random", [1.0, 1.0])])
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+    assert result.current is None
+    assert result.previous is None
+    assert result.confirmation_count == 0
+    assert result.confirmed_versions == ()
+    assert "7" in result.reason and "8" in result.reason
+
+
+def test_a_two_point_series_is_insufficient_data(tmp_path):
+    """The degenerate low end of the same "short window" gate -- with only 2
+    evaluated members, a from-scratch Mann-Kendall over the whole series would
+    itself be insufficient-data (n < 3); the window-length gate fires first
+    either way, so both routes collapse onto the identical tri-state outcome,
+    never miscoerced into plateau or no-plateau."""
+    for version in (1, 2):
+        _write_member(tmp_path, version, [(7, "random", [1.0, 1.0])])
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+    assert result.current is None
+
+
+# --- insufficient-data: missing GPU-hour coordinate --------------------------------
+
+
+def test_missing_elo_curve_artifact_is_insufficient_data(tmp_path):
+    """No ``elo_curve.json`` has ever been written -- every window member is
+    missing its GPU-hours coordinate. Scores vary by version (never all-tied)
+    so this isolates the missing-GPU-hours trigger alone from the separate
+    all-tied-window trigger below."""
+    rng = random.Random(2)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 40) for v in range(1, 9)}
+    _build_plateau_fixture(tmp_path, scores, refresh_elo_curve=False)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+    assert result.current is not None  # sub-conditions still computed for audit
+    assert result.current.gpu_hours_span is None
+    assert result.current.gpu_span_sufficient is False
+    assert result.elo_curve_fingerprint is None
+    assert "GPU-hours coordinate" in result.reason
+
+
+def test_stale_elo_curve_missing_the_newest_member_is_insufficient_data(tmp_path):
+    """``elo_curve.json`` exists but was written before the newest member was
+    scored -- a realistic staleness case (the harness has not yet re-run
+    ``elo_curve``/``build_verdict`` since the snapshot advanced), distinct from
+    the artifact never existing at all."""
+    scores = {v: [1.0, 1.0] for v in range(1, 8)}  # members 1..7 only, refreshed now
+    _build_plateau_fixture(tmp_path, scores, refresh_elo_curve=True)
+    stale_fingerprint = elo_curve_path(tmp_path).read_bytes()
+
+    # Member 8 completes afterward, without ever refreshing elo_curve.json again.
+    _write_member(tmp_path, 8, [(7, "random", [1.0, 1.0])])
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+    assert result.current.versions == (1, 2, 3, 4, 5, 6, 7, 8)
+    assert result.current.gpu_hours_span is None  # version 8 has no row in the stale file
+    assert result.elo_curve_fingerprint == hashlib.sha256(stale_fingerprint).hexdigest()
+
+
+def test_an_insufficient_data_windows_mann_kendall_reading_also_blocks(tmp_path):
+    """Symmetric with the missing-GPU-coordinate trigger: if a window's own
+    Mann-Kendall reading were ever insufficient-data (unreachable at the pinned
+    M=8 >= 3, but never assumed away), the overall verdict must be
+    insufficient-data too, not silently treated as "non-significant"."""
+    scores = {v: [1.0, 1.0] for v in range(1, 9)}
+    _build_plateau_fixture(tmp_path, scores)
+    result = detect_plateau(tmp_path, B=39)
+    # At M=8 this path is not reachable -- assert the structural guarantee instead:
+    # every real window's own n always equals the pinned M, which is >= 3.
+    assert result.current.mann_kendall.insufficient_data is False
+    assert result.current.mann_kendall.n == eval_protocol.PLATEAU_WINDOW_M
+
+
+# --- insufficient-data: an all-tied window (P2.5; tasks/m4/008 Test Strategy) ------
+
+
+def test_all_tied_window_is_insufficient_data_not_plateau(tmp_path):
+    """An all-tied window hits Mann-Kendall's own pinned sigma=0 degenerate
+    branch (``insufficient_data=False, s=0, z=0.0, p=1.0``) rather than its
+    literal ``insufficient_data`` flag -- distinct from the unreachable n<3
+    case exercised above. That branch carries zero real trend information,
+    and the windowed contrast's CI collapses to width 0 for the same reason
+    (every replicate curve is identical too), so the full conjunction would
+    otherwise be trivially satisfied on a window with no statistical content.
+    The design doc §12 M4 insufficient-data clause and tasks/m4/008's Test
+    Strategy both require this to read as INSUFFICIENT-DATA, never PLATEAU."""
+    scores = {v: [1.0, 1.0] for v in range(1, 11)}  # every member ties exactly
+    _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+    assert result.outcome != PLATEAU_OUTCOME_PLATEAU
+    assert result.current.mann_kendall.insufficient_data is False  # not the n<3 branch
+    assert result.current.mann_kendall.p == 1.0
+    assert result.current.mk_all_tied is True
+    assert result.current.mk_non_significant is False  # forced False, never "legitimate"
+    assert result.current.contrast_ci_width == 0.0  # the degenerate CI collapse too
+    assert result.current.satisfied is False
+    assert result.confirmation_count == 0
+    assert result.confirmed_versions == ()
+    assert "all-tied" in result.reason
+
+
+def test_a_window_shorter_than_m_and_an_all_tied_window_are_both_never_plateau(tmp_path):
+    """Both P2.5 triggers side by side, over the same two candidate window
+    lengths one below and one at ``M``: neither ever reaches PLATEAU or
+    NO_PLATEAU, only the explicit tri-state INSUFFICIENT-DATA."""
+    short_scores = {v: [1.0, 0.0] for v in range(1, 8)}  # 7 < M -- too short outright
+    tied_scores = {v: [1.0, 1.0] for v in range(1, 9)}  # exactly M, but all-tied
+
+    for scores in (short_scores, tied_scores):
+        root = tmp_path / f"run-{len(scores)}"
+        root.mkdir()
+        _build_plateau_fixture(root, scores)
+        result = detect_plateau(root, B=39)
+        assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
+        assert result.outcome not in (PLATEAU_OUTCOME_PLATEAU, PLATEAU_OUTCOME_NO_PLATEAU)
+
+
+# --- each sub-condition independently flips the outcome ----------------------------
+
+
+def test_mann_kendall_significant_trend_blocks_plateau_alone(tmp_path):
+    rng = random.Random(1000)
+    scores = {v: _win_rate_pair_scores(rng, 0.15 + 0.7 * (v - 1) / 8, 300) for v in range(1, 9)}
+    _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    c = result.current
+    assert c.mk_non_significant is False  # the one blocking sub-condition
+    assert c.ci_narrow is True
+    assert c.gpu_span_sufficient is True
+    assert c.satisfied is False
+    assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
+    assert result.confirmation_count == 0
+
+
+def test_wide_ci_blocks_plateau_alone(tmp_path):
+    rng = random.Random(1)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 50) for v in range(1, 9)}
+    _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    c = result.current
+    assert c.mk_non_significant is True
+    assert c.ci_narrow is False  # the one blocking sub-condition
+    assert c.contrast_ci_width >= eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO
+    assert c.gpu_span_sufficient is True
+    assert c.satisfied is False
+    assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
+
+
+def test_thin_gpu_hour_span_blocks_plateau_alone(tmp_path):
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 200) for v in range(1, 9)}
+    _build_plateau_fixture(tmp_path, scores, seconds_per_version=500.0)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    c = result.current
+    assert c.mk_non_significant is True
+    assert c.ci_narrow is True
+    assert c.gpu_span_sufficient is False  # the one blocking sub-condition
+    assert c.gpu_hours_span == pytest.approx(7 * 500.0 / 3600.0)
+    assert c.satisfied is False
+    assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
+
+
+# --- the anti-flap confirmation clause ---------------------------------------------
+
+
+def test_conjunction_holding_only_at_the_newest_member_is_no_plateau_pending_confirmation(
+    tmp_path,
+):
+    rng = random.Random(1)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 100) for v in range(1, 10)}  # 9 members
+    _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.current.newest_version == 9
+    assert result.previous.newest_version == 8
+    assert result.current.satisfied is True
+    assert result.previous.satisfied is False  # not yet confirmed one snapshot earlier
+    assert result.confirmation_count == 1
+    assert result.confirmed_versions == (9,)
+    assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
+    assert "pending confirmation" in result.reason
+
+
+def test_conjunction_holding_at_two_consecutive_snapshots_is_plateau(tmp_path):
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 120) for v in range(1, 11)}  # 10 members
+    _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.current.newest_version == 10
+    assert result.previous.newest_version == 9
+    assert result.current.satisfied is True
+    assert result.previous.satisfied is True
+    assert result.confirmation_count == 2
+    assert result.confirmed_versions == (9, 10)
+    assert result.outcome == PLATEAU_OUTCOME_PLATEAU
+    assert result.reason is None
+
+
+# --- non-star-graph regression: `previous` must not absorb later evidence --------
+
+
+def test_previous_window_is_unaffected_by_a_later_rung8_game_into_its_own_span(tmp_path):
+    """Regression for the truncated-refit fix (tasks/m4/008 review finding #1).
+
+    Every other plateau fixture in this module is a degenerate star graph -- each
+    member only ever plays the fixed anchor "random" -- the one case where slicing
+    both confirmation windows out of a single, fully-informed fit happens to give
+    the same answer as two genuinely independent, contemporaneous reads. Real runs
+    are not star graphs: §9 pin 2's one anchored Bradley-Terry fit links every
+    member through the rungs they share, and a rung-8 cell keeps a historical
+    opponent's *own* earlier rung-7 identity (``core.eval_agents.
+    historical_opponents``'s module note), so member 9's own rung-8 game against
+    member 1 pulls on member 1's fitted rating too -- and member 1 sits inside the
+    ``previous`` window's span (versions 1..8). This builds that exact shape and
+    checks ``previous`` reads identically to a store that only ever had members
+    1..8 -- i.e. that it is genuinely order-independent, never contaminated by
+    member 9's rung-8 evidence arriving after member 8 was already the newest.
+    """
+    root_full = tmp_path / "full"
+    root_truncated = tmp_path / "truncated"
+    root_full.mkdir()
+    root_truncated.mkdir()
+
+    for version in range(1, 9):
+        _write_member(root_full, version, [(7, "random", [1.0, 1.0])])
+        _write_member(root_truncated, version, [(7, "random", [1.0, 1.0])])
+    # Member 9 exists only in the "full" store -- and, beyond its ordinary
+    # rung-7-vs-random cell, plays a rung-8 game against member 1's own rung-7
+    # identity, lopsided enough to move member 1's fitted rating.
+    _write_member(
+        root_full,
+        9,
+        [(7, "random", [1.0, 1.0]), (7, "rung7-v1-1", [2.0, 2.0])],
+    )
+
+    _write_gpu_segmented_checkpoint_markers(
+        root_full, list(range(1, 10)), seconds_per_version=4200.0
+    )
+    _write_gpu_segmented_checkpoint_markers(
+        root_truncated, list(range(1, 9)), seconds_per_version=4200.0
+    )
+    _write_run_config(root_full, checkpoint_count=30, eval_seed=4242)
+    _write_run_config(root_truncated, checkpoint_count=30, eval_seed=4242)
+
+    snapshot_full = load_snapshot(root_full)
+    snapshot_truncated = load_snapshot(root_truncated)
+    elo_curve(root_full, snapshot_full)
+    elo_curve(root_truncated, snapshot_truncated)
+
+    # Sanity check the fixture actually exercises the coupling this regression
+    # targets: member 1's rating really does move once member 9's rung-8 game
+    # against it is folded into one joint fit -- otherwise this fixture would not
+    # be testing anything beyond the star-graph case every other test already covers.
+    full_v1_elo = fit_snapshot_elo(snapshot_full)["rung7-v1-1"]
+    truncated_v1_elo = fit_snapshot_elo(snapshot_truncated)["rung7-v1-1"]
+    assert full_v1_elo != pytest.approx(truncated_v1_elo)
+
+    result_full = detect_plateau(root_full, B=39)
+    result_truncated = detect_plateau(root_truncated, B=39)
+
+    assert result_full.previous.newest_version == 8
+    assert result_truncated.current.newest_version == 8
+    assert result_truncated.previous is None  # only 8 members -- no second window yet
+
+    # The fix: `previous`'s own sub-conditions read exactly as a standalone
+    # snapshot that never had member 9 (or its rung-8 game) would have -- never
+    # perturbed by evidence that did not exist yet when member 8 was newest.
+    assert result_full.previous.mann_kendall == result_truncated.current.mann_kendall
+    assert result_full.previous.contrast == pytest.approx(result_truncated.current.contrast)
+    assert result_full.previous.contrast_ci == pytest.approx(result_truncated.current.contrast_ci)
+    assert result_full.previous.gpu_hours_span == pytest.approx(
+        result_truncated.current.gpu_hours_span
+    )
+    assert result_full.previous.satisfied == result_truncated.current.satisfied
+
+
+# --- hand-computed windowed-contrast value -----------------------------------------
+
+
+def test_windowed_contrast_matches_hand_computed_half_window_means(tmp_path):
+    """A deterministic (non-random) star fixture: versions 1-4 score exactly 2.0
+    of 4 games (50%) against the anchor and versions 5-8 score exactly 3.0 of 4
+    (75%) -- each closed-form-verifiable once §9 pin 6's one-virtual-draw
+    regularizer is folded in (``_closed_form`` mirrors ``tests/test_elo.py``'s
+    own convention: effective rate = ``(score + 0.5) / (games + 1)``), the same
+    style ``test_two_checkpoint_three_rung_fixture_matches_hand_computed_bt_
+    ratings`` above already uses. A 50% raw rate is unmoved by the (symmetric)
+    virtual draw (elo stays exactly 0.0); 75% becomes ``(3.0 + 0.5) / 5 = 0.7``.
+    Delta_window = mean(elo, 5..8) - mean(elo, 1..4) is then hand-verifiable,
+    mirroring ``test_delta_hat_matches_hand_computed_window_means``'s style for
+    the §1 Delta. No ``elo_curve.json`` is written -- irrelevant to this
+    assertion, since a window's sub-conditions are computed (and exposed for
+    audit) before the GPU-hours check ever runs.
+    """
+    scores = {v: [1.0, 1.0] for v in range(1, 5)}  # sum=2.0/4 games = 0.5 win rate
+    scores.update({v: [1.5, 1.5] for v in range(5, 9)})  # sum=3.0/4 games = 0.75
+    _build_plateau_fixture(tmp_path, scores, refresh_elo_curve=False)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    expected_contrast = _closed_form((3.0 + 0.5) / 5.0) - _closed_form((2.0 + 0.5) / 5.0)
+    assert result.current.contrast == pytest.approx(expected_contrast, abs=1e-4)
+    assert result.current.mann_kendall.s == 16  # every one of the 4x4 cross pairs is a "+"
+
+
+# --- snapshot-only reads: an on-disk partial cell perturbs nothing ----------------
+
+
+def test_on_disk_partial_cell_perturbs_nothing(tmp_path):
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 120) for v in range(1, 11)}
+    _build_plateau_fixture(tmp_path, scores)
+    baseline = detect_plateau(tmp_path, B=39)
+
+    # A stray, never-completed member-11 cell -- structurally "scheduled" but not
+    # yet complete -- must be structurally invisible (task 1 pin 9 / P2.2).
+    header = _header(candidate_version=11, rung=7, opponent_id="random", n_pairs=2)
+    register_member(tmp_path, 11, [header.cell_id.to_string()])
+    _fill(tmp_path, header, [1.0, 1.0])  # opened + appended, never completed
+
+    after = detect_plateau(tmp_path, B=39)
+
+    assert after == baseline  # exact dataclass equality, not just the outcome field
+
+
+# --- determinism: same store + seed -> identical result --------------------------
+
+
+def test_same_store_and_seed_give_identical_plateau_results_across_two_runs(tmp_path):
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 120) for v in range(1, 11)}
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    _build_plateau_fixture(root_a, scores)
+    _build_plateau_fixture(root_b, scores)
+
+    result_a = detect_plateau(root_a, B=39)
+    result_b = detect_plateau(root_b, B=39)
+
+    assert result_a == result_b
+    # And calling twice over the one store is equally deterministic.
+    assert detect_plateau(root_a, B=39) == result_a
+
+
+# --- the payload carries the fingerprints and sub-condition values ----------------
+
+
+def test_plateau_result_carries_the_snapshot_elo_curve_and_protocol_fingerprints(tmp_path):
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 120) for v in range(1, 11)}
+    snapshot = _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.snapshot_fingerprint == snapshot.snapshot_fingerprint
+    assert (
+        result.elo_curve_fingerprint
+        == hashlib.sha256(elo_curve_path(tmp_path).read_bytes()).hexdigest()
+    )
+    assert result.protocol_fingerprint == eval_protocol.protocol_fingerprint()
+    assert result.window_m == eval_protocol.PLATEAU_WINDOW_M
+
+
+def test_detect_plateau_rejects_a_non_admissible_b(tmp_path):
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 120) for v in range(1, 11)}
+    _build_plateau_fixture(tmp_path, scores)
+
+    with pytest.raises(ValueError):
+        detect_plateau(tmp_path, B=100)
+
+
+def test_conjunction_regressing_at_the_newest_member_discards_the_stale_credit(tmp_path):
+    """The anti-flap direction the clause exists for: satisfied at the previous
+    window, regressed at the newest one -> no plateau, and the previously
+    satisfying reading earns zero confirmation credit (a future refactor of the
+    newest-first confirmation loop to a count-based check would credit it).
+    Members 1..9 reuse the exact rng(0) stream the confirmed-plateau fixture
+    above draws for its first nine members, so the previous window (2..9) is
+    known-satisfied; member 10 gets only 12 pairs, whose noisy rating widens the
+    newest window's contrast CI past the pinned 75-Elo threshold.
+    """
+    rng = random.Random(0)
+    scores = {v: _win_rate_pair_scores(rng, 0.5, 120) for v in range(1, 10)}
+    scores[10] = _win_rate_pair_scores(rng, 0.5, 12)
+    _build_plateau_fixture(tmp_path, scores)
+
+    result = detect_plateau(tmp_path, B=39)
+
+    assert result.previous.newest_version == 9
+    assert result.previous.satisfied is True
+    assert result.current.newest_version == 10
+    assert result.current.satisfied is False
+    assert result.confirmation_count == 0
+    assert result.confirmed_versions == ()
+    assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
