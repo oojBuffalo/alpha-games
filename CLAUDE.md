@@ -82,7 +82,7 @@ The **same** `games/blokus_duo/` package parameterized over a game config — *n
 **M6** ordered levers, each gated on the M4-defined plateau: (1) FPU reduction, (2) 8-fold augmentation (rung-7 Elo), (3) value-only fast-position storage iff value-limited, (4) global-pooling, (5) KataGo aux bundle →
 **M7** (future) N-player engine for 4p Blokus: vector value head, max-n/paranoid backup, tournament eval.
 
-Already pinned at its milestone: aux loss weight **λ_aux = 0.25** (M2, §7); weight-publish interval **200 learner steps** / checkpoint count **K = 30** (M3, §6.2); mirrored pairs per (checkpoint, rung) cell **24 pairs / 48 games** (M4, §9 — landed with the full pre-registered §1/§9 evaluation protocol).
+Already pinned at its milestone: aux loss weight **λ_aux = 0.25** (M2, §7); weight-publish interval **200 learner steps** / checkpoint count **K = 30** (M3, §6.2); mirrored pairs per (checkpoint, rung) cell **24 pairs / 48 games** (M4, §9 — landed with the full pre-registered §1/§9 evaluation protocol; precision basis reproduced by `python3 scripts/verify_pairs_per_cell.py`).
 
 ## Test battery highlights (M1)
 
