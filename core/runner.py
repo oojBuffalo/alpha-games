@@ -9,12 +9,12 @@ at M4.
 
 from __future__ import annotations
 
-import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from core.agents import Agent
 from core.game import Game
+from core.seeding import derive_seed
 
 AgentFactory = Callable[[int], Agent]
 
@@ -64,17 +64,25 @@ class PairResult:
     """Outcome of one mirrored pair — the §1/§9 bootstrap's resampling unit.
 
     Attributes:
-        pair_index: Position of the pair within its match.
+        pair_index: Absolute position of the pair within its match (durable
+            coordinate — stable under resumption, see :func:`play_pairs`).
         score_a: Agent A's score over both games (win 1, draw 0.5, loss 0 each).
         score_b: Agent B's score, ``2 − score_a`` in v1.
         games: The two :class:`GameRecord`s — index 0 has A in seat 0, index 1
             has the seats swapped (B in seat 0).
+        pair_seed: ``derive_seed(seed, "pair", pair_index)`` — the pure
+            function of ``(seed, pair_index)`` both games' seeds derive from;
+            recorded so a stored result is independently re-derivable and
+            verifiable without replaying it. Defaults to 0 for synthetic
+            ``PairResult``s built outside :func:`play_pairs` (e.g. test
+            fixtures) that carry no real seed.
     """
 
     pair_index: int
     score_a: float
     score_b: float
     games: tuple[GameRecord, GameRecord]
+    pair_seed: int = 0
 
 
 def _score(utility: float) -> float:
@@ -196,37 +204,62 @@ def play_pairs(
     n_pairs: int,
     seed: int,
     opening_balancer: OpeningBalancer | None = None,
+    start_pair_index: int = 0,
 ) -> list[PairResult]:
     """Play ``n_pairs`` mirrored pairs between two agents (§9 protocol).
 
     Each pair plays two games with **seats swapped** (A first, then B first).
     Agents are rebuilt through their factories for every game, with the same
-    per-pair seed in both games of a pair — mirrored RNG streams — and
-    independent seeds across pairs, all derived from ``seed``.
+    per-pair seed in both games of a pair — mirrored RNG streams. Per-pair
+    seeds are pure functions of the pair's absolute index, not of stream
+    position (the ``core.seeding`` durable-coordinate discipline):
+    ``pair_seed = derive_seed(seed, "pair", pair_index)``, then
+    ``seed_a = derive_seed(pair_seed, "a")`` and
+    ``seed_b = derive_seed(pair_seed, "b")``. Consequently pair ``k`` plays
+    identically no matter which window it is played in — this is what makes
+    resumption exact (see ``start_pair_index`` below) rather than merely
+    seeded-and-hope: a run interrupted and resumed from a recorded index
+    reproduces exactly the games an uninterrupted run would have played,
+    because nothing about a pair's seed depends on how many pairs were played
+    before it.
 
     Args:
         game: The game to evaluate on.
         factory_a: Builds agent A from a seed.
         factory_b: Builds agent B from a seed.
         n_pairs: Number of mirrored pairs to play.
-        seed: Master seed; results are a pure function of it.
+        seed: Master seed; results are a pure function of it (and of
+            ``start_pair_index``, which selects *which* pairs to play, not how
+            they are seeded).
         opening_balancer: Optional game-specific hook (§12 M1.6 pin): given
             game 1's opening action, returns a predicate restricting game 2's
             opening (e.g. Blokus's same-start-square rule).
+        start_pair_index: Absolute index of the first pair to play. Playing
+            pairs ``[start_pair_index, start_pair_index + n_pairs)`` — with
+            ``pair_index`` in every result the absolute index, not a
+            0-based offset into this call — is what lets a caller resume a
+            partially played match at pair ``k`` via
+            ``play_pairs(..., n_pairs=remaining, start_pair_index=k)``.
 
     Returns:
-        One :class:`PairResult` per pair, in play order.
+        One :class:`PairResult` per pair, in play order, with absolute
+        ``pair_index`` values ``[start_pair_index, start_pair_index + n_pairs)``.
 
     Raises:
-        ValueError: If ``n_pairs`` is not positive — a zero-game match must fail
-            loudly, not emit an empty result that fabricates a fake rating.
+        ValueError: If ``n_pairs`` is not positive — a zero-game match must
+            fail loudly, not emit an empty result that fabricates a fake
+            rating. Also if ``start_pair_index`` is negative — there is no
+            pair before index 0 to resume from.
     """
     if n_pairs <= 0:
         raise ValueError(f"n_pairs must be positive, got {n_pairs}")
-    master = random.Random(seed)
+    if start_pair_index < 0:
+        raise ValueError(f"start_pair_index must be non-negative, got {start_pair_index}")
     results = []
-    for i in range(n_pairs):
-        seed_a, seed_b = master.getrandbits(64), master.getrandbits(64)
+    for i in range(start_pair_index, start_pair_index + n_pairs):
+        pair_seed = derive_seed(seed, "pair", i)
+        seed_a = derive_seed(pair_seed, "a")
+        seed_b = derive_seed(pair_seed, "b")
         rec_fwd = play_game(game, (factory_a(seed_a), factory_b(seed_b)))
         game_rev: Game = game
         if opening_balancer is not None:
@@ -239,6 +272,7 @@ def play_pairs(
                 score_a=score_a,
                 score_b=2.0 - score_a,
                 games=(rec_fwd, rec_rev),
+                pair_seed=pair_seed,
             )
         )
     return results
