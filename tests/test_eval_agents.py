@@ -1,29 +1,16 @@
-"""Checkpoint-backed evaluator load path + rungs 5/6/7 eval agents (§9, M4).
+"""Checkpoint-backed evaluator load path + rung-5 network-policy agent (§9, M4).
 
-CPU-only, seeded. Covers the spec's Test Strategy for rung 5 (task 2): the
-distinct-weights golden (the P1 killer -- two saved checkpoints with
-known-different weights must load into evaluators that produce different
-logits *and* different chosen actions, each labeled its own
-``model_version``); rung-5 argmax against a hand-computed masked-softmax
-golden, including the lowest-id tie-break; determinism with no RNG consumed;
-one tampered-fingerprint integration case delegating to the m3 checkpoint
-battery's own tampering pattern (mismatched game, not a re-test of the whole
-battery); an end-to-end mirrored micro-Blokus pair through ``play_pairs`` +
+CPU-only, seeded. Covers the spec's Test Strategy: the distinct-weights
+golden (the P1 killer -- two saved checkpoints with known-different weights
+must load into evaluators that produce different logits *and* different
+chosen actions, each labeled its own ``model_version``); rung-5 argmax
+against a hand-computed masked-softmax golden, including the lowest-id
+tie-break; determinism with no RNG consumed; one tampered-fingerprint
+integration case delegating to the m3 checkpoint battery's own tampering
+pattern (mismatched game, not a re-test of the whole battery); an end-to-end
+mirrored micro-Blokus pair through ``play_pairs`` +
 ``games.blokus_duo.baselines.start_square_balancer`` with a rung-5 agent; and
-the reflective every-``Game``-ABC-member delegation audit for
-``core.runner._OpeningRestricted``.
-
-And for rungs 6/7's shared ``SearchAgent`` (task 3): the prior-source
-golden (rung 6 uniform vs. rung 7 softmaxed, both consuming the evaluator's
-value) and the budget-accounting proof (root edge visits sum to exactly
-``sims - 1``) via a white-box ``MCTS``-recording shim -- black-box on
-``SearchAgent`` itself, since it exposes no search-object accessor; noiseless
-determinism of both move sequences and visit counts; statelessness/binding
-(a wrapper game's opening restriction actually bites, and interleaved calls
-on unrelated states/games do not cross-contaminate); a protocol assert that
-no construction path yields root noise; and a slow-marker sanity match
-recovering minimax moves on TTT through the agent seam with a value-perfect
-stub evaluator (the M0 oracle pattern, ``tests/test_mcts_minimax.py``).
+the runner delegation audit lives in ``tests/test_runner.py``.
 """
 
 from __future__ import annotations
@@ -38,18 +25,18 @@ import torch
 import core.eval_agents as eval_agents_module
 from core import RandomAgent
 from core.artifact_fingerprint import FingerprintMismatchError
-from core.checkpoint import build_bundle, write_published_checkpoint
+from core.checkpoint import CheckpointFormatError, build_bundle, write_published_checkpoint
 from core.eval_agents import (
     EVAL_SIMS,
     NetworkPolicyAgent,
     SearchAgent,
+    SearchForm,
     load_eval_network,
     rung5_agent_factory,
     rung_search_agent_factory,
 )
-from core.game import Game
 from core.mcts import MCTS
-from core.network import Network, NetworkConfig
+from core.network import Network, NetworkConfig, make_network_evaluator
 from core.runner import _OpeningRestricted, play_pairs
 from core.train import make_optimizer, make_scaler
 from games.blokus_duo import BlokusDuo
@@ -62,6 +49,25 @@ from tests.reference.minimax import optimal_values, reachable_states
 MICRO = BlokusDuo(config=MICRO_CONFIG)
 OTHELLO = Othello()
 TTT = TicTacToe()
+
+
+def _tiny_network_config(game):
+    """A ``NetworkConfig`` matching ``game``'s declared surface, tiny trunk.
+
+    Mirrors ``tests/test_checkpoint.py``'s ``_tiny_ttt_net`` pattern (a small,
+    fast-to-build net for CPU tests) -- and, since ``core.eval_agents``
+    restores the recorded config rather than
+    ``NetworkConfig.from_game``, this deliberately non-default trunk
+    (1 block x 4 channels, vs. D5's 8x128) is exactly what proves that.
+    """
+    return NetworkConfig(
+        input_planes=game.input_planes,
+        input_shape=tuple(game.input_shape),
+        policy_shape=tuple(game.policy_shape),
+        trunk_blocks=1,
+        trunk_channels=4,
+        num_aux=len(game.value_targets.aux_names),
+    )
 
 
 class _RecordingMCTS(MCTS):
@@ -81,26 +87,20 @@ class _RecordingMCTS(MCTS):
         _RecordingMCTS.instances.append(self)
 
 
-def _tiny_network_config(game):
-    """A ``NetworkConfig`` matching ``game``'s declared surface, tiny trunk.
-
-    Mirrors ``tests/test_checkpoint.py``'s ``_tiny_ttt_net`` pattern (a small,
-    fast-to-build net for CPU tests) -- and, since ``core.eval_agents``
-    reconstructs the trunk shape from the saved weights rather than
-    ``NetworkConfig.from_game``, this deliberately non-default trunk
-    (1 block x 4 channels, vs. D5's 8x128) is exactly what proves that.
-    """
-    return NetworkConfig(
-        input_planes=game.input_planes,
-        input_shape=tuple(game.input_shape),
-        policy_shape=tuple(game.policy_shape),
-        trunk_blocks=1,
-        trunk_channels=4,
-        num_aux=len(game.value_targets.aux_names),
-    )
+def _zero_evaluator(game, state):
+    del game, state
+    return 0.0, None
 
 
-def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt"):
+@pytest.fixture
+def recording_mcts(monkeypatch):
+    _RecordingMCTS.instances.clear()
+    monkeypatch.setattr(eval_agents_module, "MCTS", _RecordingMCTS)
+    yield _RecordingMCTS.instances
+    _RecordingMCTS.instances.clear()
+
+
+def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt", return_source=False):
     """Build and publish one tiny, seeded real checkpoint for ``game``.
 
     Args:
@@ -114,7 +114,7 @@ def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt"):
             per directory but two calls may share a version number).
 
     Returns:
-        The published checkpoint's path.
+        The published checkpoint's path, plus a source evaluator when requested.
     """
     torch.manual_seed(seed)
     net = Network(_tiny_network_config(game))
@@ -130,7 +130,8 @@ def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt"):
         scaler=scaler,
         metrics={},
     )
-    return write_published_checkpoint(tmp_path / sub_dir, bundle)
+    path = write_published_checkpoint(tmp_path / sub_dir, bundle)
+    return (path, make_network_evaluator(net, game)) if return_source else path
 
 
 # --- distinct-weights golden (the P1 killer) -----------------------------------------
@@ -142,16 +143,26 @@ def test_distinct_checkpoints_load_distinct_evaluators_and_actions(tmp_path):
     model_version -- the load path actually restored the weights, not just a
     freshly initialized net wearing a borrowed version label (review P1).
     """
-    path1 = _write_checkpoint(tmp_path, MICRO, version=1, seed=1, sub_dir="ckpt1")
-    path2 = _write_checkpoint(tmp_path, MICRO, version=2, seed=2, sub_dir="ckpt2")
+    path1, source1 = _write_checkpoint(
+        tmp_path, MICRO, version=1, seed=1, sub_dir="ckpt1", return_source=True
+    )
+    path2, source2 = _write_checkpoint(
+        tmp_path, MICRO, version=2, seed=2, sub_dir="ckpt2", return_source=True
+    )
 
     ev1, mv1 = load_eval_network(path1, MICRO)
     ev2, mv2 = load_eval_network(path2, MICRO)
     assert (mv1, mv2) == (1, 2)
 
     probe = MICRO.initial_state()
-    _, priors1 = ev1(MICRO, probe)
-    _, priors2 = ev2(MICRO, probe)
+    value1, priors1 = ev1(MICRO, probe)
+    value2, priors2 = ev2(MICRO, probe)
+    expected1, reference1 = source1(MICRO, probe)
+    expected2, reference2 = source2(MICRO, probe)
+    assert value1 == pytest.approx(expected1)
+    assert value2 == pytest.approx(expected2)
+    assert priors1 == pytest.approx(reference1)
+    assert priors2 == pytest.approx(reference2)
     assert set(priors1) == set(priors2)  # same legal ids: same probe state
     assert priors1 != priors2  # different weights -> different raw logits
 
@@ -161,7 +172,8 @@ def test_distinct_checkpoints_load_distinct_evaluators_and_actions(tmp_path):
     assert agent2.name == "rung5-v1-2"
     # Pinned via an independent seed search: seed=1 opens with action 6,
     # seed=2 with action 115, on this exact tiny architecture/probe state.
-    assert agent1.select_action(MICRO, probe) != agent2.select_action(MICRO, probe)
+    assert agent1.select_action(MICRO, probe) == 6
+    assert agent2.select_action(MICRO, probe) == 115
 
 
 # --- rung-5 argmax golden, incl. lowest-id tie-break ---------------------------------
@@ -234,21 +246,7 @@ def test_load_eval_network_rejects_a_tampered_fingerprint_checkpoint(tmp_path):
     integration case rather than re-running that whole negative battery.
     """
     ttt = TicTacToe()
-    torch.manual_seed(5)
-    net = Network(_tiny_network_config(ttt))
-    optimizer = make_optimizer(net, lr=1e-2)
-    scaler = make_scaler("cpu")
-    bundle = build_bundle(
-        version=0,
-        learner_step=0,
-        game=ttt,
-        run_config={},
-        net=net,
-        optimizer=optimizer,
-        scaler=scaler,
-        metrics={},
-    )
-    path = write_published_checkpoint(tmp_path, bundle)
+    path = _write_checkpoint(tmp_path, ttt, version=0, seed=5)
 
     with pytest.raises(FingerprintMismatchError):
         load_eval_network(path, OTHELLO)
@@ -310,122 +308,105 @@ def test_rung5_agent_factory_loads_once_and_shares_across_calls(tmp_path, monkey
     )  # sharing the one loaded evaluator: identical behavior, not just identical name
 
 
-# --- reflective delegation audit: every Game ABC member -------------------------------
+@pytest.mark.parametrize("prefix", ["stem.0.", "blocks.0.", "aux_"])
+def test_load_eval_network_rejects_missing_components(tmp_path, prefix):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    payload = torch.load(path, weights_only=True)
+    original = payload["model_state_dict"]
+    payload["model_state_dict"] = {k: v for k, v in original.items() if not k.startswith(prefix)}
+    assert len(payload["model_state_dict"]) < len(original)
+    torch.save(payload, path)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        load_eval_network(path, MICRO)
 
 
-def test_opening_restricted_delegates_every_game_abc_member():
-    """Every abstract *and* concrete ``Game`` member must delegate to the
-    wrapped game unchanged (outside the deliberate initial-state opening
-    filter) -- so a future ABC addition that this test isn't updated for
-    fails loudly here (the ``declared == set(checks)`` guard below) instead
-    of silently shipping an undelegated member (as ``orientation_table_hash``/
-    ``encoding_conventions`` were before this task, since both are concrete
-    on the ABC and Python happily inherits a default for an unoverridden
-    concrete method -- no ``TypeError`` the way a missed abstract member
-    would raise)."""
-    inner = MICRO
-    wrapper = _OpeningRestricted(inner, lambda a: True)  # accept-all: no filtering effect
+@pytest.mark.parametrize("filename", ["resume.pt", "ckpt-1.pt"])
+def test_load_eval_network_rejects_resume_provenance_even_when_renamed(tmp_path, filename):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    from core.checkpoint import load_checkpoint, write_resume_snapshot
 
-    state0 = inner.initial_state()
-    a0 = min(inner.legal_moves(state0))
-    state1 = inner.apply(state0, a0)  # non-initial, nonterminal: bypasses the filter path
-    a1 = min(inner.legal_moves(state1))
-    move1 = inner.decode_action(a1)
+    snapshot = write_resume_snapshot(tmp_path / "snapshot", load_checkpoint(path, MICRO))
+    renamed = snapshot.with_name(filename)
+    snapshot.rename(renamed)
+    with pytest.raises(CheckpointFormatError, match="published checkpoint"):
+        load_eval_network(renamed, MICRO)
 
-    terminal = state0
-    while not inner.is_terminal(terminal):
-        terminal = inner.apply(terminal, min(inner.legal_moves(terminal)))
 
-    def _symmetry_groups_match(wrapped_group, inner_group):
-        # (transform, permutation) pairs: the transform is a freshly built
-        # closure on every property access (not cached), so two calls never
-        # produce `==`-equal callables even when they behave identically --
-        # compare permutations directly and transforms by their output on a
-        # real encoded state instead of by object identity.
-        sample_planes = inner.encode_state(state1)
-        if len(wrapped_group) != len(inner_group):
-            return False
-        for (t_w, perm_w), (t_i, perm_i) in zip(wrapped_group, inner_group, strict=True):
-            if tuple(perm_w) != tuple(perm_i):
-                return False
-            if t_w(sample_planes) != t_i(sample_planes):
-                return False
-        return True
+@pytest.mark.parametrize("config", [{}, {"input_planes": "4"}])
+def test_load_eval_network_rejects_malformed_architecture(tmp_path, config):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    payload = torch.load(path, weights_only=True)
+    payload["network_config"] = config
+    torch.save(payload, path)
+    with pytest.raises(CheckpointFormatError, match="network_config"):
+        load_eval_network(path, MICRO)
 
-    checks = {
-        # declared capabilities
-        "num_players": (lambda g: g.num_players, None),
-        "is_stochastic": (lambda g: g.is_stochastic, None),
-        "is_perfect_information": (lambda g: g.is_perfect_information, None),
-        "symmetry_group": (lambda g: g.symmetry_group, _symmetry_groups_match),
-        "value_targets": (lambda g: g.value_targets, None),
-        # fingerprint surface
-        "orientation_table_hash": (lambda g: g.orientation_table_hash, None),
-        "encoding_conventions": (lambda g: g.encoding_conventions, None),
-        # core contract
-        "initial_state": (lambda g: g.initial_state(), None),
-        "current_player": (lambda g: g.current_player(state1), None),
-        "legal_moves": (lambda g: list(g.legal_moves(state1)), None),
-        "apply": (lambda g: g.apply(state1, a1), None),
-        "is_terminal": (lambda g: g.is_terminal(state1), None),
-        "terminal_utility": (lambda g: g.terminal_utility(terminal, 0), None),
-        "training_targets": (lambda g: g.training_targets(terminal, 0), None),
-        # encoding surface
-        "encode_state": (lambda g: g.encode_state(state1), None),
-        "encode_action": (lambda g: g.encode_action(move1), None),
-        "decode_action": (lambda g: g.decode_action(a1), None),
-        "policy_shape": (lambda g: g.policy_shape, None),
-        "input_planes": (lambda g: g.input_planes, None),
-        "input_shape": (lambda g: g.input_shape, None),
-    }
 
-    declared = {name for name in vars(Game) if not name.startswith("_")}
-    assert declared == set(checks), (
-        f"Game ABC members missing from this delegation audit: {declared - set(checks)}; "
-        f"stale entries no longer on the ABC: {set(checks) - declared}"
-    )
+def test_checkpoint_records_architecture_independently_of_weights(tmp_path):
+    from core.checkpoint import CHECKPOINT_SCHEMA_VERSION, load_checkpoint
 
-    for name, (call, compare) in checks.items():
-        got, want = call(wrapper), call(inner)
-        if compare is None:
-            assert got == want, name
-        else:
-            assert compare(got, want), name
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    bundle = load_checkpoint(path, MICRO)
+    assert bundle.schema_version == CHECKPOINT_SCHEMA_VERSION == 2
+    assert bundle.network_config == _tiny_network_config(MICRO)
+    assert bundle.artifact_kind == "published"
+    payload = torch.load(path, weights_only=True)
+    assert isinstance(payload["network_config"], dict)
 
 
 # --- SearchAgent (rungs 6/7): identity + construction ----------------------------------
 
 
 def test_search_agent_identity_strings_and_form_validation():
-    def stub_evaluator(g, s):
-        del g, s
-        return 0.0, None
-
-    rung6 = SearchAgent(stub_evaluator, model_version=3, form=6, sims=1)
-    rung7 = SearchAgent(stub_evaluator, model_version=3, form=7, sims=1)
+    rung6 = SearchAgent(_zero_evaluator, model_version=3, form=6)
+    rung7 = SearchAgent(_zero_evaluator, model_version=3, form=7)
     assert rung6.name == "rung6-v1-3"
     assert rung7.name == "rung7-v1-3"
 
-    for bad_form in (0, 5, 8, "6"):
+    for bad_form in (0, 5, 8, "6", 6.0, 7.0, True, None):
         with pytest.raises(ValueError):
-            SearchAgent(stub_evaluator, model_version=1, form=bad_form)
+            SearchAgent(_zero_evaluator, model_version=1, form=bad_form)
 
 
 def test_search_agent_defaults_to_the_pinned_eval_sims_budget():
     # EVAL_SIMS is the frozen v1 budget -- the constructor must default to it
     # rather than silently require callers to pass it.
-    def stub_evaluator(g, s):
-        del g, s
-        return 0.0, None
-
-    agent = SearchAgent(stub_evaluator, model_version=1, form=7)
+    agent = SearchAgent(_zero_evaluator, model_version=1, form=7)
     assert agent._sims == EVAL_SIMS == 512
+
+
+@pytest.mark.parametrize("form", [6, 7, SearchForm.UNIFORM_VALUE, SearchForm.POLICY_VALUE])
+@pytest.mark.parametrize("sims", [2, 4, 37, 64, 512])
+def test_search_budget_is_part_of_identity(form, sims):
+    agent = SearchAgent(_zero_evaluator, model_version=9, form=form, sims=sims)
+    rung = SearchForm.parse(form).value
+    budget = "" if sims == 512 else f"-s{sims}"
+    assert agent.name == f"rung{rung}-v1{budget}-9"
+
+
+@pytest.mark.parametrize("sims", [-1, 0, 1, 2.0, True, "512", None])
+def test_search_rejects_invalid_budgets_before_loading(sims, monkeypatch):
+    with pytest.raises(ValueError, match="sims"):
+        SearchAgent(_zero_evaluator, 1, form=7, sims=sims)
+
+    def unexpected_load(*args):
+        pytest.fail("invalid search configuration must fail before checkpoint IO")
+
+    monkeypatch.setattr(eval_agents_module, "load_eval_network", unexpected_load)
+    with pytest.raises(ValueError, match="sims"):
+        rung_search_agent_factory("unused.pt", TTT, 7, sims=sims)
+
+
+@pytest.mark.parametrize("form", [6.0, 7.0, "6", True, 8])
+def test_search_factory_rejects_invalid_forms_before_loading(form):
+    with pytest.raises(ValueError, match="form"):
+        rung_search_agent_factory("unused.pt", TTT, form)
 
 
 # --- prior-source golden: rung 6 uniform, rung 7 softmax, both consume value ------------
 
 
-def test_prior_source_golden_rung6_uniform_rung7_softmax_both_consume_value(monkeypatch):
+def test_prior_source_golden_rung6_uniform_rung7_softmax_both_consume_value(recording_mcts):
     state = TTT.initial_state()
     legal = list(TTT.legal_moves(state))
     logits = {a: float(i) for i, a in enumerate(legal)}  # strictly increasing: distinguishable
@@ -434,9 +415,6 @@ def test_prior_source_golden_rung6_uniform_rung7_softmax_both_consume_value(monk
     def stub_evaluator(g, s):
         calls.append(s)
         return 0.6, dict(logits)
-
-    monkeypatch.setattr(eval_agents_module, "MCTS", _RecordingMCTS)
-    _RecordingMCTS.instances.clear()
 
     agent6 = SearchAgent(stub_evaluator, model_version=1, form=6, sims=5)
     agent7 = SearchAgent(stub_evaluator, model_version=1, form=7, sims=5)
@@ -473,7 +451,8 @@ def test_prior_source_golden_rung6_uniform_rung7_softmax_both_consume_value(monk
 # --- budget accounting (the P2 regression) ----------------------------------------------
 
 
-def test_root_edge_visits_sum_to_sims_minus_one(monkeypatch):
+@pytest.mark.parametrize("sims", [2, 37, EVAL_SIMS])
+def test_root_edge_visits_sum_to_sims_minus_one(recording_mcts, sims):
     """After one move, the root's edge visits sum to exactly sims - 1: the
     first simulation only expands the root itself (M0 accounting -- no edge
     on its path), so the remaining sims-1 each add exactly one visit to some
@@ -482,15 +461,7 @@ def test_root_edge_visits_sum_to_sims_minus_one(monkeypatch):
     n_sims - 1``), so this proves SearchAgent actually ran the pinned budget
     end to end, not merely that the invariant holds on MCTS in isolation."""
 
-    def stub_evaluator(g, s):
-        del g, s
-        return 0.0, None
-
-    monkeypatch.setattr(eval_agents_module, "MCTS", _RecordingMCTS)
-    _RecordingMCTS.instances.clear()
-
-    sims = 37
-    agent = SearchAgent(stub_evaluator, model_version=1, form=7, sims=sims)
+    agent = SearchAgent(_zero_evaluator, model_version=1, form=7, sims=sims)
     agent.select_action(TTT, TTT.initial_state())
 
     assert len(_RecordingMCTS.instances) == 1
@@ -501,9 +472,8 @@ def test_root_edge_visits_sum_to_sims_minus_one(monkeypatch):
 # --- noiseless determinism --------------------------------------------------------------
 
 
-def test_noiseless_determinism_identical_sequences_and_visit_counts(tmp_path, monkeypatch):
+def test_noiseless_determinism_identical_sequences_and_visit_counts(tmp_path, recording_mcts):
     path = _write_checkpoint(tmp_path, MICRO, version=1, seed=21)
-    monkeypatch.setattr(eval_agents_module, "MCTS", _RecordingMCTS)
 
     def _play_out(agent):
         _RecordingMCTS.instances.clear()
@@ -538,15 +508,11 @@ def test_select_action_binds_to_the_passed_game_not_a_captured_one():
     call, never a game captured at construction (SearchAgent is built with no
     game at all)."""
 
-    def stub_evaluator(g, s):
-        del g, s
-        return 0.0, None
-
     state0 = MICRO.initial_state()
     restricted_ids = set(list(MICRO.legal_moves(state0))[:3])
     wrapped = _OpeningRestricted(MICRO, restricted_ids.__contains__)
 
-    agent = SearchAgent(stub_evaluator, model_version=1, form=7, sims=8)
+    agent = SearchAgent(_zero_evaluator, model_version=1, form=7, sims=8)
     action = agent.select_action(wrapped, state0)
     assert action in restricted_ids
 
@@ -556,15 +522,11 @@ def test_interleaved_calls_on_unrelated_states_do_not_cross_contaminate():
     games/states, must return the same move for the same (game, state) every
     time -- no leftover tree, evaluator cache, or other cross-call state."""
 
-    def stub_evaluator(g, s):
-        del g, s
-        return 0.0, None
-
     ttt_s0 = TTT.initial_state()
     ttt_s1 = TTT.apply(ttt_s0, min(TTT.legal_moves(ttt_s0)))
     micro_s0 = MICRO.initial_state()
 
-    agent = SearchAgent(stub_evaluator, model_version=1, form=7, sims=8)
+    agent = SearchAgent(_zero_evaluator, model_version=1, form=7, sims=8)
     results = {"ttt_s0": set(), "ttt_s1": set(), "micro_s0": set()}
     for _ in range(3):
         results["ttt_s0"].add(agent.select_action(TTT, ttt_s0))
@@ -578,13 +540,10 @@ def test_interleaved_calls_on_unrelated_states_do_not_cross_contaminate():
 # --- protocol assert: no construction path yields root noise ---------------------------
 
 
-def test_no_construction_path_yields_root_noise_enabled(monkeypatch):
+def test_no_construction_path_yields_root_noise_enabled(recording_mcts):
     def stub_evaluator(g, s):
         del s
         return 0.0, {a: float(a) for a in g.legal_moves(TTT.initial_state())}
-
-    monkeypatch.setattr(eval_agents_module, "MCTS", _RecordingMCTS)
-    _RecordingMCTS.instances.clear()
 
     for form in (6, 7):
         SearchAgent(stub_evaluator, model_version=1, form=form, sims=4).select_action(
@@ -620,12 +579,13 @@ def test_rung_search_agent_factory_loads_once_and_builds_the_requested_form(tmp_
     agent_a = factory6(seed=0)
     agent_b = factory6(seed=999)  # seed accepted (AgentFactory shape), unused
     assert len(calls) == 1  # building an agent per game must not reload
-    assert agent_a.name == agent_b.name == "rung6-v1-4"
+    assert agent_a.name == agent_b.name == "rung6-v1-s4-4"
     assert agent_a is not agent_b
 
     factory7 = rung_search_agent_factory(path, MICRO, form=7, sims=4)
     agent7 = factory7(seed=0)
-    assert agent7.name == "rung7-v1-4"
+    assert agent7.name == "rung7-v1-s4-4"
+    assert rung_search_agent_factory(path, MICRO, form=7)(0).name == "rung7-v1-4"
 
 
 # --- slow-marker sanity: recovers minimax moves through the agent seam -----------------

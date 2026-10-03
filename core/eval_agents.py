@@ -5,7 +5,7 @@ pyproject confinement pin; ``core/agents.py`` stays pure stdlib and torch-free,
 so :class:`NetworkPolicyAgent` sits beside the load path it depends on rather
 than beside ``RandomAgent``/``MobilityAgent``.
 
-Every network rung (5, and 6/7's shared ``SearchAgent``) stands on the same
+Every network rung (5 here; 6/7 at a later task) stands on the same
 load-bearing seam: reconstruct a published checkpoint's *exact* trained
 architecture, restore its weights, validate its fingerprint, and wrap it as an
 MCTS :data:`~core.mcts.Evaluator` — never a freshly initialized net wearing a
@@ -20,40 +20,21 @@ checkpoint. :func:`load_eval_network` makes that step explicit and
 un-skippable, and ``tests/test_eval_agents.py``'s distinct-weights golden
 proves the weights actually moved.
 
-**Reconstructing the architecture without a stored ``NetworkConfig`` field.**
-``core.checkpoint.CheckpointBundle`` bundles ``run_config`` (``RunConfig``, no
-network-shape fields — see ``core/runconfig.py``'s ``TrainingConfig``) and
-``model_state_dict``, but no explicit ``NetworkConfig``: a real training run
-always builds via ``NetworkConfig.from_game(game)`` and never persists the
-trunk width/depth it chose. Re-deriving via ``from_game`` here would silently
-assume every checkpoint used the D5 default trunk (8 blocks × 128 channels) —
-correct for production checkpoints, but exactly the "config the checkpoint
-did *not* actually train with" for any other trunk size (small test
-checkpoints included), and `` load_state_dict(strict=True)`` would then raise
-on the first shape mismatch instead of loading. So the trunk width/depth
-(and whether an aux head exists) are read directly off the persisted
-``model_state_dict`` tensors — the one artifact that cannot drift from what
-was actually trained — while the game-shape fields (``input_planes``,
-``input_shape``, ``policy_shape``) come from ``game``, already pinned equal to
-the checkpoint's by :func:`~core.checkpoint.load_checkpoint`'s fingerprint
-compare. This is the literal reading of "the checkpoint is the authority on
-the architecture it trained," not a re-derivation of D5 defaults.
+Architecture metadata is recorded independently of the weights in checkpoint
+schema v2. Strict loading rejects missing components as well as individual keys.
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
 
 from core.agents import Agent
-from core.checkpoint import CheckpointBundle, load_checkpoint
+from core.checkpoint import CheckpointFormatError, load_checkpoint
 from core.game import Action, Game, State
 from core.mcts import MCTS, Evaluator
-from core.network import Network, NetworkConfig, make_network_evaluator
+from core.network import Network, make_network_evaluator
 from core.runner import AgentFactory
-
-_STEM_CONV_WEIGHT = "stem.0.weight"
-_AUX_FC_WEIGHT = "aux_fc.weight"
-_BLOCK_KEY_PREFIX = "blocks."
 
 #: Ladder rung 6/7 eval search-form simulation budget — design doc §9's
 #: "Pre-registered protocol (M4 pins)" block, pin 4: "Rung-6/7 eval sim
@@ -67,73 +48,6 @@ _BLOCK_KEY_PREFIX = "blocks."
 EVAL_SIMS = 512
 
 
-def _trunk_shape_from_state_dict(state_dict: dict) -> tuple[int, int]:
-    """Read ``(trunk_blocks, trunk_channels)`` off a saved ``model_state_dict``.
-
-    The stem conv's output channel count is the trunk width directly
-    (``core.network.Network.__init__``'s ``stem`` is
-    ``Conv2d(input_planes, trunk_channels, ...)``); the trunk depth is the
-    count of distinct residual-block indices present in the flat state-dict
-    keys (``blocks.<i>.conv1.weight`` etc., one index per
-    ``core.network.ResidualBlock``).
-
-    Args:
-        state_dict: A ``Network.state_dict()``-shaped mapping (bundle
-            ``model_state_dict``).
-
-    Returns:
-        ``(trunk_blocks, trunk_channels)``.
-    """
-    trunk_channels = int(state_dict[_STEM_CONV_WEIGHT].shape[0])
-    block_indices = {key.split(".")[1] for key in state_dict if key.startswith(_BLOCK_KEY_PREFIX)}
-    trunk_blocks = len(block_indices)
-    return trunk_blocks, trunk_channels
-
-
-def _num_aux_from_state_dict(state_dict: dict) -> int:
-    """Read the declared aux-head width off a saved ``model_state_dict``.
-
-    Args:
-        state_dict: A ``Network.state_dict()``-shaped mapping.
-
-    Returns:
-        ``aux_fc.weight``'s output width if the key is present (an aux head
-        was built), else ``0`` (``core.network.Network`` builds no aux
-        parameters at all when ``num_aux == 0`` — the pinned "absent"
-        convention, mirrored here).
-    """
-    if _AUX_FC_WEIGHT not in state_dict:
-        return 0
-    return int(state_dict[_AUX_FC_WEIGHT].shape[0])
-
-
-def _network_config_from_bundle(bundle: CheckpointBundle, game: Game) -> NetworkConfig:
-    """Reconstruct the exact trained :class:`~core.network.NetworkConfig`.
-
-    See the module docstring for why this reads the trunk shape off the
-    persisted weights rather than calling ``NetworkConfig.from_game(game)``.
-
-    Args:
-        bundle: A fingerprint-validated bundle
-            (:func:`~core.checkpoint.load_checkpoint`'s return).
-        game: The adapter the bundle was validated against — its declared
-            ``input_planes``/``input_shape``/``policy_shape`` are already
-            pinned equal to the checkpoint's by that validation.
-
-    Returns:
-        The config that reproduces the checkpoint's exact tensor shapes.
-    """
-    trunk_blocks, trunk_channels = _trunk_shape_from_state_dict(bundle.model_state_dict)
-    return NetworkConfig(
-        input_planes=game.input_planes,
-        input_shape=tuple(game.input_shape),
-        policy_shape=tuple(game.policy_shape),
-        trunk_blocks=trunk_blocks,
-        trunk_channels=trunk_channels,
-        num_aux=_num_aux_from_state_dict(bundle.model_state_dict),
-    )
-
-
 def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tuple[Evaluator, int]:
     """Load a published checkpoint into a ready-to-search MCTS evaluator.
 
@@ -143,10 +57,9 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
        compares the full artifact fingerprint (orientation hash included)
        against ``game``'s live one and fails loudly on any disagreement.
        This function never re-does that validation.
-    2. Rebuild the network architecture from the bundle's persisted weights
-       (:func:`_network_config_from_bundle`) — never ``NetworkConfig.from_game``
-       defaults: the checkpoint is the authority on the architecture it
-       trained.
+    2. Rebuild the network architecture from the bundle's recorded config,
+       never ``NetworkConfig.from_game`` defaults: the checkpoint records
+       the architecture it trained.
     3. ``net.load_state_dict(bundle.model_state_dict, strict=True)`` — strict,
        so any key or shape drift between the rebuilt architecture and the
        stored weights raises immediately instead of silently dropping or
@@ -162,7 +75,7 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
 
     Args:
         path: The checkpoint file to load (a published ``ckpt-<version>.pt``
-            or the rolling ``resume.pt`` — see ``core.checkpoint``).
+            — resume snapshots are rejected, including renamed copies).
         game: The adapter this checkpoint was trained against — validated by
             ``load_checkpoint`` before anything else here runs, and reused as
             the evaluator's factory-validated pairing.
@@ -184,8 +97,11 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
             (``load_state_dict(strict=True)``).
     """
     bundle = load_checkpoint(path, game)  # step 1: fingerprint validated or raised
-    config = _network_config_from_bundle(bundle, game)  # step 2: from the bundle, not from_game
-    net = Network(config)
+    if bundle.artifact_kind != "published":
+        raise CheckpointFormatError(
+            "evaluation requires a published checkpoint, not a resume snapshot"
+        )
+    net = Network(bundle.network_config)  # architecture is independent of the weights
     net.load_state_dict(bundle.model_state_dict, strict=True)  # step 3: strict restore
     evaluator = make_network_evaluator(net, game, device)  # step 4: device/eval/guard
     return evaluator, bundle.version  # step 5
@@ -260,6 +176,34 @@ def rung5_agent_factory(path: Path | str, game: Game, device: str = "cpu") -> Ag
     return factory
 
 
+class SearchForm(Enum):
+    """The two network-backed evaluation search forms."""
+
+    UNIFORM_VALUE = 6
+    POLICY_VALUE = 7
+
+    @property
+    def uniform_prior(self) -> bool:
+        return self is SearchForm.UNIFORM_VALUE
+
+    def identity(self, model_version: int, sims: int) -> str:
+        budget = "" if sims == EVAL_SIMS else f"-s{sims}"
+        return f"rung{self.value}-v1{budget}-{model_version}"
+
+    @classmethod
+    def parse(cls, form: SearchForm | int) -> SearchForm:
+        if isinstance(form, cls):
+            return form
+        if type(form) is not int or form not in (6, 7):
+            raise ValueError(f"form must be SearchForm or integer 6 or 7, got {form!r}")
+        return cls(form)
+
+
+def _validate_search_budget(sims: int) -> None:
+    if type(sims) is not int or sims < 2:
+        raise ValueError(f"sims must be an integer >= 2, got {sims!r}")
+
+
 class SearchAgent(Agent):
     """Ladder rungs 6 and 7: fresh deterministic MCTS search, argmax-N (§9).
 
@@ -281,8 +225,8 @@ class SearchAgent(Agent):
        iff this is a rung-6 agent; ``root_noise`` is always ``None`` — the D7
        hook's default leaves search bit-identical to the noiseless engine,
        so self-play-only exploration noise can never leak into eval.
-    2. ``mcts.run(self._sims, root_state=state)`` — exactly the pinned
-       budget executes, no more, no fewer.
+    2. ``mcts.run(self._sims, root_state=state)`` — exactly the budget
+       encoded in the identity executes, no more, no fewer.
     3. Return ``mcts.best_action()`` — argmax N, ties to the lowest action
        id, **no RNG** — never ``MCTS.select_action``'s temperature/rng
        sampling path, whose ``rng`` parameter this class never supplies.
@@ -302,7 +246,9 @@ class SearchAgent(Agent):
     concern, outside this form definition.
 
     **Identity is form-versioned (review S3):** ``name`` is
-    ``f"rung6-v1-{model_version}"`` or ``f"rung7-v1-{model_version}"``. The
+    ``f"rung6-v1-{model_version}"`` or ``f"rung7-v1-{model_version}"``
+    only at S=512. Explicit alternate budgets use ``-s<S>`` before the
+    model version and are separate experimental identities. The pinned
     ``v1`` constants — frozen together, never edited independently — are:
     the M0 engine at its D11 defaults (``c_init=1.25``, ``c_base=19652``,
     first-play-urgency ``Q=0``), the pinned sim budget :data:`EVAL_SIMS`,
@@ -321,12 +267,13 @@ class SearchAgent(Agent):
         form: ``6`` for uniform-prior MCTS with network value, ``7`` for
             full policy-and-value MCTS.
         sims: Simulations per move (default :data:`EVAL_SIMS`, the pinned
-            ``v1`` budget). Overridable for tests only — a real evaluation
-            run must use the default so every checkpoint is scored at the
-            same frozen budget.
+            ``v1`` budget). Other budgets receive a distinct ``-s<S>``
+            identity suffix, e.g. ``rung7-v1-s64-3``, and cannot alias the
+            pinned evaluation form. At least two simulations are required:
+            the first expands the root, the second visits a root edge.
 
     Raises:
-        ValueError: If ``form`` is not ``6`` or ``7``.
+        ValueError: If the form is invalid or sims is not an integer >= 2.
     """
 
     def __init__(
@@ -334,15 +281,15 @@ class SearchAgent(Agent):
         evaluator: Evaluator,
         model_version: int,
         *,
-        form: int,
+        form: SearchForm | int,
         sims: int = EVAL_SIMS,
     ):
-        if form not in (6, 7):
-            raise ValueError(f"form must be 6 or 7, got {form}")
+        form = SearchForm.parse(form)
+        _validate_search_budget(sims)
         self._evaluator = evaluator
-        self._uniform_prior = form == 6
+        self._uniform_prior = form.uniform_prior
         self._sims = sims
-        self._name = f"rung{form}-v1-{model_version}"
+        self._name = form.identity(model_version, sims)
 
     @property
     def name(self) -> str:
@@ -362,7 +309,7 @@ class SearchAgent(Agent):
 def rung_search_agent_factory(
     path: Path | str,
     game: Game,
-    form: int,
+    form: SearchForm | int,
     device: str = "cpu",
     sims: int = EVAL_SIMS,
 ) -> AgentFactory:
@@ -392,11 +339,11 @@ def rung_search_agent_factory(
         evaluator loaded above.
 
     Raises:
-        ValueError: If ``form`` is not ``6`` or ``7`` — raised by
-            :class:`SearchAgent` the first time the returned factory is
-            called, not by this function itself (the checkpoint load above
-            has no dependency on ``form``).
+        ValueError: If the form is invalid or sims is not an integer >= 2,
+            before loading the checkpoint.
     """
+    form = SearchForm.parse(form)
+    _validate_search_budget(sims)
     evaluator, model_version = load_eval_network(path, game, device)
 
     def factory(seed: int) -> SearchAgent:
