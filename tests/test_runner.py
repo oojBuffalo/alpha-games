@@ -198,6 +198,8 @@ def test_play_pairs_rejects_a_negative_start_pair_index():
 
     with pytest.raises(ValueError):
         play_pairs(GAME, rand, rand, n_pairs=1, seed=0, start_pair_index=-1)
+
+
 # --- reflective delegation audit: every Game ABC member -------------------------------
 
 

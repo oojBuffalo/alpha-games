@@ -80,17 +80,11 @@ def elo_curve_path(run_dir: Path | str) -> Path:
 def snapshot_matches(snapshot: EvalSnapshot) -> list[Match]:
     """Aggregate an eval snapshot's in-scope cells into ``core.elo.Match`` aggregates.
 
-    Reads every cell the snapshot marks complete (``core.eval_store.iter_cells``)
-    but keeps only those belonging to the snapshot's *complete contiguous member
-    prefix* (``snapshot.member_prefix``): a completed cell whose candidate version
-    sits beyond that prefix is real evidence for a not-yet-fully-scored member
-    (``EvalSnapshot.completed_cell_ids``'s own docstring notes such cells are
-    visible there -- "per-checkpoint live reporting reads this set directly" --
-    precisely because they sit *outside* the contiguous prefix), so it is excluded
-    here rather than silently admitted into the §1 point estimate -- the "never
-    partial data" analysis-snapshot convention this task's fit is pinned to. A
-    cell that is merely scheduled (never completed at all) is already structurally
-    absent from the snapshot and never reaches this function in the first place.
+    Reads the snapshot's complete contiguous member prefix via
+    ``core.eval_store.iter_cells``. Completed evidence beyond that prefix
+    remains available through ``snapshot.evidence_cell_ids`` for live
+    reporting, but is excluded from the analysis snapshot's fit. Cells that
+    are merely scheduled are structurally absent from the snapshot.
 
     Args:
         snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
@@ -105,8 +99,6 @@ def snapshot_matches(snapshot: EvalSnapshot) -> list[Match]:
     matches: list[Match] = []
     for path in iter_cells(snapshot):
         header, records = read_cell(path)
-        if header.cell_id.candidate_version > snapshot.member_prefix:
-            continue
         matches.append(
             records_to_match(header.candidate_identity, header.opponent_identity, records)
         )

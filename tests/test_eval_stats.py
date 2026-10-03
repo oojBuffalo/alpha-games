@@ -52,6 +52,7 @@ from core.observability import (
     segment_end_record,
     segment_start_record,
 )
+from core.seeding import derive_seed
 
 # ---------------------------------------------------------------------------------
 # Fixture helpers -- a minimal, self-contained eval-store builder (mirrors
@@ -63,6 +64,7 @@ from core.observability import (
 def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int):
     return build_header(
         run_id="run",
+        cell_seed=0,
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=f"rung{rung}-v1-{candidate_version}",
         opponent_identity=opponent_id,
@@ -74,7 +76,7 @@ def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int
 def _pair_record(pair_index: int, score_a: float) -> PairRecord:
     return PairRecord(
         pair_index=pair_index,
-        pair_seed=pair_index,
+        pair_seed=derive_seed(0, "pair", pair_index),
         score_a=score_a,
         games=(GameRecordSnapshot(plies=1, opening=0), GameRecordSnapshot(plies=1, opening=0)),
     )
