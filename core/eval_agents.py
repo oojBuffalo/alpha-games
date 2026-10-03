@@ -39,6 +39,7 @@ from core.checkpoint import (
     load_checkpoint,
     published_checkpoint_path,
 )
+from core.eval_protocol import RUNG8_EARLIEST_VERSION, RUNG8_LAG_DIVISOR
 from core.game import Action, Game, State
 from core.mcts import MCTS, Evaluator
 from core.network import Network, make_network_evaluator
@@ -368,17 +369,50 @@ def rung_search_agent_factory(
     return factory
 
 
-def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: int) -> list[int]:
-    """Select the historical set pinned by design doc §9, pin 5.
+# --- rung 8: historical checkpoints as frozen opponents (§9, §12 M4) -------------------
+#
+# Not a new agent form -- a scheduling category over the rung-7 form above.
+# A historical opponent for candidate checkpoint v is exactly
+# SearchAgent(form=7) built from an older ckpt-<u>.pt, so its identity stays
+# f"rung7-v1-{u}" whether u was ever itself a candidate or only ever appears
+# as an opponent: core.elo.fit_elo's canonical-key matchup collapsing then
+# links the whole checkpoint sequence into one connected Bradley-Terry graph
+# without this module doing anything Elo-specific at all. Historical
+# opponents are frozen by construction (immutable ckpt-<u>.pt files, plus
+# SearchAgent's own frozen-v1-form discipline) -- no re-rating of past games,
+# and no re-rating machinery is built here.
+
+
+def historical_opponents(
+    versions: Sequence[int],
+    candidate: int,
+    *,
+    k_total: int,
+    lag_divisor: int = RUNG8_LAG_DIVISOR,
+    earliest: int = RUNG8_EARLIEST_VERSION,
+) -> list[int]:
+    """Select rung-8 historical-opponent versions for one candidate checkpoint.
 
     Return ``{v - 1, v - ceil(K/4), 1}``, intersected with available versions
     in ``[1, v - 1]``, deduplicated and ascending. The keyword-only ``k_total``
     fixes the lag across a growing prefix of published checkpoints.
 
     Args:
-        versions: Available member checkpoint ids, each in ``1..K``.
-        candidate: Member id in ``1..K`` that must appear in ``versions``.
-        k_total: The run's fixed total checkpoint count ``K``.
+        versions: The run's member versions actually available, in any
+            order. Every element must be ``>= 1``; v0 or any other
+            non-member id is a domain violation, not silently dropped.
+        candidate: The checkpoint version being evaluated. Must appear in
+            ``versions``.
+        lag_divisor: Positive divisor for the historical lag; production uses 4.
+        earliest: Always-included historical member; production uses 1.
+        k_total: The run's total, fixed checkpoint count ``K``, used to
+            compute the ``ceil(K/4)`` lag (see above for why this is never
+            derived from ``versions``).
+
+    Returns:
+        The selected opponent versions: ascending, deduplicated, never
+        ``candidate`` itself, and never a version outside
+        ``[1, candidate - 1]`` or outside ``versions``.
 
     Raises:
         ValueError: If ``K < 1``, any id lies outside ``1..K``, or the
@@ -398,8 +432,10 @@ def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: in
         raise ValueError(
             f"candidate {candidate} is not a member of the supplied versions {sorted(versions)}"
         )
-    lag = math.ceil(k_total / 4)
-    wanted = {candidate - 1, candidate - lag, 1}
+    if lag_divisor < 1 or earliest < 1:
+        raise ValueError("lag_divisor and earliest must be positive")
+    lag = math.ceil(k_total / lag_divisor)
+    wanted = {candidate - 1, candidate - lag, earliest}
     available = set(versions)
     return sorted(u for u in wanted if 1 <= u < candidate and u in available)
 
