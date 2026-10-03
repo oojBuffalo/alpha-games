@@ -50,7 +50,7 @@ def test_rung8_rule_examples(vp):
 def test_form7_cell_counts(vp):
     """The rung-7 form's own evidence: 4 rung cells plus ≤3 rung-8 cells."""
     cells = {name: len(opps) for name, _, opps in vp.SCENARIOS}
-    assert cells == {"early": 4, "mid": 7, "late": 7}
+    assert cells == {"early": 4, "mid": 7, "late": 7, "plateau-late": 7}
     assert 24 * min(cells.values()) == 96 and 24 * max(cells.values()) == 168
 
 
