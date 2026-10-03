@@ -688,7 +688,7 @@ def test_iter_cells_yields_every_completed_cell_in_sorted_order(tmp_path):
 def test_form_versions_and_search_budgets_have_distinct_cell_paths():
     cells = [
         CellId(12, 7, "random"),
-        CellId(12, 7, "random", 2),
+        CellId(12, 7, "random", full_candidate_identity="rung7-v2-12"),
         CellId(12, 7, "random", full_candidate_identity="rung7-v1-s64-12"),
     ]
     assert len({cell.to_string() for cell in cells}) == 3
@@ -834,3 +834,16 @@ def test_post_hole_completion_leaves_prefix_fingerprint_and_iterator_unchanged(t
     assert after.completed_cell_ids != before.completed_cell_ids
     assert after.snapshot_fingerprint == before.snapshot_fingerprint
     assert list(iter_cells(after)) == list(iter_cells(before))
+
+
+def test_legacy_schema_rejected_before_missing_seed_parse(tmp_path):
+    header = _make_header()
+    path = _fill_cell(tmp_path, header, 0)
+    payload = header.to_dict()
+    payload["schema_version"] = 1
+    del payload["cell_seed"]
+    path.write_text(json.dumps(payload) + "\n")
+    with pytest.raises(SchemaVersionError):
+        read_cell(path)
+    with pytest.raises(SchemaVersionError):
+        open_cell_for_resume(path, header)
