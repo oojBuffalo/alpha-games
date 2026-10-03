@@ -1760,3 +1760,12 @@ def test_liveness_missing_publish_markers_cannot_pass_bound(tmp_path):
     assert report["lag_samples_complete"] is False
     assert report["lag_breached"] is None
     assert report["lag_bound_met"] is None
+
+
+def test_checkpoint_observation_alone_cannot_certify_publish_time_bound(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    _write_scored_member(tmp_path, 1, [1.0])
+    report = eval_run.build_liveness_report(tmp_path)
+    assert report["caught_up"] is True
+    assert report["lag_bound_met"] is None
+    assert report["lag_samples_complete"] is False

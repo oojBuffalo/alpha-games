@@ -1279,7 +1279,9 @@ class _LivenessMonitor:
             breached |= consecutive >= LIVENESS_BREACH_CONSECUTIVE
         training_complete = self.k_total in schedulable_versions(self.run_dir, self.k_total)
         final_lag = eval_lag(self.run_dir, self.k_total)
-        samples_complete = self.seen == set(range(1, self.k_total + 1))
+        samples_complete = self.seen == set(range(1, self.k_total + 1)) and all(
+            sample.get("source") == "publish_marker" for sample in self.samples
+        )
         payload = {
             "constants": {
                 "max_lag": LIVENESS_MAX_LAG,
