@@ -59,6 +59,11 @@ def test_form7_cell_counts(vp):
     assert (24 * min(cells), 24 * max(cells)) == (168, 792)
 
 
+def test_illustrative_subset_scenario_counts(vp):
+    cells = {name: len(opps) for name, _, opps in vp.SCENARIOS}
+    assert cells == {"early": 4, "mid": 7, "late": 7, "plateau-late": 7}
+
+
 def test_analytic_delta_half_width_band(vp):
     """Pin 1's illustrative subset Δ half-width: ≈27 Elo at 24 pairs, ≈39 at 12, ≈19 at 48."""
     hw = {

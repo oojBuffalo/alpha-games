@@ -21,8 +21,7 @@ additive only. Nothing here is ever edited in place to change a *value*; a genui
 value change is a new ``PROTOCOL_VERSION`` and, per the design doc, a new eval
 namespace (the relaunch guard in a later task refuses to mix evidence across one).
 
-The design-doc amendment is an ancestor of this branch; the doc golden requires
-its section-9 pin block to exist.
+The committed design doc §9 and §12 are checked against this registry by tests.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ from typing import Any
 #: deliberately alongside a doc amendment that changes a covered convention's value --
 #: distinct from :func:`protocol_fingerprint`, which changes automatically on *any*
 #: registry drift regardless of whether this constant was remembered to move too.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 #: Cell-header / pair-record on-disk shape version (independent axis from
 #: ``PROTOCOL_VERSION``: the record *shape* a reader must recognize can move
@@ -110,6 +109,19 @@ BOOTSTRAP_B_ADMISSIBLE_REMAINDER = 39
 BOOTSTRAP_CI_LOWER_QUANTILE = 0.025
 BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
 
+# --- profiled-plateau rule constants (design doc §12 M4) -------------------------
+# Changing any pin requires a protocol version and eval namespace change.
+PLATEAU_WINDOW_M = 16
+PLATEAU_MK_ALPHA = 0.05
+PLATEAU_HALF_WINDOW_RULE = "ceil(M/2)"
+#: Precision gate: CI width must be strictly below this threshold.
+PLATEAU_CI_WIDTH_THRESHOLD_ELO = 150.0
+#: Location gate: both endpoints must lie strictly inside (-margin, +margin).
+PLATEAU_EQUIVALENCE_MARGIN_ELO = 75.0
+PLATEAU_GPU_HOURS_MIN = 8.0
+#: Persistence across overlapping snapshots, not independent statistical evidence.
+PLATEAU_CONFIRMATION_COUNT = 2
+
 # Statistical and evidence conventions covered by section 9, pins 7-10.
 DELTA_WINDOW_DIVISOR = 3
 DELTA_GATE_THRESHOLD = 0.0
@@ -160,6 +172,13 @@ REGISTRY: dict[str, Any] = {
     "bootstrap_b_admissible_remainder": BOOTSTRAP_B_ADMISSIBLE_REMAINDER,
     "bootstrap_ci_lower_quantile": BOOTSTRAP_CI_LOWER_QUANTILE,
     "bootstrap_ci_upper_quantile": BOOTSTRAP_CI_UPPER_QUANTILE,
+    "plateau_window_m": PLATEAU_WINDOW_M,
+    "plateau_mk_alpha": PLATEAU_MK_ALPHA,
+    "plateau_half_window_rule": PLATEAU_HALF_WINDOW_RULE,
+    "plateau_ci_width_threshold_elo": PLATEAU_CI_WIDTH_THRESHOLD_ELO,
+    "plateau_equivalence_margin_elo": PLATEAU_EQUIVALENCE_MARGIN_ELO,
+    "plateau_gpu_hours_min": PLATEAU_GPU_HOURS_MIN,
+    "plateau_confirmation_count": PLATEAU_CONFIRMATION_COUNT,
 }
 
 
