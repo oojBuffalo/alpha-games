@@ -58,6 +58,8 @@ SEED_LABEL_SEAT_B = "b"
 #: PURPOSE_EVAL, cell_id)``). Recorded here so the two sides are pinned against one
 #: source rather than a literal someone has to keep in sync by memory.
 SEED_LABEL_EVAL = "eval"
+SEED_LABEL_BOOTSTRAP = "bootstrap"
+SEED_LABEL_REPLICATE = "replicate"
 
 # --- pinned eval constants (tasks/m4/001) -----------------------------------------
 
@@ -119,6 +121,29 @@ PLATEAU_GPU_HOURS_MIN = 8.0
 #: Persistence across overlapping snapshots, not independent statistical evidence.
 PLATEAU_CONFIRMATION_COUNT = 2
 
+# Statistical and evidence conventions covered by section 9, pins 7-10.
+DELTA_WINDOW_DIVISOR = 3
+DELTA_GATE_THRESHOLD = 0.0
+MK_MIN_OBSERVATIONS = 3
+VIRTUAL_DRAW_SCORE = 0.5
+VIRTUAL_DRAW_GAMES = 1
+STATISTICAL_CONVENTIONS = {
+    "bootstrap_resampling": "within-cell-paired-records-with-replacement",
+    "bootstrap_fit": "joint-refit-each-replicate-warm-started",
+    "bootstrap_iteration_order": "sorted-cell-id-then-stored-record-order",
+    "delta_window_rounding": "ceiling",
+    "delta_gate_comparison": "lower-ci-strictly-greater-than-threshold",
+    "mann_kendall_variance": "tie-corrected",
+    "mann_kendall_continuity": "subtract-sign-s",
+    "mann_kendall_p": "two-sided-normal",
+    "mann_kendall_insufficient": "s-z-p-null",
+    "mann_kendall_zero_variance": "s=0,z=0,p=1",
+    "snapshot_scope": "complete-contiguous-member-prefix-only",
+    "delta_snapshot_gate": "prefix-equals-k-target",
+    "authoritative_gate": "complete-k-set-and-production-b",
+    "finite_fit": "one-virtual-draw-per-unordered-matchup",
+}
+
 #: Every covered constant, by name -- the input to :func:`protocol_fingerprint`.
 #: Additive only (see the module docstring): a later task adds keys here, never
 #: repurposes one to mean something else.
@@ -129,6 +154,14 @@ REGISTRY: dict[str, Any] = {
     "seed_label_seat_a": SEED_LABEL_SEAT_A,
     "seed_label_seat_b": SEED_LABEL_SEAT_B,
     "seed_label_eval": SEED_LABEL_EVAL,
+    "seed_label_bootstrap": SEED_LABEL_BOOTSTRAP,
+    "seed_label_replicate": SEED_LABEL_REPLICATE,
+    "delta_window_divisor": DELTA_WINDOW_DIVISOR,
+    "delta_gate_threshold": DELTA_GATE_THRESHOLD,
+    "mk_min_observations": MK_MIN_OBSERVATIONS,
+    "virtual_draw_score": VIRTUAL_DRAW_SCORE,
+    "virtual_draw_games": VIRTUAL_DRAW_GAMES,
+    **STATISTICAL_CONVENTIONS,
     "pairs_per_cell": PAIRS_PER_CELL,
     "eval_sims": EVAL_SIMS,
     "rung8_lag_divisor": RUNG8_LAG_DIVISOR,
