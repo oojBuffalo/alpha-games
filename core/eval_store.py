@@ -1105,6 +1105,13 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
                 f"manifest marks cell {cid} complete but its file is missing: {path}"
             )
         header, records = read_cell(path)
+        if (
+            header.protocol_version != PROTOCOL_VERSION
+            or header.protocol_fingerprint != protocol_fingerprint()
+        ):
+            raise ProtocolMismatchError(
+                f"cell {cid}: stored protocol does not match current registry"
+            )
         parsed = parse_cell_id(cid)
         stored_triple = (
             header.cell_id.candidate_version,

@@ -21,18 +21,8 @@ additive only. Nothing here is ever edited in place to change a *value*; a genui
 value change is a new ``PROTOCOL_VERSION`` and, per the design doc, a new eval
 namespace (the relaunch guard in a later task refuses to mix evidence across one).
 
-**Doc-first status, as observable on this branch.** tasks/m4/001's actual design-doc
-amendment -- the §9/status-header/§12 edits that pin pairs-per-cell, the eval
-search-form sim budget, and the rung-8 rule -- lives on a sibling branch
-(``docs/m4-pin-eval-protocol``) that, as of this module's own commit, is not an
-ancestor of this line of history: ``metadocs/blokus-duo-az-design-v0_5.md`` checked
-out here still carries the "to pin doc-first at M4" flags that amendment resolves.
-The constants below already match that pending amendment's values, so this module is
-the *code* side of the pin, staged ahead of the doc branch landing -- not a claim
-that the doc has already been amended in this history. Per the project's "design-doc
-changes precede divergent code" rule, the two branches must merge together (or the
-doc branch first) before any "pin" reference below should be read as citing an
-already-merged doc section rather than the value the pending amendment specifies.
+The design-doc amendment is an ancestor of this branch; the doc golden requires
+its section-9 pin block to exist.
 """
 
 from __future__ import annotations
@@ -70,6 +60,8 @@ SEED_LABEL_SEAT_B = "b"
 #: PURPOSE_EVAL, cell_id)``). Recorded here so the two sides are pinned against one
 #: source rather than a literal someone has to keep in sync by memory.
 SEED_LABEL_EVAL = "eval"
+SEED_LABEL_BOOTSTRAP = "bootstrap"
+SEED_LABEL_REPLICATE = "replicate"
 
 # --- pinned eval constants (tasks/m4/001) -----------------------------------------
 
@@ -92,6 +84,55 @@ EVAL_SIMS = 512
 RUNG8_LAG_DIVISOR = 4
 RUNG8_EARLIEST_VERSION = 1
 
+# --- bootstrap / Mann-Kendall statistical conventions (tasks/m4/001 pin 7, tasks/m4/007) -----
+
+#: The pinned production bootstrap replicate count (tasks/m4/001 pin 7): ``B = 1,999``,
+#: satisfying §1's "B ≈ 2,000" while keeping both order-statistic ranks below integral
+#: (``(B+1)*0.025 = 50``, ``(B+1)*0.975 = 1,950``). ``core.eval_stats``'s CI/gate
+#: functions take ``B`` as a parameter defaulting to this value; an authoritative
+#: verdict (task 7.3) requires ``B == BOOTSTRAP_B_PRODUCTION`` exactly.
+BOOTSTRAP_B_PRODUCTION = 1999
+
+#: The admissible-``B`` rank rule (tasks/m4/001 pin 7): both order-statistic ranks
+#: ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE`` / ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE`` are
+#: integral exactly when ``(B + 1)`` is a multiple of this modulus -- equivalently
+#: ``B % BOOTSTRAP_B_ADMISSIBLE_MODULUS == BOOTSTRAP_B_ADMISSIBLE_REMAINDER``
+#: (``B ≡ 39 mod 40``: 39, 79, ..., 1,999). A ``B`` failing this check is rejected
+#: loudly by ``core.eval_stats.order_statistic_ci`` rather than silently rounded.
+BOOTSTRAP_B_ADMISSIBLE_MODULUS = 40
+BOOTSTRAP_B_ADMISSIBLE_REMAINDER = 39
+
+#: The single order-statistic CI rule's two quantiles (tasks/m4/001 pin 7): the 95%
+#: interval's endpoints sit at ranks ``(B+1)*BOOTSTRAP_CI_LOWER_QUANTILE`` and
+#: ``(B+1)*BOOTSTRAP_CI_UPPER_QUANTILE`` (1-indexed order statistics of the sorted
+#: replicate values) -- the one convention used at every admissible ``B``, never a
+#: second quantile rule.
+BOOTSTRAP_CI_LOWER_QUANTILE = 0.025
+BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
+
+# Statistical and evidence conventions covered by section 9, pins 7-10.
+DELTA_WINDOW_DIVISOR = 3
+DELTA_GATE_THRESHOLD = 0.0
+MK_MIN_OBSERVATIONS = 3
+VIRTUAL_DRAW_SCORE = 0.5
+VIRTUAL_DRAW_GAMES = 1
+STATISTICAL_CONVENTIONS = {
+    "bootstrap_resampling": "within-cell-paired-records-with-replacement",
+    "bootstrap_fit": "joint-refit-each-replicate-warm-started",
+    "bootstrap_iteration_order": "sorted-cell-id-then-stored-record-order",
+    "delta_window_rounding": "ceiling",
+    "delta_gate_comparison": "lower-ci-strictly-greater-than-threshold",
+    "mann_kendall_variance": "tie-corrected",
+    "mann_kendall_continuity": "subtract-sign-s",
+    "mann_kendall_p": "two-sided-normal",
+    "mann_kendall_insufficient": "s-z-p-null",
+    "mann_kendall_zero_variance": "s=0,z=0,p=1",
+    "snapshot_scope": "complete-contiguous-member-prefix-only",
+    "delta_snapshot_gate": "prefix-equals-k-target",
+    "authoritative_gate": "complete-k-set-production-b-and-production-cells",
+    "finite_fit": "one-virtual-draw-per-unordered-matchup",
+}
+
 #: Every covered constant, by name -- the input to :func:`protocol_fingerprint`.
 #: Additive only (see the module docstring): a later task adds keys here, never
 #: repurposes one to mean something else.
@@ -102,10 +143,23 @@ REGISTRY: dict[str, Any] = {
     "seed_label_seat_a": SEED_LABEL_SEAT_A,
     "seed_label_seat_b": SEED_LABEL_SEAT_B,
     "seed_label_eval": SEED_LABEL_EVAL,
+    "seed_label_bootstrap": SEED_LABEL_BOOTSTRAP,
+    "seed_label_replicate": SEED_LABEL_REPLICATE,
+    "delta_window_divisor": DELTA_WINDOW_DIVISOR,
+    "delta_gate_threshold": DELTA_GATE_THRESHOLD,
+    "mk_min_observations": MK_MIN_OBSERVATIONS,
+    "virtual_draw_score": VIRTUAL_DRAW_SCORE,
+    "virtual_draw_games": VIRTUAL_DRAW_GAMES,
+    **STATISTICAL_CONVENTIONS,
     "pairs_per_cell": PAIRS_PER_CELL,
     "eval_sims": EVAL_SIMS,
     "rung8_lag_divisor": RUNG8_LAG_DIVISOR,
     "rung8_earliest_version": RUNG8_EARLIEST_VERSION,
+    "bootstrap_b_production": BOOTSTRAP_B_PRODUCTION,
+    "bootstrap_b_admissible_modulus": BOOTSTRAP_B_ADMISSIBLE_MODULUS,
+    "bootstrap_b_admissible_remainder": BOOTSTRAP_B_ADMISSIBLE_REMAINDER,
+    "bootstrap_ci_lower_quantile": BOOTSTRAP_CI_LOWER_QUANTILE,
+    "bootstrap_ci_upper_quantile": BOOTSTRAP_CI_UPPER_QUANTILE,
 }
 
 
