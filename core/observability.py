@@ -339,8 +339,8 @@ class ReducedRun:
             field); ``positions_evaluated`` is the cumulative actor-delta sum
             at or before the marker (exact **up to one actor flush period** --
             a stated bound, never interpolated); ``gpu_hours`` is the
-            single-counted segment time elapsed by the marker, under the same
-            completed-segments-only rule as the top-level ``gpu_hours``.
+            single-counted completed-segment time plus elapsed active-segment
+            time at the marker timestamp, even if that segment never closes.
     """
 
     totals: dict[str, float]
@@ -452,7 +452,8 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
     legitimately opens two segments at once, so this only matters for
     hand-built fixtures) accumulate completed-segment seconds; and each
     ``checkpoint_published`` marker snapshots the running
-    positions-evaluated sum and completed-GPU-seconds *as of that point in
+    positions-evaluated sum and GPU seconds (completed segments plus
+    active-segment time through the marker timestamp) *as of that point in
     the scan* -- which, by construction of the single forward pass, is
     exactly "summed over every record at or before the marker's position in
     run time order".
@@ -508,7 +509,8 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
             checkpoints[rec["model_version"]] = (
                 rec["learner_step"],
                 running_positions,
-                gpu_seconds / _SECONDS_PER_HOUR,
+                (gpu_seconds + sum(max(0.0, ts - start) for start in open_segment_starts))
+                / _SECONDS_PER_HOUR,
             )
 
     totals = {

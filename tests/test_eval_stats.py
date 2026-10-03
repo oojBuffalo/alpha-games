@@ -92,6 +92,7 @@ from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int):
     return build_header(
         run_id="run",
+        cell_seed=0,
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=f"rung{rung}-v1-{candidate_version}",
         opponent_identity=opponent_id,
@@ -103,7 +104,7 @@ def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int
 def _pair_record(pair_index: int, score_a: float) -> PairRecord:
     return PairRecord(
         pair_index=pair_index,
-        pair_seed=pair_index,
+        pair_seed=derive_seed(0, "pair", pair_index),
         score_a=score_a,
         games=(GameRecordSnapshot(plies=1, opening=0), GameRecordSnapshot(plies=1, opening=0)),
     )
@@ -457,10 +458,10 @@ def _build_real_shape_metrics_fixture(run_dir):
 
     Hand arithmetic (mirrors tests/test_observability.py's inline comments):
       v1 marker @t=2.0: positions before it = 10(t=1, actor-0) + 7(t=1.5, actor-1) = 17
-                        gpu segment #1 (0.0-2.5) not yet closed at t=2.0 -> 0.0h
+                        gpu segment #1 (0.0-10.0) elapsed at t=2.0 -> 2/3600 h
       v2 marker @t=5.0: positions before it = 17 + 15(t=3, actor-0 ep0)
                         + 5(t=4, actor-0 ep1, after its restart) + 3(t=4.5, actor-1) = 40
-                        gpu segment #1 closed at t=2.5 -> 2.5/3600 h
+                        gpu segment #1 still active at t=5.0 -> 5/3600 h
     """
     orch = EpochMetricsWriter(run_dir, "orchestrator")
     a0 = EpochMetricsWriter(run_dir, "actor-0")
@@ -471,13 +472,13 @@ def _build_real_shape_metrics_fixture(run_dir):
     a0.append(delta_record("positions_evaluated", 10, timestamp=1.0))
     a1.append(delta_record("positions_evaluated", 7, timestamp=1.5))
     _append_checkpoint_published(learner, version=1, learner_step=5, timestamp=2.0)
-    orch.append(segment_end_record(timestamp=2.5))
     a0.append(delta_record("positions_evaluated", 15, timestamp=3.0))
     a0_restarted = EpochMetricsWriter(run_dir, "actor-0")  # a crash + restart mid-series
     assert a0_restarted.epoch == 1
     a0_restarted.append(delta_record("positions_evaluated", 5, timestamp=4.0))
     a1.append(delta_record("positions_evaluated", 3, timestamp=4.5))
     _append_checkpoint_published(learner, version=2, learner_step=9, timestamp=5.0)
+    orch.append(segment_end_record(timestamp=10.0))
 
 
 def test_elo_curve_joins_correct_cumulative_x_values_on_a_real_shape_metrics_fixture(tmp_path):
@@ -497,11 +498,11 @@ def test_elo_curve_joins_correct_cumulative_x_values_on_a_real_shape_metrics_fix
 
     assert rows[0]["learner_step"] == 5
     assert rows[0]["net_evals"] == pytest.approx(17.0)
-    assert rows[0]["gpu_hours"] == pytest.approx(0.0)
+    assert rows[0]["gpu_hours"] == pytest.approx(2.0 / 3600.0)
 
     assert rows[1]["learner_step"] == 9
     assert rows[1]["net_evals"] == pytest.approx(40.0)
-    assert rows[1]["gpu_hours"] == pytest.approx(2.5 / 3600.0)
+    assert rows[1]["gpu_hours"] == pytest.approx(5.0 / 3600.0)
 
 
 def test_elo_curve_raises_when_a_scored_member_has_no_publication_marker(tmp_path):
@@ -922,7 +923,7 @@ def test_build_verdict_complete_k_set_carries_delta_ci_and_gate(tmp_path):
     assert payload["delta"] is not None
     assert set(payload["delta"]) == {"delta_hat", "ci", "gate"}
     assert payload["delta"]["ci"][0] <= payload["delta"]["delta_hat"] <= payload["delta"]["ci"][1]
-    assert payload["reason"] is None
+    assert "non-production" in payload["reason"]
 
 
 def test_build_verdict_on_disk_partial_cell_perturbs_nothing(tmp_path):
@@ -953,7 +954,7 @@ def test_build_verdict_authoritative_requires_complete_k_set_and_b_1999(tmp_path
     but still carries Delta and CI; an incomplete K-set at B=1999 stays
     non-authoritative regardless."""
     run_complete = tmp_path / "complete"
-    _write_member(run_complete, 1, [(7, "random", [1.0, 1.0])])
+    _write_member(run_complete, 1, [(7, "random", [1.0] * 24)])
     _write_checkpoint_markers(run_complete, [1])
     _write_run_config(run_complete, checkpoint_count=1, eval_seed=7)
 
@@ -1074,6 +1075,7 @@ def test_protocol_registry_matches_the_literal_pinned_values():
     (core.eval_protocol) so the protocol cannot silently drift once production
     games exist."""
     assert eval_protocol.PROTOCOL_VERSION == 1
+    assert eval_protocol.SCHEMA_VERSION == 2
     assert eval_protocol.PAIRS_PER_CELL == 24
     assert eval_protocol.EVAL_SIMS == 512
     assert eval_protocol.RUNG8_LAG_DIVISOR == 4
@@ -1197,7 +1199,7 @@ def test_all_statistical_conventions_are_hashed():
         "mann_kendall_zero_variance": "s=0,z=0,p=1",
         "snapshot_scope": "complete-contiguous-member-prefix-only",
         "delta_snapshot_gate": "prefix-equals-k-target",
-        "authoritative_gate": "complete-k-set-and-production-b",
+        "authoritative_gate": "complete-k-set-production-b-and-production-cells",
         "finite_fit": "one-virtual-draw-per-unordered-matchup",
     }
     assert PURPOSE_BOOTSTRAP == pinned["seed_label_bootstrap"]
@@ -1217,3 +1219,88 @@ def test_eval_config_serializes_and_checks_protocol_stamps():
     raw["evaluation"]["protocol_fingerprint"] = "old"
     with pytest.raises(ValueError, match="stored protocol"):
         RunConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "ratings",
+    [
+        {"rung7-v1-1": 0.0, "rung7-v1-s128-2": 1.0},
+        {"rung7-v1-1": 0.0, "rung7-v1-s128-1": 1.0},
+    ],
+)
+def test_checkpoint_curve_refuses_mixed_budget_or_duplicate_versions(ratings):
+    with pytest.raises(ValueError, match="mixes search budgets|multiple rung-7 identities"):
+        checkpoint_elo(ratings)
+
+
+def test_checkpoint_curve_includes_honest_reduced_budget_identities():
+    assert checkpoint_elo({"rung7-v1-s128-2": 20.0, "rung7-v1-s128-1": 10.0}) == [
+        (1, 10.0),
+        (2, 20.0),
+    ]
+
+
+def test_production_b_cannot_make_reduced_cells_authoritative(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    payload = build_verdict(tmp_path, B=1999)
+    assert payload["authoritative"] is False
+    assert payload["delta"] is not None
+    assert "non-production" in payload["reason"]
+
+
+@pytest.mark.parametrize("value", [1e6, -1e6, 1e308, 10**1000])
+def test_initial_ratings_rejects_huge_values_with_value_error(value):
+    with pytest.raises(ValueError, match="magnitude"):
+        fit_elo(
+            [("a", "r", 30.0, 48), ("b", "a", 10.0, 48)],
+            "r",
+            initial_ratings={"a": value, "b": -1e6},
+        )
+
+
+def test_elo_curve_rejects_cross_run_snapshot_before_writing(tmp_path):
+    run_a = tmp_path / "a"
+    run_b = tmp_path / "b"
+    _write_member(run_a, 1, [(7, "random", [1.0, 1.0])])
+    _build_real_shape_metrics_fixture(run_b)
+    with pytest.raises(ValueError, match="same run"):
+        elo_curve(run_b, load_snapshot(run_a))
+    assert not elo_curve_path(run_b).exists()
+
+
+def test_elo_curve_accepts_resolved_alias_of_snapshot_run(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_member(run_dir, 1, [(7, "random", [1.0, 1.0])])
+    _build_real_shape_metrics_fixture(run_dir)
+    alias = tmp_path / "alias"
+    alias.symlink_to(run_dir, target_is_directory=True)
+    assert elo_curve(alias, load_snapshot(run_dir))["rows"][0]["gpu_hours"] == pytest.approx(
+        2.0 / 3600.0
+    )
+
+
+@pytest.mark.parametrize("budget", [128, 512])
+def test_source_search_settings_control_verdict_authority(tmp_path, budget):
+    identity = "rung7-v1-1" if budget == 512 else f"rung7-v1-s{budget}-1"
+    header = build_header(
+        run_id="run",
+        cell_id=CellId(1, 7, "random", full_candidate_identity=identity),
+        candidate_identity=identity,
+        opponent_identity="random",
+        candidate_fingerprint={"orientation_table_hash": "test"},
+        eval_config={"pairs_per_cell": 24, "eval_sims": budget},
+        cell_seed=0,
+    )
+    register_member(tmp_path, 1, [header.cell_id.to_string()])
+    _fill(tmp_path, header, [1.0] * 24)
+    complete_cell(tmp_path, header.cell_id.to_string())
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    payload = build_verdict(tmp_path, B=1999)
+    assert payload["authoritative"] is (budget == 512)
+    assert len(payload["per_checkpoint"]) == 1
+    assert payload["delta"] is not None
+    if budget != 512:
+        assert "non-production" in payload["reason"]

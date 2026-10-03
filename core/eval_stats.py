@@ -104,6 +104,7 @@ from core.eval_protocol import (
     BOOTSTRAP_CI_UPPER_QUANTILE,
     DELTA_GATE_THRESHOLD,
     DELTA_WINDOW_DIVISOR,
+    EVAL_SIMS,
     MK_MIN_OBSERVATIONS,
     SEED_LABEL_REPLICATE,
 )
@@ -128,7 +129,7 @@ ANCHOR_AGENT = "random"
 #: convention for ``form == 7``, matched here as a plain string pattern rather than by
 #: importing that module (which pulls in the checkpoint-loading machinery this module
 #: has no other reason to depend on).
-_RUNG7_IDENTITY = re.compile(r"^rung7-v1-(\d+)$")
+_RUNG7_IDENTITY = re.compile(r"^rung7-v1-(?:s(\d+)-)?(\d+)$")
 
 
 def _snapshot_cell_records(
@@ -142,18 +143,9 @@ def _snapshot_cell_records(
     order, so the filter lives in one place rather than two copies that could
     silently drift apart.
 
-    Reads every cell the snapshot marks complete (``core.eval_store.iter_cells``)
-    but keeps only those belonging to the snapshot's *complete contiguous member
-    prefix* (``snapshot.member_prefix``): a completed cell whose candidate version
-    sits beyond that prefix is real evidence for a not-yet-fully-scored member
-    (``EvalSnapshot.completed_cell_ids``'s own docstring notes such cells are
-    visible there -- "per-checkpoint live reporting reads this set directly" --
-    precisely because they sit *outside* the contiguous prefix), so it is excluded
-    here rather than silently admitted into the §1 point estimate or the
-    bootstrap -- the "never partial data" analysis-snapshot convention both are
-    pinned to (task 1 pin 9, P2.2). A cell that is merely scheduled (never
-    completed at all) is already structurally absent from the snapshot and never
-    reaches this function in the first place.
+    Reads the complete contiguous member prefix via ``core.eval_store.iter_cells``.
+    Completed cells beyond it remain in ``snapshot.completed_cell_ids`` for live
+    reporting; only required prefix cells enter the fit and bootstrap.
 
     Args:
         snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
@@ -170,8 +162,6 @@ def _snapshot_cell_records(
     cells: list[tuple[str, str, list[PairRecord]]] = []
     for path in iter_cells(snapshot):
         header, records = read_cell(path)
-        if header.cell_id.candidate_version > snapshot.member_prefix:
-            continue
         cells.append((header.candidate_identity, header.opponent_identity, records))
     return cells
 
@@ -407,16 +397,28 @@ def checkpoint_elo(ratings: dict[str, float]) -> list[tuple[int, float]]:
         ratings: A ``core.elo.fit_elo`` (or :func:`fit_snapshot_elo`) result.
 
     Returns:
-        ``(model_version, elo)`` pairs for every rung-7 (``"rung7-v1-<v>"``)
-        agent present in ``ratings``, ordered by ``model_version`` ascending --
+        ``(model_version, elo)`` pairs for every rung-7 identity, including
+        explicit ``-s<S>`` budgets, ordered by ``model_version`` ascending --
         the §6.2 provenance ordering, never file mtime and never dict/insertion
         order.
     """
     versions: list[tuple[int, float]] = []
+    budgets: set[int] = set()
+    seen_versions: set[int] = set()
     for name, elo in ratings.items():
         match = _RUNG7_IDENTITY.match(name)
         if match is not None:
-            versions.append((int(match.group(1)), elo))
+            version = int(match.group(2))
+            budget = int(match.group(1)) if match.group(1) else EVAL_SIMS
+            if budget <= 0:
+                raise ValueError("rung-7 search budget must be positive")
+            if version in seen_versions:
+                raise ValueError(f"multiple rung-7 identities for checkpoint {version}")
+            budgets.add(budget)
+            seen_versions.add(version)
+            versions.append((version, elo))
+    if len(budgets) > 1:
+        raise ValueError("rung-7 checkpoint curve mixes search budgets")
     versions.sort(key=lambda pair: pair[0])
     return versions
 

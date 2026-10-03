@@ -360,9 +360,9 @@ def test_scripted_two_actor_learner_orchestrator_golden_with_interleaved_publish
 
     # the x-axis join, exact up to one flush period (module docstring)
     assert result.checkpoints == {
-        0: (0, 30.0, pytest.approx(0.0)),  # positions at/before t=3: 10 + 20
-        1: (2, 45.0, pytest.approx(3.5 / 3600.0)),  # at/before t=7: +15 (t=5); segment #1 closed
-        2: (3, 75.0, pytest.approx(3.5 / 3600.0)),  # at/before t=11: +25(t=8) +5(t=9)
+        0: (0, 30.0, pytest.approx(3.0 / 3600.0)),  # positions at/before t=3: 10 + 20
+        1: (2, 45.0, pytest.approx(4.0 / 3600.0)),  # at/before t=7: +15 (t=5); segment #1 closed
+        2: (3, 75.0, pytest.approx(8.0 / 3600.0)),  # at/before t=11: +25(t=8) +5(t=9)
     }
 
     # idempotent under re-reduction
