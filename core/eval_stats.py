@@ -110,7 +110,7 @@ Mann-Kendall and order-statistic-CI machinery rather than a second copy:
   earlier checkpoint's fitted rating too. Slicing every confirmation window
   out of one fit computed over *all* currently-scored cells would therefore
   let the newest evidence retroactively repaint what is supposed to be an
-  independent, earlier reading. Only the manifest read itself is single
+  earlier reading. Only the manifest read itself is single
   (``core.eval_store.load_snapshot``); every window but the newest is instead
   refit from that one read *truncated* to its own ``member_prefix``
   (mirroring the existing :func:`_snapshot_cell_records` truncation) --
@@ -145,7 +145,9 @@ from core.eval_protocol import (
     BOOTSTRAP_CI_UPPER_QUANTILE,
     PLATEAU_CI_WIDTH_THRESHOLD_ELO,
     PLATEAU_CONFIRMATION_COUNT,
+    PLATEAU_EQUIVALENCE_MARGIN_ELO,
     PLATEAU_GPU_HOURS_MIN,
+    PLATEAU_HALF_WINDOW_RULE,
     PLATEAU_MK_ALPHA,
     PLATEAU_WINDOW_M,
     PROTOCOL_VERSION,
@@ -1073,10 +1075,12 @@ def _windowed_contrast(curve_by_version: dict[int, float], versions: Sequence[in
     Returns:
         ``mean(elo over the newest ceil(len(versions)/2) versions) - mean(elo
         over the oldest ceil(len(versions)/2) versions)``. For the pinned ``M`` =
-        8 (even), the two halves are the non-overlapping first/last four members;
+        16 (even), the two halves are the non-overlapping first/last eight members;
         the ``ceil`` generalizes correctly (with overlap) if ``M`` were ever
         odd, per the doc amendment's own formula.
     """
+    if PLATEAU_HALF_WINDOW_RULE != "ceil(M/2)":
+        raise ValueError(f"unsupported plateau half-window rule: {PLATEAU_HALF_WINDOW_RULE!r}")
     half = -(-len(versions) // 2)  # ceil(len(versions) / 2), pure-integer.
     oldest = versions[:half]
     newest = versions[-half:]
@@ -1131,6 +1135,7 @@ class WindowCondition:
         contrast_ci_width: ``contrast_ci[1] - contrast_ci[0]``.
         ci_narrow: ``True`` iff ``contrast_ci_width <
             core.eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO`` (strictly below).
+        ci_equivalent: Both CI endpoints lie strictly inside the pinned equivalence margin.
         gpu_hours_span: This window's GPU-hour span -- the newest member's
             cumulative single-counted GPU-hours minus the oldest member's (the
             §1 x-axis join) -- or ``None`` if some window member has no
@@ -1139,7 +1144,7 @@ class WindowCondition:
         gpu_span_sufficient: ``True`` iff ``gpu_hours_span`` is not ``None`` and
             ``>= core.eval_protocol.PLATEAU_GPU_HOURS_MIN``.
         satisfied: The full conjunction this window itself satisfies --
-            ``mk_non_significant and ci_narrow and gpu_span_sufficient``. Two
+            ``mk_non_significant and ci_narrow and ci_equivalent and gpu_span_sufficient``. Two
             consecutive ``satisfied`` windows are what :func:`detect_plateau`
             requires before declaring PLATEAU.
     """
@@ -1155,6 +1160,7 @@ class WindowCondition:
     gpu_hours_span: float | None
     gpu_span_sufficient: bool
     ci_narrow: bool
+    ci_equivalent: bool
     satisfied: bool
 
 
@@ -1205,6 +1211,10 @@ def _window_condition(
     contrast_ci = order_statistic_ci(replicate_contrasts, B)
     contrast_ci_width = contrast_ci[1] - contrast_ci[0]
     ci_narrow = contrast_ci_width < PLATEAU_CI_WIDTH_THRESHOLD_ELO
+    ci_equivalent = (
+        contrast_ci[0] > -PLATEAU_EQUIVALENCE_MARGIN_ELO
+        and contrast_ci[1] < PLATEAU_EQUIVALENCE_MARGIN_ELO
+    )
 
     if all(v in gpu_hours_by_version for v in versions):
         gpu_hours_span: float | None = (
@@ -1227,79 +1237,21 @@ def _window_condition(
         gpu_hours_span=gpu_hours_span,
         gpu_span_sufficient=gpu_span_sufficient,
         ci_narrow=ci_narrow,
-        satisfied=mk_non_significant and ci_narrow and gpu_span_sufficient,
+        ci_equivalent=ci_equivalent,
+        satisfied=mk_non_significant and ci_narrow and ci_equivalent and gpu_span_sufficient,
     )
 
 
 @dataclass(frozen=True)
 class PlateauResult:
-    """The profiled-plateau detector's auditable tri-state verdict (task 8).
+    """Auditable tri-state result; truthiness raises TypeError.
 
-    Never coerce ``outcome`` to a bool -- it is one of
-    :data:`PLATEAU_OUTCOME_PLATEAU`, :data:`PLATEAU_OUTCOME_NO_PLATEAU`, or
-    :data:`PLATEAU_OUTCOME_INSUFFICIENT_DATA`, and this class deliberately
-    implements no ``__bool__``: a plateau claim must be read by comparing
-    ``outcome`` against a named value, never by truthiness.
-
-    Attributes:
-        outcome: The tri-state verdict.
-        window_m: The pinned window length used (``core.eval_protocol.
-            PLATEAU_WINDOW_M``), recorded for audit even though it never
-            varies at a fixed protocol version.
-        current: The window ending at the newest evaluated member -- an alias
-            for ``windows[0]`` -- or ``None`` iff ``outcome ==
-            PLATEAU_OUTCOME_INSUFFICIENT_DATA`` because fewer than
-            ``window_m`` members are evaluated at all (there is no full
-            window to examine, so ``windows == ()``).
-        previous: The window ending one evaluated member earlier than
-            ``current`` -- an alias for ``windows[1] if len(windows) > 1 else
-            None``. It is refit from a snapshot truncated to *its own*
-            ``member_prefix`` (:func:`detect_plateau`'s docstring), never
-            sliced out of ``current``'s fit: §9 pin 2's shared Bradley-Terry
-            graph means a later candidate's matches can shift an earlier
-            checkpoint's rating too, so reusing one fit for both windows would
-            let ``current``'s newer evidence quietly leak into what must read
-            as an independent, earlier snapshot. (This is *not* a design-doc
-            quotation -- no rating-invariance claim is pinned anywhere in the
-            doc; §9 pin 9 pins only raw per-cell content immutability.)
-            ``None`` when fewer than ``window_m + 1`` members are evaluated
-            (no second window exists yet to confirm against) or when
-            ``outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA`` before any window
-            was built.
-        windows: Every window the anti-flap loop actually built and examined,
-            newest first -- the general form of ``current``/``previous``,
-            which are just convenience aliases for ``windows[0]`` and
-            ``windows[1] if len(windows) > 1 else None``. Holds ``0`` to
-            ``core.eval_protocol.PLATEAU_CONFIRMATION_COUNT`` entries: fewer
-            than the full count only when the evaluated series itself is too
-            short yet for the full confirmation depth (never a hardcoded cap
-            at two -- a future ``PLATEAU_CONFIRMATION_COUNT`` bump changes
-            only ``len(windows)``, not this dataclass's shape).
-        confirmation_count: How many of the newest consecutive ``windows``
-            satisfy the full conjunction, counted from the newest backward and
-            stopping at the first that does not (``0`` to
-            ``core.eval_protocol.PLATEAU_CONFIRMATION_COUNT``) -- never a
-            "confirmed later, unconfirmed at the newest" count, since the
-            clause is defined over *consecutive* snapshots.
-        confirmed_versions: The satisfying windows' ``newest_version`` values,
-            ascending -- between ``0`` and ``PLATEAU_CONFIRMATION_COUNT``
-            elements, naming exactly which consecutive member checkpoints
-            confirmed the plateau (or are pending confirmation).
-        reason: A human-readable explanation for ``no_plateau`` or
-            ``insufficient_data``; ``None`` for ``plateau`` (mirrors
-            ``build_verdict``'s own ``reason`` convention).
-        snapshot_fingerprint: The task-5 :class:`~core.eval_store.EvalSnapshot`
-            this verdict was computed over
-            (``core.eval_store.EvalSnapshot.snapshot_fingerprint``).
-        elo_curve_fingerprint: The sha256 of the on-disk ``elo_curve.json``
-            artifact (:func:`elo_curve_path`) this verdict's GPU-hours join
-            was read from, or ``None`` if that artifact does not exist yet --
-            always the artifact actually read, never recomputed or rewritten
-            here (:func:`detect_plateau` triggers no write of its own).
-        protocol_fingerprint: ``core.eval_protocol.protocol_fingerprint()`` at
-            the moment this verdict was computed -- the same registry stamp
-            every cell header and verdict carries, including the six plateau
-            constants themselves.
+    ``current`` and ``previous`` alias the newest two entries of ``windows``.
+    Historical windows are refit from their own evidence prefixes, preventing
+    later matches from changing earlier readings. ``confirmation_count`` counts
+    consecutive satisfied windows newest-first; ``confirmed_versions`` records
+    their endpoints in ascending order. Fingerprints identify the snapshot,
+    GPU-hours artifact, and complete protocol registry used for this report.
     """
 
     outcome: PlateauOutcome
@@ -1313,6 +1265,9 @@ class PlateauResult:
     snapshot_fingerprint: str
     elo_curve_fingerprint: str | None
     protocol_fingerprint: str
+
+    def __bool__(self) -> bool:
+        raise TypeError("PlateauResult is tri-state; compare outcome to a named value")
 
 
 def _read_elo_curve_gpu_hours(run_dir: Path) -> tuple[dict[int, float], str | None]:
@@ -1383,10 +1338,7 @@ def _fit_checkpoint_curves(
 ) -> tuple[dict[int, float], list[dict[int, float]]]:
     """Fit one snapshot's point-estimate and bootstrap-replicate rung-7 Elo curves.
 
-    Shared by every window :func:`detect_plateau` builds -- the newest window
-    (over ``snapshot`` exactly as read) and every earlier confirmation window
-    (over a copy truncated by :func:`_snapshot_truncated_to`) -- so both cases
-    go through one fit-plus-resample implementation rather than two.
+    Used for earlier confirmation windows after truncating their snapshot prefix.
 
     Args:
         snapshot: A frozen snapshot (full or truncated).
@@ -1411,108 +1363,29 @@ def _fit_checkpoint_curves(
 
 
 def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> PlateauResult:
-    """Detect a design doc §12 M4 "profiled plateau", read-only, over the run's evidence.
+    """Read the §12 M4 plateau predicate without writing or triggering actions.
 
-    Pure library detector: reads the task-5 analysis snapshot
-    (``core.eval_store.load_snapshot`` -- never the live manifest, so an on-disk
-    partial cell can never influence the result, §9 pin 9) and the task-7
-    ``elo_curve.json`` artifact already on disk (:func:`_read_elo_curve_gpu_hours`
-    -- never recomputed or rewritten here); triggers nothing, writes nothing, and
-    schedules nothing -- the six pinned constants
-    (``core.eval_protocol.PLATEAU_WINDOW_M`` / ``PLATEAU_MK_ALPHA`` /
-    ``PLATEAU_CI_WIDTH_THRESHOLD_ELO`` / ``PLATEAU_GPU_HOURS_MIN`` /
-    ``PLATEAU_CONFIRMATION_COUNT`` and the half-window split) only ever *report*
-    a tri-state verdict; every M6 lever decision and the §13 ceiling declaration
-    stay human calls that *consume* this report.
+    Uses the immutable completed-cell snapshot and the existing elo_curve.json
+    GPU-hours join. The current window must have sufficient members, a non-tied
+    and sufficient MK result, and every GPU coordinate; otherwise the result is
+    insufficient_data. A decidable current window yields plateau only when
+    trend, precision, equivalence, and GPU span pass at every confirmation
+    prefix. An undecidable earlier window provides no confirmation credit.
 
-    **The anti-flap confirmation clause needs ``PLATEAU_CONFIRMATION_COUNT``
-    independent, point-in-time readings, but this function opens the manifest
-    only once.** §9 pin 9 pins raw per-cell immutability only -- a completed
-    cell's own content never changes -- it says nothing about a *derived*
-    rating being invariant to later evidence, and for this protocol it is not:
-    §9 pin 2's one anchored Bradley-Terry fit connects every agent in play,
-    including rung-8 historical opponents that keep their own earlier rung-7
-    rating's identity (``core.eval_agents.historical_opponents``'s module
-    note), so a later candidate's fresh matches generically shift an earlier
-    checkpoint's fitted rating too. Slicing every confirmation window out of
-    one fit computed over *all* currently-scored cells would therefore let the
-    newest evidence retroactively repaint what is supposed to be an
-    independent, earlier reading -- exactly the flap the confirmation clause
-    exists to rule out.
+    Consecutive windows overlap: confirmation measures persistence, not
+    independence. Each earlier window is refit from its own member prefix so
+    later rung-8 matches cannot retroactively change its historical rating.
 
-    Instead: the window ending at the newest evaluated member (``current``) is
-    fit from the snapshot exactly as read (:func:`_fit_checkpoint_curves`).
-    Every earlier confirmation window is refit from that same one-time read,
-    *truncated* to its own ``member_prefix`` (:func:`_snapshot_truncated_to`,
-    mirroring :func:`_snapshot_cell_records`'s existing truncation) before its
-    own point estimate and bootstrap replicates are computed from scratch --
-    reconstructing bit-for-bit what a standalone snapshot taken back when that
-    earlier member was newest would have shown, precisely because pin 9's
-    immutability guarantee means the cells a smaller prefix admits are exactly
-    the cells that already existed and were already complete back then. Up to
-    ``core.eval_protocol.PLATEAU_CONFIRMATION_COUNT`` such windows are built
-    this way (fewer only when the evaluated series is itself too short yet for
-    the full confirmation depth -- never a hardcoded two), and *every one of
-    them*, not just two, must satisfy the full conjunction before PLATEAU is
-    declared.
-
-    Sub-condition machinery is reused verbatim, never re-derived: :func:`mann_kendall`
-    (with its own pinned degenerate cases) restricted to each window's
-    point-estimate Elo sequence; :func:`bootstrap_replicates` plus
-    :func:`order_statistic_ci` (the same admissible-B rank rule as the §1 Delta)
-    for the windowed contrast's CI, drawn from the run's own ``bootstrap_seed``
-    for every window examined -- the same top-level seed each time (pin 7
-    records one seed per run, not one per analysis), applied to a different,
-    narrower cell population per earlier window's own truncated snapshot.
-
-    Args:
-        run_dir: The run's root directory -- the eval snapshot's own root, the
-            root ``core.run_identity.read_stored_config`` reads ``config.json``
-            from (for the evaluation seed), and the root the on-disk
-            ``eval/elo_curve.json`` artifact (if any) is read from.
-        B: The bootstrap replicate count backing the windowed-contrast CIs.
-            Must be admissible (``B ≡ 39 mod 40``; see :func:`order_statistic_ci`).
-            Defaults to the pinned production value.
-
-    Returns:
-        A :class:`PlateauResult`. ``outcome`` is
-        :data:`PLATEAU_OUTCOME_INSUFFICIENT_DATA` when: fewer than
-        ``PLATEAU_WINDOW_M`` members are evaluated at all; some window's
-        Mann-Kendall reading is itself insufficient-data (unreachable at the
-        pinned ``M`` = 8 >= 3, but never assumed away); some window's
-        point-estimate Elo sequence is all-tied (:attr:`WindowCondition.
-        mk_all_tied` -- Mann-Kendall's pinned sigma=0 degenerate branch, which
-        reports ``insufficient_data=False`` yet carries no real trend
-        information and so must never stand in for a legitimate
-        non-significant reading, design doc §12 M4's insufficient-data
-        clause); or some examined window has a member version with no
-        GPU-hours coordinate in the elo-curve join (including the whole join
-        being absent, i.e. no ``elo_curve.json`` has been written yet).
-        Otherwise ``outcome`` is
-        :data:`PLATEAU_OUTCOME_PLATEAU` iff the full conjunction (Mann-Kendall
-        non-significant AND CI width below threshold AND GPU-hour span at or
-        above the minimum) holds at every one of the
-        ``PLATEAU_CONFIRMATION_COUNT`` confirmation windows built (see
-        ``windows``); :data:`PLATEAU_OUTCOME_NO_PLATEAU` otherwise (including
-        when it holds only at a newest prefix of them, pending confirmation,
-        or fewer than ``PLATEAU_CONFIRMATION_COUNT`` windows exist yet).
-
-    Raises:
-        ValueError: If ``B`` is not admissible, or the evaluated rung-7 curve's
-            versions are not exactly ``{1, ..., n_evaluated}`` (a non-contiguous
-            series -- an eval-store/protocol inconsistency this function refuses
-            to window over silently), or propagated from :func:`fit_snapshot_elo`
-            (an agent disconnected from the anchor).
-        FileNotFoundError: If ``run_dir`` has no stored ``config.json``
-            (``core.run_identity.read_stored_config``).
+    Raises ValueError for inadmissible B, non-contiguous rung-7 curves, or
+    a disconnected fit; FileNotFoundError for missing stored config when a
+    complete window needs bootstrap replicates.
     """
     _validate_admissible_B(B)
     run_dir = Path(run_dir)
     M = PLATEAU_WINDOW_M
 
     snapshot = load_snapshot(run_dir)
-    point_curve = checkpoint_elo(fit_snapshot_elo(snapshot))
-    n_evaluated = len(point_curve)
+    n_evaluated = snapshot.member_prefix
     gpu_hours_by_version, elo_curve_fingerprint = _read_elo_curve_gpu_hours(run_dir)
 
     def _insufficient(reason: str, windows: tuple[WindowCondition, ...]) -> PlateauResult:
@@ -1537,6 +1410,7 @@ def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> P
             windows=(),
         )
 
+    point_curve = checkpoint_elo(fit_snapshot_elo(snapshot))
     all_versions = [version for version, _ in point_curve]
     if set(all_versions) != set(range(1, n_evaluated + 1)):
         raise ValueError(
@@ -1551,12 +1425,7 @@ def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> P
         dict(checkpoint_elo(ratings)) for ratings in bootstrap_replicates(snapshot, seed, B)
     ]
 
-    # Build up to PLATEAU_CONFIRMATION_COUNT windows, newest first (i == 0 is
-    # "current"). i == 0 reuses the fit already computed above; every i >= 1 is
-    # refit from an independently truncated snapshot (see this function's own
-    # docstring) so a later window's evidence can never leak into an earlier
-    # one -- never hardcoded to exactly two, so a future PLATEAU_CONFIRMATION_COUNT
-    # bump changes only how many windows this loop builds.
+    # Historical windows use their own evidence prefixes.
     max_windows = min(PLATEAU_CONFIRMATION_COUNT, n_evaluated - M + 1)
     windows: list[WindowCondition] = []
     for i in range(max_windows):
@@ -1579,7 +1448,7 @@ def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> P
             )
         )
 
-    for window in windows:
+    for window in windows[:1]:
         if window.mann_kendall.insufficient_data:
             return _insufficient(
                 f"Mann-Kendall over the window ending at member {window.newest_version} "
@@ -1606,7 +1475,12 @@ def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> P
     confirmation_count = 0
     confirmed: list[int] = []
     for window in windows:  # newest first; stop at the first unsatisfied window.
-        if not window.satisfied:
+        if (
+            not window.satisfied
+            or window.mann_kendall.insufficient_data
+            or window.mk_all_tied
+            or window.gpu_hours_span is None
+        ):
             break
         confirmation_count += 1
         confirmed.append(window.newest_version)

@@ -21,18 +21,7 @@ additive only. Nothing here is ever edited in place to change a *value*; a genui
 value change is a new ``PROTOCOL_VERSION`` and, per the design doc, a new eval
 namespace (the relaunch guard in a later task refuses to mix evidence across one).
 
-**Doc-first status, as observable on this branch.** tasks/m4/001's actual design-doc
-amendment -- the §9/status-header/§12 edits that pin pairs-per-cell, the eval
-search-form sim budget, and the rung-8 rule -- lives on a sibling branch
-(``docs/m4-pin-eval-protocol``) that, as of this module's own commit, is not an
-ancestor of this line of history: ``metadocs/blokus-duo-az-design-v0_5.md`` checked
-out here still carries the "to pin doc-first at M4" flags that amendment resolves.
-The constants below already match that pending amendment's values, so this module is
-the *code* side of the pin, staged ahead of the doc branch landing -- not a claim
-that the doc has already been amended in this history. Per the project's "design-doc
-changes precede divergent code" rule, the two branches must merge together (or the
-doc branch first) before any "pin" reference below should be read as citing an
-already-merged doc section rather than the value the pending amendment specifies.
+The committed design doc §9 and §12 are checked against this registry by tests.
 """
 
 from __future__ import annotations
@@ -45,7 +34,7 @@ from typing import Any
 #: deliberately alongside a doc amendment that changes a covered convention's value --
 #: distinct from :func:`protocol_fingerprint`, which changes automatically on *any*
 #: registry drift regardless of whether this constant was remembered to move too.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 #: Cell-header / pair-record on-disk shape version (independent axis from
 #: ``PROTOCOL_VERSION``: the record *shape* a reader must recognize can move
@@ -117,56 +106,17 @@ BOOTSTRAP_B_ADMISSIBLE_REMAINDER = 39
 BOOTSTRAP_CI_LOWER_QUANTILE = 0.025
 BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
 
-# --- profiled-plateau rule constants (design doc §12 M4; tasks/m4/008) ------------
-#
-# The six constants pinned together as one predicate, each with the doc amendment's
-# own one-sentence rationale (mirrored here verbatim rather than paraphrased, so the
-# doc<->constants golden in tests/test_eval_stats.py has a stable sentence to anchor
-# on): "profiled plateau" gates every M6 lever go/no-go and the §13 ceiling
-# declaration (`core.eval_stats.detect_plateau`), so -- like every other convention
-# in this registry -- changing any one of them is a protocol-version bump, never a
-# silent edit.
-
-#: Window length -- `M` evaluated member checkpoints (pin: window). About a quarter
-#: of `K` = 30: long enough for Mann-Kendall to have real power at
-#: :data:`PLATEAU_MK_ALPHA`, short enough to answer "has progress stopped recently"
-#: rather than "on average over the whole run."
-PLATEAU_WINDOW_M = 8
-
-#: Mann-Kendall two-sided significance level for the windowed trend test (pin: trend
-#: test). Non-significant means `p >= PLATEAU_MK_ALPHA`, the same 95% convention §1
-#: and §9 already use throughout, so the plateau rule introduces no second
-#: confidence level.
+# --- profiled-plateau rule constants (design doc §12 M4) -------------------------
+# Changing any pin requires a protocol version and eval namespace change.
+PLATEAU_WINDOW_M = 16
 PLATEAU_MK_ALPHA = 0.05
-
-#: The named windowed contrast's half-window split rule (pin: named windowed
-#: contrast) -- `Δ_window = mean(Elo, newest ceil(M/2) window members) -
-#: mean(Elo, oldest ceil(M/2) window members)`, computed on the point estimate with
-#: its CI over the *same* bootstrap replicates via the *same* admissible-B
-#: order-statistic rank rule as the §1 Δ. Recorded as a descriptive label (like the
-#: seed-label constants above) rather than a second numeric constant, since the
-#: split point is always `ceil(M/2)` of whatever `M` is pinned above -- this is
-#: explicitly *not* §1's Δ, which exists only over the complete K-set.
 PLATEAU_HALF_WINDOW_RULE = "ceil(M/2)"
-
-#: CI-width threshold, in Elo points -- the windowed-contrast CI must be strictly
-#: below this (pin: CI-width threshold). An order of magnitude below the Elo gains
-#: typical of the early run, so "flat" means flat relative to real signal rather
-#: than an artifact of a loose interval; achievable at the pin-1 evidence density
-#: (≈288-360 pairs/checkpoint) without a special-cased evaluation budget.
-PLATEAU_CI_WIDTH_THRESHOLD_ELO = 75.0
-
-#: Minimum GPU-hour span the window's `M` members must cover (pin: GPU-hour
-#: window), from the §1 x-axis join (§12 M3's observability counters), so a
-#: plateau can never be declared over a burst of cheap, closely-spaced checkpoints.
+#: Precision gate: CI width must be strictly below this threshold.
+PLATEAU_CI_WIDTH_THRESHOLD_ELO = 150.0
+#: Location gate: both endpoints must lie strictly inside (-margin, +margin).
+PLATEAU_EQUIVALENCE_MARGIN_ELO = 75.0
 PLATEAU_GPU_HOURS_MIN = 8.0
-
-#: Anti-flap confirmation count -- the full conjunction (MK non-significant AND CI
-#: width below threshold AND GPU-hour span at or above the minimum) must hold at
-#: this many consecutive evaluated member checkpoints (pin: anti-flap confirmation)
-#: before PLATEAU is declared; a single satisfying snapshot is NO-PLATEAU, pending
-#: confirmation, so an isolated flat-looking reading can never flip an irreversible
-#: M6 lever decision on its own.
+#: Persistence across overlapping snapshots, not independent statistical evidence.
 PLATEAU_CONFIRMATION_COUNT = 2
 
 #: Every covered constant, by name -- the input to :func:`protocol_fingerprint`.
@@ -192,6 +142,7 @@ REGISTRY: dict[str, Any] = {
     "plateau_mk_alpha": PLATEAU_MK_ALPHA,
     "plateau_half_window_rule": PLATEAU_HALF_WINDOW_RULE,
     "plateau_ci_width_threshold_elo": PLATEAU_CI_WIDTH_THRESHOLD_ELO,
+    "plateau_equivalence_margin_elo": PLATEAU_EQUIVALENCE_MARGIN_ELO,
     "plateau_gpu_hours_min": PLATEAU_GPU_HOURS_MIN,
     "plateau_confirmation_count": PLATEAU_CONFIRMATION_COUNT,
 }
