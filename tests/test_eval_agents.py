@@ -10,8 +10,7 @@ integration case delegating to the m3 checkpoint battery's own tampering
 pattern (mismatched game, not a re-test of the whole battery); an end-to-end
 mirrored micro-Blokus pair through ``play_pairs`` +
 ``games.blokus_duo.baselines.start_square_balancer`` with a rung-5 agent; and
-the reflective every-``Game``-ABC-member delegation audit for
-``core.runner._OpeningRestricted``.
+the runner delegation audit lives in ``tests/test_runner.py``.
 """
 
 from __future__ import annotations
@@ -25,15 +24,14 @@ import torch
 import core.eval_agents as eval_agents_module
 from core import RandomAgent
 from core.artifact_fingerprint import FingerprintMismatchError
-from core.checkpoint import build_bundle, write_published_checkpoint
+from core.checkpoint import CheckpointFormatError, build_bundle, write_published_checkpoint
 from core.eval_agents import (
     NetworkPolicyAgent,
     load_eval_network,
     rung5_agent_factory,
 )
-from core.game import Game
-from core.network import Network, NetworkConfig
-from core.runner import _OpeningRestricted, play_pairs
+from core.network import Network, NetworkConfig, make_network_evaluator
+from core.runner import play_pairs
 from core.train import make_optimizer, make_scaler
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.baselines import start_square_balancer
@@ -50,7 +48,7 @@ def _tiny_network_config(game):
 
     Mirrors ``tests/test_checkpoint.py``'s ``_tiny_ttt_net`` pattern (a small,
     fast-to-build net for CPU tests) -- and, since ``core.eval_agents``
-    reconstructs the trunk shape from the saved weights rather than
+    restores the recorded config rather than
     ``NetworkConfig.from_game``, this deliberately non-default trunk
     (1 block x 4 channels, vs. D5's 8x128) is exactly what proves that.
     """
@@ -64,7 +62,7 @@ def _tiny_network_config(game):
     )
 
 
-def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt"):
+def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt", return_source=False):
     """Build and publish one tiny, seeded real checkpoint for ``game``.
 
     Args:
@@ -78,7 +76,7 @@ def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt"):
             per directory but two calls may share a version number).
 
     Returns:
-        The published checkpoint's path.
+        The published checkpoint's path, plus a source evaluator when requested.
     """
     torch.manual_seed(seed)
     net = Network(_tiny_network_config(game))
@@ -94,7 +92,8 @@ def _write_checkpoint(tmp_path, game, *, version, seed, sub_dir="ckpt"):
         scaler=scaler,
         metrics={},
     )
-    return write_published_checkpoint(tmp_path / sub_dir, bundle)
+    path = write_published_checkpoint(tmp_path / sub_dir, bundle)
+    return (path, make_network_evaluator(net, game)) if return_source else path
 
 
 # --- distinct-weights golden (the P1 killer) -----------------------------------------
@@ -106,16 +105,26 @@ def test_distinct_checkpoints_load_distinct_evaluators_and_actions(tmp_path):
     model_version -- the load path actually restored the weights, not just a
     freshly initialized net wearing a borrowed version label (review P1).
     """
-    path1 = _write_checkpoint(tmp_path, MICRO, version=1, seed=1, sub_dir="ckpt1")
-    path2 = _write_checkpoint(tmp_path, MICRO, version=2, seed=2, sub_dir="ckpt2")
+    path1, source1 = _write_checkpoint(
+        tmp_path, MICRO, version=1, seed=1, sub_dir="ckpt1", return_source=True
+    )
+    path2, source2 = _write_checkpoint(
+        tmp_path, MICRO, version=2, seed=2, sub_dir="ckpt2", return_source=True
+    )
 
     ev1, mv1 = load_eval_network(path1, MICRO)
     ev2, mv2 = load_eval_network(path2, MICRO)
     assert (mv1, mv2) == (1, 2)
 
     probe = MICRO.initial_state()
-    _, priors1 = ev1(MICRO, probe)
-    _, priors2 = ev2(MICRO, probe)
+    value1, priors1 = ev1(MICRO, probe)
+    value2, priors2 = ev2(MICRO, probe)
+    expected1, reference1 = source1(MICRO, probe)
+    expected2, reference2 = source2(MICRO, probe)
+    assert value1 == pytest.approx(expected1)
+    assert value2 == pytest.approx(expected2)
+    assert priors1 == pytest.approx(reference1)
+    assert priors2 == pytest.approx(reference2)
     assert set(priors1) == set(priors2)  # same legal ids: same probe state
     assert priors1 != priors2  # different weights -> different raw logits
 
@@ -125,7 +134,8 @@ def test_distinct_checkpoints_load_distinct_evaluators_and_actions(tmp_path):
     assert agent2.name == "rung5-v1-2"
     # Pinned via an independent seed search: seed=1 opens with action 6,
     # seed=2 with action 115, on this exact tiny architecture/probe state.
-    assert agent1.select_action(MICRO, probe) != agent2.select_action(MICRO, probe)
+    assert agent1.select_action(MICRO, probe) == 6
+    assert agent2.select_action(MICRO, probe) == 115
 
 
 # --- rung-5 argmax golden, incl. lowest-id tie-break ---------------------------------
@@ -198,21 +208,7 @@ def test_load_eval_network_rejects_a_tampered_fingerprint_checkpoint(tmp_path):
     integration case rather than re-running that whole negative battery.
     """
     ttt = TicTacToe()
-    torch.manual_seed(5)
-    net = Network(_tiny_network_config(ttt))
-    optimizer = make_optimizer(net, lr=1e-2)
-    scaler = make_scaler("cpu")
-    bundle = build_bundle(
-        version=0,
-        learner_step=0,
-        game=ttt,
-        run_config={},
-        net=net,
-        optimizer=optimizer,
-        scaler=scaler,
-        metrics={},
-    )
-    path = write_published_checkpoint(tmp_path, bundle)
+    path = _write_checkpoint(tmp_path, ttt, version=0, seed=5)
 
     with pytest.raises(FingerprintMismatchError):
         load_eval_network(path, OTHELLO)
@@ -274,84 +270,47 @@ def test_rung5_agent_factory_loads_once_and_shares_across_calls(tmp_path, monkey
     )  # sharing the one loaded evaluator: identical behavior, not just identical name
 
 
-# --- reflective delegation audit: every Game ABC member -------------------------------
+@pytest.mark.parametrize("prefix", ["stem.0.", "blocks.0.", "aux_"])
+def test_load_eval_network_rejects_missing_components(tmp_path, prefix):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    payload = torch.load(path, weights_only=True)
+    original = payload["model_state_dict"]
+    payload["model_state_dict"] = {k: v for k, v in original.items() if not k.startswith(prefix)}
+    assert len(payload["model_state_dict"]) < len(original)
+    torch.save(payload, path)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        load_eval_network(path, MICRO)
 
 
-def test_opening_restricted_delegates_every_game_abc_member():
-    """Every abstract *and* concrete ``Game`` member must delegate to the
-    wrapped game unchanged (outside the deliberate initial-state opening
-    filter) -- so a future ABC addition that this test isn't updated for
-    fails loudly here (the ``declared == set(checks)`` guard below) instead
-    of silently shipping an undelegated member (as ``orientation_table_hash``/
-    ``encoding_conventions`` were before this task, since both are concrete
-    on the ABC and Python happily inherits a default for an unoverridden
-    concrete method -- no ``TypeError`` the way a missed abstract member
-    would raise)."""
-    inner = MICRO
-    wrapper = _OpeningRestricted(inner, lambda a: True)  # accept-all: no filtering effect
+@pytest.mark.parametrize("filename", ["resume.pt", "ckpt-1.pt"])
+def test_load_eval_network_rejects_resume_provenance_even_when_renamed(tmp_path, filename):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    from core.checkpoint import load_checkpoint, write_resume_snapshot
 
-    state0 = inner.initial_state()
-    a0 = min(inner.legal_moves(state0))
-    state1 = inner.apply(state0, a0)  # non-initial, nonterminal: bypasses the filter path
-    a1 = min(inner.legal_moves(state1))
-    move1 = inner.decode_action(a1)
+    snapshot = write_resume_snapshot(tmp_path / "snapshot", load_checkpoint(path, MICRO))
+    renamed = snapshot.with_name(filename)
+    snapshot.rename(renamed)
+    with pytest.raises(CheckpointFormatError, match="published checkpoint"):
+        load_eval_network(renamed, MICRO)
 
-    terminal = state0
-    while not inner.is_terminal(terminal):
-        terminal = inner.apply(terminal, min(inner.legal_moves(terminal)))
 
-    def _symmetry_groups_match(wrapped_group, inner_group):
-        # (transform, permutation) pairs: the transform is a freshly built
-        # closure on every property access (not cached), so two calls never
-        # produce `==`-equal callables even when they behave identically --
-        # compare permutations directly and transforms by their output on a
-        # real encoded state instead of by object identity.
-        sample_planes = inner.encode_state(state1)
-        if len(wrapped_group) != len(inner_group):
-            return False
-        for (t_w, perm_w), (t_i, perm_i) in zip(wrapped_group, inner_group, strict=True):
-            if tuple(perm_w) != tuple(perm_i):
-                return False
-            if t_w(sample_planes) != t_i(sample_planes):
-                return False
-        return True
+@pytest.mark.parametrize("config", [{}, {"input_planes": "4"}])
+def test_load_eval_network_rejects_malformed_architecture(tmp_path, config):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    payload = torch.load(path, weights_only=True)
+    payload["network_config"] = config
+    torch.save(payload, path)
+    with pytest.raises(CheckpointFormatError, match="network_config"):
+        load_eval_network(path, MICRO)
 
-    checks = {
-        # declared capabilities
-        "num_players": (lambda g: g.num_players, None),
-        "is_stochastic": (lambda g: g.is_stochastic, None),
-        "is_perfect_information": (lambda g: g.is_perfect_information, None),
-        "symmetry_group": (lambda g: g.symmetry_group, _symmetry_groups_match),
-        "value_targets": (lambda g: g.value_targets, None),
-        # fingerprint surface
-        "orientation_table_hash": (lambda g: g.orientation_table_hash, None),
-        "encoding_conventions": (lambda g: g.encoding_conventions, None),
-        # core contract
-        "initial_state": (lambda g: g.initial_state(), None),
-        "current_player": (lambda g: g.current_player(state1), None),
-        "legal_moves": (lambda g: list(g.legal_moves(state1)), None),
-        "apply": (lambda g: g.apply(state1, a1), None),
-        "is_terminal": (lambda g: g.is_terminal(state1), None),
-        "terminal_utility": (lambda g: g.terminal_utility(terminal, 0), None),
-        "training_targets": (lambda g: g.training_targets(terminal, 0), None),
-        # encoding surface
-        "encode_state": (lambda g: g.encode_state(state1), None),
-        "encode_action": (lambda g: g.encode_action(move1), None),
-        "decode_action": (lambda g: g.decode_action(a1), None),
-        "policy_shape": (lambda g: g.policy_shape, None),
-        "input_planes": (lambda g: g.input_planes, None),
-        "input_shape": (lambda g: g.input_shape, None),
-    }
 
-    declared = {name for name in vars(Game) if not name.startswith("_")}
-    assert declared == set(checks), (
-        f"Game ABC members missing from this delegation audit: {declared - set(checks)}; "
-        f"stale entries no longer on the ABC: {set(checks) - declared}"
-    )
+def test_checkpoint_records_architecture_independently_of_weights(tmp_path):
+    from core.checkpoint import CHECKPOINT_SCHEMA_VERSION, load_checkpoint
 
-    for name, (call, compare) in checks.items():
-        got, want = call(wrapper), call(inner)
-        if compare is None:
-            assert got == want, name
-        else:
-            assert compare(got, want), name
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    bundle = load_checkpoint(path, MICRO)
+    assert bundle.schema_version == CHECKPOINT_SCHEMA_VERSION == 2
+    assert bundle.network_config == _tiny_network_config(MICRO)
+    assert bundle.artifact_kind == "published"
+    payload = torch.load(path, weights_only=True)
+    assert isinstance(payload["network_config"], dict)

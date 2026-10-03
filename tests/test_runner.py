@@ -11,7 +11,10 @@ import pytest
 
 from core import RandomAgent
 from core.agents import Agent
-from core.runner import play_game, play_pairs
+from core.game import Game
+from core.runner import _OpeningRestricted, play_game, play_pairs
+from games.blokus_duo import BlokusDuo
+from games.blokus_duo.config import MICRO_CONFIG
 from games.tictactoe import TicTacToe
 
 GAME = TicTacToe()
@@ -153,3 +156,86 @@ def test_play_pairs_rejects_a_zero_game_match():
     for bad in (0, -1):
         with pytest.raises(ValueError):
             play_pairs(GAME, rand, rand, n_pairs=bad, seed=0)
+
+
+# --- reflective delegation audit: every Game ABC member -------------------------------
+
+
+def test_opening_restricted_delegates_every_game_abc_member():
+    """Every abstract *and* concrete ``Game`` member must delegate to the
+    wrapped game unchanged (outside the deliberate initial-state opening
+    filter) -- so a future ABC addition that this test isn't updated for
+    fails loudly here (the ``declared == set(checks)`` guard below) instead
+    of silently shipping an undelegated member (as ``orientation_table_hash``/
+    ``encoding_conventions`` were before this task, since both are concrete
+    on the ABC and Python happily inherits a default for an unoverridden
+    concrete method -- no ``TypeError`` the way a missed abstract member
+    would raise)."""
+    inner = BlokusDuo(config=MICRO_CONFIG)
+    wrapper = _OpeningRestricted(inner, lambda a: True)  # accept-all: no filtering effect
+
+    state0 = inner.initial_state()
+    a0 = min(inner.legal_moves(state0))
+    state1 = inner.apply(state0, a0)  # non-initial, nonterminal: bypasses the filter path
+    a1 = min(inner.legal_moves(state1))
+    move1 = inner.decode_action(a1)
+
+    terminal = state0
+    while not inner.is_terminal(terminal):
+        terminal = inner.apply(terminal, min(inner.legal_moves(terminal)))
+
+    def _symmetry_groups_match(wrapped_group, inner_group):
+        # (transform, permutation) pairs: the transform is a freshly built
+        # closure on every property access (not cached), so two calls never
+        # produce `==`-equal callables even when they behave identically --
+        # compare permutations directly and transforms by their output on a
+        # real encoded state instead of by object identity.
+        sample_planes = inner.encode_state(state1)
+        if len(wrapped_group) != len(inner_group):
+            return False
+        for (t_w, perm_w), (t_i, perm_i) in zip(wrapped_group, inner_group, strict=True):
+            if tuple(perm_w) != tuple(perm_i):
+                return False
+            if t_w(sample_planes) != t_i(sample_planes):
+                return False
+        return True
+
+    checks = {
+        # declared capabilities
+        "num_players": (lambda g: g.num_players, None),
+        "is_stochastic": (lambda g: g.is_stochastic, None),
+        "is_perfect_information": (lambda g: g.is_perfect_information, None),
+        "symmetry_group": (lambda g: g.symmetry_group, _symmetry_groups_match),
+        "value_targets": (lambda g: g.value_targets, None),
+        # fingerprint surface
+        "orientation_table_hash": (lambda g: g.orientation_table_hash, None),
+        "encoding_conventions": (lambda g: g.encoding_conventions, None),
+        # core contract
+        "initial_state": (lambda g: g.initial_state(), None),
+        "current_player": (lambda g: g.current_player(state1), None),
+        "legal_moves": (lambda g: list(g.legal_moves(state1)), None),
+        "apply": (lambda g: g.apply(state1, a1), None),
+        "is_terminal": (lambda g: g.is_terminal(state1), None),
+        "terminal_utility": (lambda g: g.terminal_utility(terminal, 0), None),
+        "training_targets": (lambda g: g.training_targets(terminal, 0), None),
+        # encoding surface
+        "encode_state": (lambda g: g.encode_state(state1), None),
+        "encode_action": (lambda g: g.encode_action(move1), None),
+        "decode_action": (lambda g: g.decode_action(a1), None),
+        "policy_shape": (lambda g: g.policy_shape, None),
+        "input_planes": (lambda g: g.input_planes, None),
+        "input_shape": (lambda g: g.input_shape, None),
+    }
+
+    declared = {name for name in vars(Game) if not name.startswith("_")}
+    assert declared == set(checks), (
+        f"Game ABC members missing from this delegation audit: {declared - set(checks)}; "
+        f"stale entries no longer on the ABC: {set(checks) - declared}"
+    )
+
+    for name, (call, compare) in checks.items():
+        got, want = call(wrapper), call(inner)
+        if compare is None:
+            assert got == want, name
+        else:
+            assert compare(got, want), name
