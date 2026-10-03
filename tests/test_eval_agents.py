@@ -696,13 +696,13 @@ def test_rung7_agent_recovers_minimax_moves_with_a_value_perfect_evaluator():
 
 def test_historical_opponents_reproduces_the_pinned_rule_and_edges():
     # k_total=8 -> lag = ceil(8 / 4) = 2, so the pinned set is {v-1, v-2, 1}.
-    versions = tuple(range(1, 11))  # a full 1..10 member list
+    versions = tuple(range(1, 9))  # a full 1..8 member list
 
     assert historical_opponents(versions, candidate=1, k_total=8) == []  # first member: empty
     assert historical_opponents(versions, candidate=2, k_total=8) == [1]  # {1, 0, 1} -> {1}
     assert historical_opponents(versions, candidate=3, k_total=8) == [1, 2]  # {2, 1, 1}
     assert historical_opponents(versions, candidate=5, k_total=8) == [1, 3, 4]  # {4, 3, 1}
-    assert historical_opponents(versions, candidate=10, k_total=8) == [1, 8, 9]  # {9, 8, 1}
+    assert historical_opponents(versions, candidate=8, k_total=8) == [1, 6, 7]  # {7, 6, 1}
 
     for candidate in versions:  # never selects the candidate itself, for every candidate
         assert candidate not in historical_opponents(versions, candidate=candidate, k_total=8)
@@ -833,10 +833,10 @@ def test_historical_opponent_factory_fails_the_cell_before_any_agent_is_built(
 
     def _boom(*args, **kwargs):
         raise AssertionError(
-            "rung_search_agent_factory must never run once the pre-load assert has failed"
+            "network restoration must never run once the pre-load assert has failed"
         )
 
-    monkeypatch.setattr(eval_agents_module, "rung_search_agent_factory", _boom)
+    monkeypatch.setattr(eval_agents_module, "_eval_network_from_bundle", _boom)
 
     with pytest.raises(FingerprintMismatchError):
         eval_agents_module.historical_opponent_factory(ckpt_dir, MICRO, old_version=1)
@@ -894,3 +894,80 @@ def test_identity_sharing_and_connected_elo_graph_with_random_anchor(tmp_path):
     ratings = fit_elo(matches, anchor="random")
     assert set(ratings) == {"random", name_v2, "rung7-v1-1"}
     assert ratings["random"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        (1, []),
+        (2, [1]),
+        (3, [1, 2]),
+        (9, [1, 8]),
+        (10, [1, 2, 9]),
+        (11, [1, 3, 10]),
+        (30, [1, 22, 29]),
+    ],
+)
+def test_historical_opponents_production_k30_golden(candidate, expected):
+    assert historical_opponents(tuple(range(1, 31)), candidate, k_total=30) == expected
+
+
+@pytest.mark.parametrize("k_total", [1, 2, 3, 4])
+def test_historical_opponents_lag_one_collapses_duplicates(k_total):
+    expected = [] if k_total == 1 else sorted({1, k_total - 1})
+    assert historical_opponents(tuple(range(1, k_total + 1)), k_total, k_total=k_total) == expected
+
+
+@pytest.mark.parametrize(
+    ("versions", "candidate", "k_total", "offender"),
+    [
+        ([1, 9, 10], 10, 8, "9, 10"),
+        ([1, 50], 50, 30, "50"),
+        ([1, 2], 0, 30, "candidate 0"),
+        ([1, 2], 31, 30, "candidate 31"),
+    ],
+)
+def test_historical_opponents_rejects_out_of_domain_ids(versions, candidate, k_total, offender):
+    with pytest.raises(ValueError, match=offender):
+        historical_opponents(versions, candidate, k_total=k_total)
+
+
+@pytest.mark.parametrize("old_version", [0, -1])
+def test_historical_factory_rejects_nonmembers_before_resolving_path(
+    tmp_path, monkeypatch, old_version
+):
+    def unexpected_path(*args):
+        raise AssertionError("invalid version must fail before path resolution")
+
+    monkeypatch.setattr(eval_agents_module, "published_checkpoint_path", unexpected_path)
+    with pytest.raises(ValueError, match=f"got {old_version}"):
+        historical_opponent_factory(tmp_path, MICRO, old_version)
+
+
+def test_historical_factory_rejects_payload_version_mismatch_before_network_restore(
+    tmp_path, monkeypatch
+):
+    path = _write_checkpoint(tmp_path, MICRO, version=7, seed=1)
+    path.rename(published_checkpoint_path(path.parent, 5))
+
+    def unexpected_network(*args):
+        raise AssertionError("identity mismatch must fail before network restoration")
+
+    monkeypatch.setattr(eval_agents_module, "_eval_network_from_bundle", unexpected_network)
+    with pytest.raises(ValueError, match="payload version 7, expected 5"):
+        historical_opponent_factory(path.parent, MICRO, old_version=5)
+
+
+def test_historical_factory_deserializes_checkpoint_once(tmp_path, monkeypatch):
+    path = _write_checkpoint(tmp_path, MICRO, version=1, seed=1)
+    original_load = eval_agents_module.load_checkpoint
+    calls = []
+
+    def count_load(*args, **kwargs):
+        calls.append(args[0])
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(eval_agents_module, "load_checkpoint", count_load)
+    factory = historical_opponent_factory(path.parent, MICRO, old_version=1, sims=1)
+    assert factory(0).name == factory(1).name == "rung7-v1-1"
+    assert calls == [path]
