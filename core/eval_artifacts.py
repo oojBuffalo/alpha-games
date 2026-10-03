@@ -8,6 +8,8 @@ from typing import Any
 
 from core.eval_protocol import (
     BOOTSTRAP_B_PRODUCTION,
+    EVAL_SIMS,
+    PAIRS_PER_CELL,
     PROTOCOL_VERSION,
     REGISTRY,
     protocol_fingerprint,
@@ -25,7 +27,7 @@ from core.eval_stats import (
     per_checkpoint_ci,
     replicate_deltas,
 )
-from core.eval_store import EvalSnapshot, eval_dir, load_snapshot
+from core.eval_store import EvalSnapshot, eval_dir, iter_cells, load_snapshot, read_cell
 from core.observability import reduce_run
 from core.replay_shard import _atomic_write_json
 from core.run_identity import read_stored_config
@@ -89,6 +91,8 @@ def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
             ``checkpoint_published`` marker for it) this function refuses to
             paper over.
     """
+    if Path(run_dir).resolve() != Path(snapshot.run_dir).resolve():
+        raise ValueError("run_dir must identify the same run as snapshot.run_dir")
     ratings = fit_snapshot_elo(snapshot)
     reduced = reduce_run(run_dir)
 
@@ -146,6 +150,15 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _production_identity(identity: str) -> bool:
+    """Require bare v1 network forms; frozen network-free names stay opaque."""
+    if "-s" in identity:
+        return False
+    if identity.startswith(("rung5-", "rung6-", "rung7-")):
+        return identity.startswith(("rung5-v1-", "rung6-v1-", "rung7-v1-"))
+    return True
+
+
 def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> dict[str, Any]:
     """Assemble and durably write the §12 M5.5 verdict artifact.
 
@@ -174,7 +187,8 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
     per-checkpoint CIs and Mann-Kendall result for the evaluated prefix.
     An empty prefix skips fitting and bootstrap, writes an empty curve and
     checkpoint list, and reports insufficient data for Mann-Kendall.
-    ``authoritative`` requires both the complete K-set **and** ``B ==
+    ``authoritative`` requires production cell settings and identities,
+    the complete K-set, and ``B ==
     core.eval_protocol.BOOTSTRAP_B_PRODUCTION`` exactly -- a complete K-set
     evaluated at a smaller admissible ``B`` (e.g. a reduced-cost test run)
     still carries a full Delta/CI/gate, just never the ``authoritative`` flag.
@@ -214,7 +228,18 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
     eval_seed_value = stored_config.run.evaluation.eval_seed
 
     seed = bootstrap_seed(eval_seed_value)
-    point_curve = checkpoint_elo(fit_snapshot_elo(snapshot)) if snapshot.member_prefix else []
+    point_ratings = fit_snapshot_elo(snapshot) if snapshot.member_prefix else {}
+    point_curve = checkpoint_elo(point_ratings)
+    production_identities = all(_production_identity(name) for name in point_ratings)
+    production_cells = production_identities and all(
+        (
+            _production_identity(header.candidate_identity)
+            and _production_identity(header.opponent_identity)
+            and header.eval_config.get("pairs_per_cell") == PAIRS_PER_CELL
+            and header.eval_config.get("eval_sims", EVAL_SIMS) == EVAL_SIMS
+        )
+        for header, _ in (read_cell(path) for path in iter_cells(snapshot))
+    )
     checkpoints_evaluated = snapshot.member_prefix
     is_complete_k_set = checkpoints_evaluated == k_target
 
@@ -245,7 +270,9 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
             "ci": [delta_ci[0], delta_ci[1]],
             "gate": delta_gate(delta_ci),
         }
-        reason = None
+        reason = (
+            None if production_cells else "non-production evaluation cell settings or identities"
+        )
     else:
         delta_payload = None
         reason = (
@@ -264,7 +291,7 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
     elo_curve_fingerprint = _file_sha256(elo_curve_path(run_dir))
 
     payload: dict[str, Any] = {
-        "authoritative": is_complete_k_set and B == BOOTSTRAP_B_PRODUCTION,
+        "authoritative": (is_complete_k_set and B == BOOTSTRAP_B_PRODUCTION and production_cells),
         "checkpoints_evaluated": checkpoints_evaluated,
         "k_target": k_target,
         "bootstrap_b": B,

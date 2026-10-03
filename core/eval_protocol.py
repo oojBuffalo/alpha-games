@@ -40,7 +40,8 @@ PROTOCOL_VERSION = 2
 #: ``PROTOCOL_VERSION``: the record *shape* a reader must recognize can move
 #: separately from the *values* the protocol pins). ``core.eval_store`` rejects any
 #: schema_version it does not equal, loudly.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# v2 adds required cell_seed and full candidate-form identity in the cell path.
 
 # --- seed-derivation labels (core.seeding.derive_seed literal label parts) --------
 
@@ -140,7 +141,7 @@ STATISTICAL_CONVENTIONS = {
     "mann_kendall_zero_variance": "s=0,z=0,p=1",
     "snapshot_scope": "complete-contiguous-member-prefix-only",
     "delta_snapshot_gate": "prefix-equals-k-target",
-    "authoritative_gate": "complete-k-set-and-production-b",
+    "authoritative_gate": "complete-k-set-production-b-and-production-cells",
     "finite_fit": "one-virtual-draw-per-unordered-matchup",
 }
 

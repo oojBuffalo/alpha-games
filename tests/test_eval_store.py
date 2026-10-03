@@ -61,9 +61,11 @@ def _make_header(
     opponent_id: str = "random",
     eval_config: dict | None = None,
     candidate_fingerprint: dict | None = None,
+    cell_seed: int = 0,
 ) -> CellHeader:
     return build_header(
         run_id=run_id,
+        cell_seed=cell_seed,
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=f"rung{rung}-v1-{candidate_version}",
         opponent_identity=opponent_id,
@@ -77,7 +79,7 @@ def _make_header(
 def _flat_record(pair_index: int, score_a: float = 1.0) -> PairRecord:
     return PairRecord(
         pair_index=pair_index,
-        pair_seed=pair_index,
+        pair_seed=derive_seed(0, "pair", pair_index),
         score_a=score_a,
         games=(GameRecordSnapshot(plies=1, opening=0), GameRecordSnapshot(plies=1, opening=0)),
     )
@@ -333,7 +335,7 @@ def test_resumption_golden_byte_identical_after_a_torn_tail(tmp_path):
     seed = 4242
     n_pairs = 6
     kill_at = 3
-    header = _make_header(candidate_version=1)
+    header = _make_header(candidate_version=1, cell_seed=seed)
 
     ref_dir = tmp_path / "uninterrupted"
     ref_next = open_cell_for_write(ref_dir, header)
@@ -363,7 +365,7 @@ def test_resumption_golden_byte_identical_after_a_torn_tail(tmp_path):
 def test_open_cell_for_write_resumes_transparently(tmp_path):
     game = TicTacToe()
     seed = 99
-    header = _make_header(candidate_version=1)
+    header = _make_header(candidate_version=1, cell_seed=seed)
     next_index = open_cell_for_write(tmp_path, header)
     assert next_index == 0
     path = cell_path(tmp_path, header.cell_id.to_string())
@@ -400,7 +402,7 @@ def test_open_cell_for_resume_raises_on_mid_stream_corruption_without_truncating
     """
     game = TicTacToe()
     seed = 777
-    header = _make_header(candidate_version=1)
+    header = _make_header(candidate_version=1, cell_seed=seed)
     open_cell_for_write(tmp_path, header)
     path = cell_path(tmp_path, header.cell_id.to_string())
     _play_and_append(path, game, seed, 0, 3)  # durable pair_index 0, 1, 2
@@ -521,6 +523,7 @@ def test_complete_cell_is_idempotent_and_never_reopens(tmp_path):
     cid = build_cell_id(1, 7, "random")
     register_member(tmp_path, 1, [cid])
     assert not is_cell_complete(tmp_path, cid)
+    _fill_cell(tmp_path, _make_header(candidate_version=1), PAIRS_PER_CELL)
     complete_cell(tmp_path, cid)
     assert is_cell_complete(tmp_path, cid)
     before = json.loads(manifest_path(tmp_path).read_text())
@@ -624,9 +627,9 @@ def test_snapshot_fingerprint_is_invariant_to_manifest_timestamps(tmp_path):
 def test_snapshot_rejects_manifest_marking_a_missing_cell_complete(tmp_path):
     cid = build_cell_id(1, 7, "random")
     register_member(tmp_path, 1, [cid])
-    complete_cell(tmp_path, cid)  # no cell file was ever written
     with pytest.raises(ManifestError):
-        load_snapshot(tmp_path)
+        complete_cell(tmp_path, cid)
+    assert not is_cell_complete(tmp_path, cid)
 
 
 def test_snapshot_rejects_a_cell_short_of_its_pinned_pair_count(tmp_path):
@@ -634,9 +637,9 @@ def test_snapshot_rejects_a_cell_short_of_its_pinned_pair_count(tmp_path):
     cid = header.cell_id.to_string()
     register_member(tmp_path, 1, [cid])
     _fill_cell(tmp_path, header, 2)  # short of PAIRS_PER_CELL
-    complete_cell(tmp_path, cid)
     with pytest.raises(ManifestError):
-        load_snapshot(tmp_path)
+        complete_cell(tmp_path, cid)
+    assert not is_cell_complete(tmp_path, cid)
 
 
 def test_snapshot_rejects_a_cell_whose_header_disagrees_with_its_own_filename(tmp_path):
@@ -647,9 +650,8 @@ def test_snapshot_rejects_a_cell_whose_header_disagrees_with_its_own_filename(tm
     write_header(path, header)  # header says "random"; filed under "mobility"
     for i in range(PAIRS_PER_CELL):
         append_pair_record(path, _flat_record(i))
-    complete_cell(tmp_path, wrong_cid)
     with pytest.raises(ManifestError):
-        load_snapshot(tmp_path)
+        complete_cell(tmp_path, wrong_cid)
 
 
 def test_snapshot_rejects_unknown_manifest_schema_version(tmp_path):
@@ -681,3 +683,167 @@ def test_iter_cells_yields_every_completed_cell_in_sorted_order(tmp_path):
         read_header, records = read_cell(path)
         assert len(records) == PAIRS_PER_CELL
         assert read_header.schema_version == eval_protocol.SCHEMA_VERSION
+
+
+def test_form_versions_and_search_budgets_have_distinct_cell_paths():
+    cells = [
+        CellId(12, 7, "random"),
+        CellId(12, 7, "random", full_candidate_identity="rung7-v2-12"),
+        CellId(12, 7, "random", full_candidate_identity="rung7-v1-s64-12"),
+    ]
+    assert len({cell.to_string() for cell in cells}) == 3
+    for cell in cells:
+        assert parse_cell_id(cell.to_string()) == cell
+
+
+@pytest.mark.parametrize("field", ["candidate_identity", "opponent_identity"])
+def test_header_duplicate_identity_must_agree(field):
+    with pytest.raises(ConfigMismatchError):
+        dataclasses.replace(
+            _make_header(), **{field: "mobility" if field == "opponent_identity" else "rung7-v2-12"}
+        )
+
+
+@pytest.mark.parametrize("fragment", [b"", b'{"candidate_fingerprint":{"h"'])
+def test_legacy_torn_header_is_recovered(tmp_path, fragment):
+    header = _make_header()
+    path = cell_path(tmp_path, header.cell_id.to_string())
+    path.parent.mkdir(parents=True)
+    path.write_bytes(fragment)
+    assert open_cell_for_write(tmp_path, header) == 0
+    assert read_cell(path) == (header, [])
+
+
+def test_failed_header_publication_never_exposes_partial_file(tmp_path, monkeypatch):
+    import core.eval_store as store
+
+    path = tmp_path / "cell.jsonl"
+
+    def crash(*args):
+        raise OSError("crash before publication")
+
+    with monkeypatch.context() as m:
+        m.setattr(store.os, "link", crash)
+        with pytest.raises(OSError):
+            write_header(path, _make_header())
+    assert not path.exists()
+    write_header(path, _make_header())
+    assert read_cell(path)[0] == _make_header()
+
+
+def test_concurrent_header_publication_has_one_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "cell.jsonl"
+
+    def publish(_):
+        try:
+            write_header(path, _make_header())
+            return True
+        except FileExistsError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert sum(pool.map(publish, range(8))) == 1
+    assert read_cell(path) == (_make_header(), [])
+
+
+def test_completed_cell_rejects_all_write_surfaces_and_retained_path(tmp_path):
+    header = _make_header(candidate_version=1)
+    cid = _write_and_complete_cell(tmp_path, header)
+    path = cell_path(tmp_path, cid)
+    original = path.read_bytes()
+    for operation in [
+        lambda: open_cell_for_write(tmp_path, header),
+        lambda: open_cell_for_resume(path, header),
+        lambda: append_pair_record(path, _flat_record(PAIRS_PER_CELL)),
+    ]:
+        with pytest.raises(ManifestError):
+            operation()
+        assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("indices", [[1], [0, 0], [0, 2], [1, 0]])
+def test_resume_and_read_reject_noncontiguous_pairs(tmp_path, indices):
+    header = _make_header()
+    path = cell_path(tmp_path, header.cell_id.to_string())
+    open_cell_for_write(tmp_path, header)
+    with path.open("a") as fh:
+        for index in indices:
+            fh.write(json.dumps(_flat_record(index).to_dict()) + "\n")
+    for operation in [lambda: open_cell_for_resume(path, header), lambda: read_cell(path)]:
+        with pytest.raises(CorruptedCellError):
+            operation()
+
+
+def test_changed_seed_and_wrong_pair_seed_are_rejected(tmp_path):
+    header = _make_header()
+    path = _fill_cell(tmp_path, header, 1)
+    with pytest.raises(ConfigMismatchError):
+        open_cell_for_resume(path, dataclasses.replace(header, cell_seed=42))
+    with pytest.raises(ConfigMismatchError):
+        append_pair_record(path, dataclasses.replace(_flat_record(1), pair_seed=999))
+    assert len(read_cell(path)[1]) == 1
+
+
+def test_full_scheduled_cell_cannot_resume_or_append(tmp_path):
+    header = _make_header()
+    path = _fill_cell(tmp_path, header, PAIRS_PER_CELL)
+    with pytest.raises(ManifestError):
+        open_cell_for_write(tmp_path, header)
+    with pytest.raises(ManifestError):
+        append_pair_record(path, _flat_record(PAIRS_PER_CELL))
+
+
+def test_future_header_schema_checked_before_renamed_fields(tmp_path):
+    header = _make_header()
+    path = _fill_cell(tmp_path, header, 0)
+    path.write_text(json.dumps({"schema_version": 999, "future_run": "foo"}) + "\n")
+    for operation in [lambda: read_cell(path), lambda: open_cell_for_resume(path, header)]:
+        with pytest.raises(SchemaVersionError):
+            operation()
+
+
+def test_concurrent_manifest_updates_preserve_every_registration_and_completion(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    first = _make_header(candidate_version=1)
+    cid = first.cell_id.to_string()
+    register_member(tmp_path, 1, [cid])
+    _fill_cell(tmp_path, first, PAIRS_PER_CELL)
+
+    def update(version):
+        if version == 1:
+            complete_cell(tmp_path, cid)
+        else:
+            register_member(tmp_path, version, [build_cell_id(version, 7, "random")])
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(update, range(1, 25)))
+    manifest = json.loads(manifest_path(tmp_path).read_text())
+    assert len(manifest["members"]) == 24
+    assert is_cell_complete(tmp_path, cid)
+
+
+def test_post_hole_completion_leaves_prefix_fingerprint_and_iterator_unchanged(tmp_path):
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1))
+    register_member(tmp_path, 2, [build_cell_id(2, 7, "random")])
+    before = load_snapshot(tmp_path)
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=3))
+    after = load_snapshot(tmp_path)
+    assert after.completed_cell_ids != before.completed_cell_ids
+    assert after.snapshot_fingerprint == before.snapshot_fingerprint
+    assert list(iter_cells(after)) == list(iter_cells(before))
+
+
+def test_legacy_schema_rejected_before_missing_seed_parse(tmp_path):
+    header = _make_header()
+    path = _fill_cell(tmp_path, header, 0)
+    payload = header.to_dict()
+    payload["schema_version"] = 1
+    del payload["cell_seed"]
+    path.write_text(json.dumps(payload) + "\n")
+    with pytest.raises(SchemaVersionError):
+        read_cell(path)
+    with pytest.raises(SchemaVersionError):
+        open_cell_for_resume(path, header)
