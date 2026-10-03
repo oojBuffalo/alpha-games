@@ -21,18 +21,8 @@ additive only. Nothing here is ever edited in place to change a *value*; a genui
 value change is a new ``PROTOCOL_VERSION`` and, per the design doc, a new eval
 namespace (the relaunch guard in a later task refuses to mix evidence across one).
 
-**Doc-first status, as observable on this branch.** tasks/m4/001's actual design-doc
-amendment -- the §9/status-header/§12 edits that pin pairs-per-cell, the eval
-search-form sim budget, and the rung-8 rule -- lives on a sibling branch
-(``docs/m4-pin-eval-protocol``) that, as of this module's own commit, is not an
-ancestor of this line of history: ``metadocs/blokus-duo-az-design-v0_5.md`` checked
-out here still carries the "to pin doc-first at M4" flags that amendment resolves.
-The constants below already match that pending amendment's values, so this module is
-the *code* side of the pin, staged ahead of the doc branch landing -- not a claim
-that the doc has already been amended in this history. Per the project's "design-doc
-changes precede divergent code" rule, the two branches must merge together (or the
-doc branch first) before any "pin" reference below should be read as citing an
-already-merged doc section rather than the value the pending amendment specifies.
+The design-doc amendment is an ancestor of this branch; the doc golden requires
+its section-9 pin block to exist.
 """
 
 from __future__ import annotations
@@ -69,6 +59,8 @@ SEED_LABEL_SEAT_B = "b"
 #: PURPOSE_EVAL, cell_id)``). Recorded here so the two sides are pinned against one
 #: source rather than a literal someone has to keep in sync by memory.
 SEED_LABEL_EVAL = "eval"
+SEED_LABEL_BOOTSTRAP = "bootstrap"
+SEED_LABEL_REPLICATE = "replicate"
 
 # --- pinned eval constants (tasks/m4/001) -----------------------------------------
 
@@ -117,6 +109,29 @@ BOOTSTRAP_B_ADMISSIBLE_REMAINDER = 39
 BOOTSTRAP_CI_LOWER_QUANTILE = 0.025
 BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
 
+# Statistical and evidence conventions covered by section 9, pins 7-10.
+DELTA_WINDOW_DIVISOR = 3
+DELTA_GATE_THRESHOLD = 0.0
+MK_MIN_OBSERVATIONS = 3
+VIRTUAL_DRAW_SCORE = 0.5
+VIRTUAL_DRAW_GAMES = 1
+STATISTICAL_CONVENTIONS = {
+    "bootstrap_resampling": "within-cell-paired-records-with-replacement",
+    "bootstrap_fit": "joint-refit-each-replicate-warm-started",
+    "bootstrap_iteration_order": "sorted-cell-id-then-stored-record-order",
+    "delta_window_rounding": "ceiling",
+    "delta_gate_comparison": "lower-ci-strictly-greater-than-threshold",
+    "mann_kendall_variance": "tie-corrected",
+    "mann_kendall_continuity": "subtract-sign-s",
+    "mann_kendall_p": "two-sided-normal",
+    "mann_kendall_insufficient": "s-z-p-null",
+    "mann_kendall_zero_variance": "s=0,z=0,p=1",
+    "snapshot_scope": "complete-contiguous-member-prefix-only",
+    "delta_snapshot_gate": "prefix-equals-k-target",
+    "authoritative_gate": "complete-k-set-and-production-b",
+    "finite_fit": "one-virtual-draw-per-unordered-matchup",
+}
+
 #: Every covered constant, by name -- the input to :func:`protocol_fingerprint`.
 #: Additive only (see the module docstring): a later task adds keys here, never
 #: repurposes one to mean something else.
@@ -127,6 +142,14 @@ REGISTRY: dict[str, Any] = {
     "seed_label_seat_a": SEED_LABEL_SEAT_A,
     "seed_label_seat_b": SEED_LABEL_SEAT_B,
     "seed_label_eval": SEED_LABEL_EVAL,
+    "seed_label_bootstrap": SEED_LABEL_BOOTSTRAP,
+    "seed_label_replicate": SEED_LABEL_REPLICATE,
+    "delta_window_divisor": DELTA_WINDOW_DIVISOR,
+    "delta_gate_threshold": DELTA_GATE_THRESHOLD,
+    "mk_min_observations": MK_MIN_OBSERVATIONS,
+    "virtual_draw_score": VIRTUAL_DRAW_SCORE,
+    "virtual_draw_games": VIRTUAL_DRAW_GAMES,
+    **STATISTICAL_CONVENTIONS,
     "pairs_per_cell": PAIRS_PER_CELL,
     "eval_sims": EVAL_SIMS,
     "rung8_lag_divisor": RUNG8_LAG_DIVISOR,

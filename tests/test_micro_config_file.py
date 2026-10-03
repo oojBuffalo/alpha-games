@@ -250,7 +250,10 @@ def test_loader_parses_the_pinned_file():
 def test_loaded_config_round_trips():
     """``to_dict`` reproduces the file (minus doc keys) and reparses to itself."""
     cfg = load_run_config()
-    assert cfg.to_dict() == _raw()
+    expected = _raw()
+    expected["evaluation"]["protocol_version"] = cfg.evaluation.protocol_version
+    expected["evaluation"]["protocol_fingerprint"] = cfg.evaluation.protocol_fingerprint
+    assert cfg.to_dict() == expected
     assert RunConfig.from_dict(cfg.to_dict()) == cfg
 
 

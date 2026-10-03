@@ -126,6 +126,10 @@ FIELD_CLASSIFICATION: dict[str, str] = {
     "evaluation.n_pairs": NON_MATERIAL,
     "evaluation.eval_seed": NON_MATERIAL,
     "evaluation.min_score_rate": NON_MATERIAL,
+    # Evaluation protocol changes do not alter training. Stored stamp mismatches
+    # are rejected by RunConfig before a resume diff can relabel eval evidence.
+    "evaluation.protocol_version": NON_MATERIAL,
+    "evaluation.protocol_fingerprint": NON_MATERIAL,
     # --- loss_predicates (M2.5 exit-gate; orthogonal -- see above) ---
     "loss_predicates.head_window_steps": NON_MATERIAL,
     "loss_predicates.tail_window_steps": NON_MATERIAL,

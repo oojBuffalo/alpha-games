@@ -86,13 +86,9 @@ them:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
-import os
 import random
 import re
-import uuid
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -106,21 +102,18 @@ from core.eval_protocol import (
     BOOTSTRAP_B_PRODUCTION,
     BOOTSTRAP_CI_LOWER_QUANTILE,
     BOOTSTRAP_CI_UPPER_QUANTILE,
-    PROTOCOL_VERSION,
-    REGISTRY,
-    protocol_fingerprint,
+    DELTA_GATE_THRESHOLD,
+    DELTA_WINDOW_DIVISOR,
+    MK_MIN_OBSERVATIONS,
+    SEED_LABEL_REPLICATE,
 )
 from core.eval_store import (
     EvalSnapshot,
     PairRecord,
-    eval_dir,
     iter_cells,
-    load_snapshot,
     read_cell,
     records_to_match,
 )
-from core.observability import reduce_run
-from core.run_identity import read_stored_config
 from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 #: The M1.6 frozen ladder's rung-1 anchor identity -- ``core.agents.RandomAgent.name``
@@ -136,20 +129,6 @@ ANCHOR_AGENT = "random"
 #: importing that module (which pulls in the checkpoint-loading machinery this module
 #: has no other reason to depend on).
 _RUNG7_IDENTITY = re.compile(r"^rung7-v1-(\d+)$")
-
-_ELO_CURVE_NAME = "elo_curve.json"
-
-
-def elo_curve_path(run_dir: Path | str) -> Path:
-    """Return the §1 plot series' on-disk path for one run.
-
-    Args:
-        run_dir: The run's root directory.
-
-    Returns:
-        ``<run_dir>/eval/elo_curve.json``.
-    """
-    return eval_dir(run_dir) / _ELO_CURVE_NAME
 
 
 def _snapshot_cell_records(
@@ -319,7 +298,7 @@ def bootstrap_replicate_matches(snapshot: EvalSnapshot, bootstrap_seed: int, b: 
     """Resample replicate ``b``'s in-scope cells from ``snapshot`` into ``Match`` objects.
 
     Replicate ``b`` draws its own generator from ``derive_seed(bootstrap_seed,
-    "replicate", b)`` (task 1 pin 7) -- independent of every other replicate's
+    SEED_LABEL_REPLICATE, b)`` (task 1 pin 7) -- independent of every other replicate's
     stream (a fresh ``random.Random`` per call, never a shared or advanced one),
     so replicate ``b`` is reproducible from ``(bootstrap_seed, b)`` alone, without
     any other replicate ever having been computed. Within each of ``snapshot``'s
@@ -336,7 +315,7 @@ def bootstrap_replicate_matches(snapshot: EvalSnapshot, bootstrap_seed: int, b: 
     Returns:
         One resampled ``Match`` per in-scope cell, in sorted cell-id order.
     """
-    seed = derive_seed(bootstrap_seed, "replicate", b)
+    seed = derive_seed(bootstrap_seed, SEED_LABEL_REPLICATE, b)
     return _resample_matches(_snapshot_cell_records(snapshot), seed)
 
 
@@ -416,7 +395,7 @@ def bootstrap_replicates(
     point_estimate = fit_snapshot_elo(snapshot)
     cells = _snapshot_cell_records(snapshot)
     for b in range(B):
-        seed = derive_seed(bootstrap_seed, "replicate", b)
+        seed = derive_seed(bootstrap_seed, SEED_LABEL_REPLICATE, b)
         matches = _resample_matches(cells, seed)
         yield fit_elo(matches, anchor=ANCHOR_AGENT, initial_ratings=point_estimate)
 
@@ -472,7 +451,9 @@ def delta_windows(K: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """
     if K < 1:
         raise ValueError(f"K must be >= 1, got {K}")
-    window = -(-K // 3)  # ceil(K / 3), pure-integer -- never a float rounding path.
+    window = -(
+        -K // DELTA_WINDOW_DIVISOR
+    )  # ceil(K / 3), pure-integer -- never a float rounding path.
     first_versions = tuple(range(1, window + 1))
     final_versions = tuple(range(K - window + 1, K + 1))
     return first_versions, final_versions
@@ -619,7 +600,7 @@ def delta_gate(ci: tuple[float, float]) -> bool:
         ``ci[0] > 0.0`` -- the lower CI endpoint alone determines the gate,
         since ``order_statistic_ci`` already guarantees ``ci[0] <= ci[1]``.
     """
-    return ci[0] > 0.0
+    return ci[0] > DELTA_GATE_THRESHOLD
 
 
 def per_checkpoint_ci(
@@ -715,7 +696,7 @@ def mann_kendall(values: Sequence[float]) -> MannKendallResult:
         None``) if ``len(values) < 3``; otherwise a populated ``(s, z, p)``.
     """
     n = len(values)
-    if n < 3:
+    if n < MK_MIN_OBSERVATIONS:
         return MannKendallResult(n=n, insufficient_data=True, s=None, z=None, p=None)
 
     s = 0
@@ -738,256 +719,27 @@ def mann_kendall(values: Sequence[float]) -> MannKendallResult:
     return MannKendallResult(n=n, insufficient_data=False, s=s, z=z, p=p)
 
 
-def _atomic_write_json(path: Path, payload: Any) -> None:
-    """Write ``payload`` as JSON to ``path``, durable and atomic.
+# Compatibility entry points: inference stays here; filesystem and artifact
+# assembly live in the publishing wrapper. Imports are lazy to avoid a cycle.
+def elo_curve_path(run_dir: Path | str) -> Path:
+    from core.eval_artifacts import elo_curve_path as implementation
 
-    Temp-name-then-``os.replace`` -- the same primitive
-    ``core.eval_store._atomic_write_manifest`` and ``core.checkpoint`` use for
-    their own replaceable artifacts: a reader can never observe a partially
-    written file.
-
-    Args:
-        path: Destination file path; its parent directory is created if
-            missing.
-        payload: A JSON-serializable value.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, sort_keys=True, indent=2)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    return implementation(run_dir)
 
 
 def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
-    """Fit and join the design doc §1 plot series, writing it durably.
+    from core.eval_artifacts import elo_curve as implementation
 
-    One anchored Bradley-Terry fit (:func:`fit_snapshot_elo`) over
-    ``snapshot``, joined member-by-member against
-    ``core.observability.reduce_run(run_dir)``'s frozen ``checkpoints``
-    contract -- the ``checkpoint_published``-marker x-axis coordinates
-    (``learner_step``, cumulative ``positions_evaluated``, single-counted
-    ``gpu_hours``) at each member's publish point in run time order. Every
-    row's ``net_evals`` is therefore exact only up to one actor flush period:
-    the cumulative positions-evaluated sum as of the publish marker's own
-    position in the global run-time ordering, never interpolated between
-    flushes -- ``reduce_run``'s own documented bound, restated here because
-    this is where a plot consumer reads it, not re-derived.
-
-    Writes ``<run_dir>/eval/elo_curve.json`` (:func:`_atomic_write_json`, so a
-    reader never observes a partially written file) and returns the identical
-    payload. matplotlib is deliberately not a dependency of this codebase --
-    a plotting consumer reads this file directly. Distinguishing this
-    (necessarily provisional, mid-run) series from an authoritative final one
-    is task 7's concern, not this function's.
-
-    Args:
-        run_dir: The run's root directory -- both ``snapshot``'s own root (an
-            eval-store snapshot is always read from one run) and the root
-            ``core.observability.reduce_run`` aggregates metrics under.
-        snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``,
-            covering this run.
-
-    Returns:
-        ``{"snapshot_fingerprint": str, "rows": [{"model_version", "elo",
-        "learner_step", "net_evals", "gpu_hours"}, ...]}`` -- rows ordered by
-        ``model_version`` ascending, covering exactly the snapshot's in-scope
-        members (:func:`snapshot_matches`'s member-prefix scope).
-
-    Raises:
-        ValueError: If :func:`fit_snapshot_elo` raises (a disconnected
-            agent), or if some member version :func:`checkpoint_elo` returns
-            has no matching entry in ``reduce_run(run_dir).checkpoints`` --
-            an eval-store/observability inconsistency (e.g. a candidate
-            scored in the eval store whose learner never wrote a
-            ``checkpoint_published`` marker for it) this function refuses to
-            paper over.
-    """
-    ratings = fit_snapshot_elo(snapshot)
-    reduced = reduce_run(run_dir)
-
-    rows: list[dict[str, Any]] = []
-    for model_version, elo in checkpoint_elo(ratings):
-        coords = reduced.checkpoints.get(model_version)
-        if coords is None:
-            raise ValueError(
-                f"member version {model_version} is scored in the eval snapshot but has no "
-                f"checkpoint_published marker in {run_dir!r}'s reduced metrics -- "
-                "eval-store/observability inconsistency"
-            )
-        learner_step, positions_evaluated, gpu_hours = coords
-        rows.append(
-            {
-                "model_version": model_version,
-                "elo": elo,
-                "learner_step": learner_step,
-                "net_evals": positions_evaluated,
-                "gpu_hours": gpu_hours,
-            }
-        )
-
-    payload = {"snapshot_fingerprint": snapshot.snapshot_fingerprint, "rows": rows}
-    _atomic_write_json(elo_curve_path(run_dir), payload)
-    return payload
-
-
-# ---------------------------------------------------------------------------------
-# verdict.json assembly (task 7.3; design doc §9/§12; task 1 pin 8; reviews
-# P4/P6/P7; second pass P2.1/P2.2/S2.2).
-# ---------------------------------------------------------------------------------
-
-_VERDICT_NAME = "verdict.json"
+    return implementation(run_dir, snapshot)
 
 
 def verdict_path(run_dir: Path | str) -> Path:
-    """Return the §12 M5.5 verdict artifact's on-disk path for one run.
+    from core.eval_artifacts import verdict_path as implementation
 
-    Args:
-        run_dir: The run's root directory.
-
-    Returns:
-        ``<run_dir>/eval/verdict.json``.
-    """
-    return eval_dir(run_dir) / _VERDICT_NAME
-
-
-def _file_sha256(path: Path) -> str:
-    """Return the sha256 hex digest of a file's raw on-disk bytes.
-
-    Args:
-        path: The file to hash.
-
-    Returns:
-        A 64-character lowercase hex digest.
-    """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return implementation(run_dir)
 
 
 def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> dict[str, Any]:
-    """Assemble and durably write the §12 M5.5 verdict artifact.
+    from core.eval_artifacts import build_verdict as implementation
 
-    The one-shot orchestrator over every earlier piece of this module. Reads
-    the watched run's own stored config
-    (``core.run_identity.read_stored_config``) for ``k_target``
-    (``training.checkpoint_count``) and the eval seed
-    (``evaluation.eval_seed``); loads the run's eval-store snapshot
-    (``core.eval_store.load_snapshot``); fits the point estimate
-    (:func:`fit_snapshot_elo`) and refreshes the §1 plot series
-    (:func:`elo_curve`) from that *same* snapshot object, so the verdict's
-    evidence fingerprint and its ``elo_curve.json`` reference always describe
-    the identical dataset; draws ``B`` bootstrap replicates
-    (:func:`bootstrap_replicates`) exactly once, reused for both
-    per-checkpoint CIs (:func:`per_checkpoint_ci`) and -- **iff** the
-    snapshot's contiguous member prefix equals the complete ``k_target``
-    -member set (task 1 pin 8) -- the Delta contrast (:func:`delta_hat`,
-    :func:`replicate_deltas`, :func:`order_statistic_ci`,
-    :func:`delta_gate`); and runs Mann-Kendall (:func:`mann_kendall`) over the
-    evaluated prefix's point-estimate curve unconditionally (reported, never
-    gating, task 1 pin 7).
-
-    Before the complete K-set exists, the artifact is provisional: it carries
-    no ``delta_hat``, no Delta CI, and no gate anywhere -- only
-    ``delta: null`` plus an explicit ``reason`` string -- alongside the
-    per-checkpoint CIs and Mann-Kendall result that *are* what live
-    (incomplete-prefix) reporting consists of. ``authoritative`` requires
-    both the complete K-set **and** ``B ==
-    core.eval_protocol.BOOTSTRAP_B_PRODUCTION`` exactly -- a complete K-set
-    evaluated at a smaller admissible ``B`` (e.g. a reduced-cost test run)
-    still carries a full Delta/CI/gate, just never the ``authoritative`` flag.
-
-    Args:
-        run_dir: The run's root directory -- the eval snapshot's own root,
-            the root ``core.run_identity.read_stored_config`` reads
-            ``config.json`` from, and the root this writes
-            ``eval/verdict.json`` (and refreshes ``eval/elo_curve.json``)
-            under.
-        B: The bootstrap replicate count. Must be admissible (task 1 pin 7:
-            ``B ≡ 39 mod 40``; see :func:`order_statistic_ci`). Defaults to
-            the pinned production value; the artifact always records the
-            value actually used.
-
-    Returns:
-        The verdict payload -- the identical JSON-safe dict durably written
-        (temp-name-then-``os.replace``, sorted keys, so the same records and
-        seed always produce bit-identical bytes) to :func:`verdict_path`.
-
-    Raises:
-        ValueError: If ``B`` is not admissible, or propagated from
-            :func:`fit_snapshot_elo`/:func:`elo_curve` (an empty snapshot, an
-            agent disconnected from the anchor, or a scored member with no
-            ``checkpoint_published`` marker).
-        FileNotFoundError: If ``run_dir`` has no stored ``config.json``
-            (``core.run_identity.read_stored_config``).
-    """
-    _validate_admissible_B(B)
-    run_dir = Path(run_dir)
-
-    snapshot = load_snapshot(run_dir)
-    stored_config = read_stored_config(run_dir)
-    k_target = stored_config.run.training.checkpoint_count
-    eval_seed_value = stored_config.run.evaluation.eval_seed
-
-    seed = bootstrap_seed(eval_seed_value)
-    point_curve = checkpoint_elo(fit_snapshot_elo(snapshot))
-    checkpoints_evaluated = snapshot.member_prefix
-    is_complete_k_set = checkpoints_evaluated == k_target
-
-    replicate_ratings = list(bootstrap_replicates(snapshot, seed, B))
-    elo_by_version = dict(point_curve)
-    per_checkpoint_payload = [
-        {"model_version": version, "elo": elo_by_version[version], "ci": [lower, upper]}
-        for version, (lower, upper) in per_checkpoint_ci(replicate_ratings, B)
-    ]
-
-    mk = mann_kendall([elo for _, elo in point_curve])
-    mann_kendall_payload = {
-        "n": mk.n,
-        "insufficient_data": mk.insufficient_data,
-        "s": mk.s,
-        "z": mk.z,
-        "p": mk.p,
-    }
-
-    if is_complete_k_set:
-        delta_ci = order_statistic_ci(replicate_deltas(replicate_ratings), B)
-        delta_payload: dict[str, Any] | None = {
-            "delta_hat": delta_hat(point_curve),
-            "ci": [delta_ci[0], delta_ci[1]],
-            "gate": delta_gate(delta_ci),
-        }
-        reason = None
-    else:
-        delta_payload = None
-        reason = (
-            f"snapshot prefix covers {checkpoints_evaluated} of {k_target} required "
-            "checkpoint(s) -- the Delta contrast is only ever computed over the "
-            "complete K-set (task 1 pin 8); no prefix Delta exists, advisory or otherwise"
-        )
-
-    elo_curve(run_dir, snapshot)
-    elo_curve_fingerprint = _file_sha256(elo_curve_path(run_dir))
-
-    payload: dict[str, Any] = {
-        "authoritative": is_complete_k_set and B == BOOTSTRAP_B_PRODUCTION,
-        "checkpoints_evaluated": checkpoints_evaluated,
-        "k_target": k_target,
-        "bootstrap_b": B,
-        "bootstrap_seed": seed,
-        "evidence_fingerprint": snapshot.snapshot_fingerprint,
-        "elo_curve_fingerprint": elo_curve_fingerprint,
-        "protocol_version": PROTOCOL_VERSION,
-        "protocol_fingerprint": protocol_fingerprint(),
-        "protocol_constants": dict(REGISTRY),
-        "per_checkpoint": per_checkpoint_payload,
-        "mann_kendall": mann_kendall_payload,
-        "delta": delta_payload,
-        "reason": reason,
-    }
-    _atomic_write_json(verdict_path(run_dir), payload)
-    return payload
+    return implementation(run_dir, B=B)

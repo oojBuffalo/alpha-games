@@ -942,10 +942,10 @@ class EvalSnapshot:
             time, independent of ``member_prefix`` contiguity (a later member's
             cells may be complete even if an earlier one has a hole; per-checkpoint
             live reporting reads this set directly).
-        snapshot_fingerprint: sha256 over ``(schema_version, sorted completed cell
+        snapshot_fingerprint: sha256 over ``(schema_version, sorted in-prefix cell
             ids, each cell file's content hash, member_prefix)`` -- byte-stable
             while a writer appends to an incomplete cell (such cells are excluded by
-            construction), changes iff a *completed* cell's content changes, and is
+            construction), changes iff an in-prefix cell's content changes, and is
             invariant to every manifest wall-clock field.
     """
 
@@ -990,6 +990,8 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
     Raises:
         SchemaVersionError: If the manifest's or a cell file's ``schema_version`` is
             unknown.
+        ProtocolMismatchError: If any completed cell was written under another
+            protocol version or fingerprint.
         ManifestError: If a cell the manifest marks complete is missing on disk, its
             header's triple disagrees with its cell id, or its recorded pair count
             does not equal its own header's pinned ``pairs_per_cell``.
@@ -1010,6 +1012,13 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
                 f"manifest marks cell {cid} complete but its file is missing: {path}"
             )
         header, records = read_cell(path)
+        if (
+            header.protocol_version != PROTOCOL_VERSION
+            or header.protocol_fingerprint != protocol_fingerprint()
+        ):
+            raise ProtocolMismatchError(
+                f"cell {cid}: stored protocol does not match current registry"
+            )
         parsed = parse_cell_id(cid)
         stored_triple = (
             header.cell_id.candidate_version,
@@ -1037,10 +1046,13 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
 
     completed_frozen = frozenset(completed_ids)
     member_prefix = _compute_member_prefix(members, completed_frozen)
+    analysis_ids = [
+        cid for cid in completed_ids if parse_cell_id(cid).candidate_version <= member_prefix
+    ]
     fingerprint_payload = {
         "schema_version": SCHEMA_VERSION,
-        "cell_ids": completed_ids,
-        "cell_hashes": cell_hashes,
+        "cell_ids": analysis_ids,
+        "cell_hashes": {cid: cell_hashes[cid] for cid in analysis_ids},
         "member_prefix": member_prefix,
     }
     snapshot_fingerprint = hashlib.sha256(

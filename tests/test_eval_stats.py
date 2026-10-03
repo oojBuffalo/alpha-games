@@ -1098,22 +1098,9 @@ def _extract_number(pattern: str, text: str) -> str | None:
 
 
 def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
-    """The doc<->constants golden: parses the pinned §9 'Pre-registered protocol
-    (M4 pins)' block and compares every parsed value against this module's own
-    constants. Arms itself automatically once tasks/m4/001's design-doc
-    amendment lands -- it currently lives on the not-yet-merged
-    docs/m4-pin-eval-protocol branch (core.eval_protocol's own module
-    docstring), so until that block exists in this tree, this test has nothing
-    to compare against and explicitly skips rather than failing on a doc
-    section that was never written here.
-    """
+    """Require the source-of-truth section-9 amendment and verify its pins."""
     doc_text = _DESIGN_DOC_PATH.read_text(encoding="utf-8")
-    if _PINNED_PROTOCOL_HEADING not in doc_text:
-        pytest.skip(
-            "design doc has no section-9 'Pre-registered protocol (M4 pins)' block yet "
-            f"-- the amendment lives on the not-yet-merged {_DOC_AMENDMENT_BRANCH} branch "
-            "(see core.eval_protocol's module docstring)"
-        )
+    assert _PINNED_PROTOCOL_HEADING in doc_text, "section-9 protocol amendment must precede code"
 
     # Scope the search to the block itself: from the heading to the next
     # section boundary ('---' or the next '## ' heading) -- never the whole doc.
@@ -1138,8 +1125,95 @@ def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
         f"could not find the order-statistic rank-rule's quantiles in: {block!r}"
     )
 
-    rung8_lag = _extract_number(r"K`?\s*/\s*(\d+)", block) or _extract_number(
+    rung8_lag = _extract_number(r"v`?\s*[−-]\s*⌈`?K`?\s*/\s*(\d+)⌉", block) or _extract_number(
         r"lag[^0-9]{0,20}(\d+)", block
     )
     assert rung8_lag is not None, f"could not find the rung-8 lag divisor in: {block!r}"
     assert int(rung8_lag) == eval_protocol.RUNG8_LAG_DIVISOR
+
+
+def test_empty_prefix_writes_provisional_verdict(tmp_path):
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=42)
+    payload = build_verdict(tmp_path, B=39)
+    assert payload["checkpoints_evaluated"] == 0
+    assert payload["authoritative"] is False
+    assert payload["per_checkpoint"] == []
+    assert payload["delta"] is None
+    assert "0 of 3" in payload["reason"]
+    assert payload["mann_kendall"] == {
+        "n": 0,
+        "insufficient_data": True,
+        "s": None,
+        "z": None,
+        "p": None,
+    }
+    assert json.loads(elo_curve_path(tmp_path).read_text())["rows"] == []
+    assert json.loads(verdict_path(tmp_path).read_text()) == payload
+
+
+def test_completed_later_cell_does_not_change_analyzed_evidence(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5])])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=42)
+    _write_checkpoint_markers(tmp_path, [1])
+    before = build_verdict(tmp_path, B=39)
+    _write_member(tmp_path, 3, [(7, "random", [2.0, 2.0])])
+    after = build_verdict(tmp_path, B=39)
+    assert before == after
+    assert len(load_snapshot(tmp_path).completed_cell_ids) == 2
+
+
+def test_analysis_refuses_old_protocol_before_replacing_artifact(tmp_path, monkeypatch):
+    from core.eval_store import ProtocolMismatchError
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5])])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=42)
+    _write_checkpoint_markers(tmp_path, [1])
+    build_verdict(tmp_path, B=39)
+    before = verdict_path(tmp_path).read_bytes()
+    monkeypatch.setitem(eval_protocol.REGISTRY, "seed_label_replicate", "different")
+    with pytest.raises(ProtocolMismatchError, match="stored protocol"):
+        build_verdict(tmp_path, B=39)
+    assert verdict_path(tmp_path).read_bytes() == before
+
+
+def test_all_statistical_conventions_are_hashed():
+    pinned = {
+        "seed_label_bootstrap": "bootstrap",
+        "seed_label_replicate": "replicate",
+        "delta_window_divisor": 3,
+        "delta_gate_threshold": 0.0,
+        "mk_min_observations": 3,
+        "virtual_draw_score": 0.5,
+        "virtual_draw_games": 1,
+        "bootstrap_resampling": "within-cell-paired-records-with-replacement",
+        "bootstrap_fit": "joint-refit-each-replicate-warm-started",
+        "bootstrap_iteration_order": "sorted-cell-id-then-stored-record-order",
+        "delta_window_rounding": "ceiling",
+        "delta_gate_comparison": "lower-ci-strictly-greater-than-threshold",
+        "mann_kendall_variance": "tie-corrected",
+        "mann_kendall_continuity": "subtract-sign-s",
+        "mann_kendall_p": "two-sided-normal",
+        "mann_kendall_insufficient": "s-z-p-null",
+        "mann_kendall_zero_variance": "s=0,z=0,p=1",
+        "snapshot_scope": "complete-contiguous-member-prefix-only",
+        "delta_snapshot_gate": "prefix-equals-k-target",
+        "authoritative_gate": "complete-k-set-and-production-b",
+        "finite_fit": "one-virtual-draw-per-unordered-matchup",
+    }
+    assert PURPOSE_BOOTSTRAP == pinned["seed_label_bootstrap"]
+    assert eval_protocol.SEED_LABEL_REPLICATE == pinned["seed_label_replicate"]
+    for key, value in pinned.items():
+        assert eval_protocol.REGISTRY[key] == value
+
+
+def test_eval_config_serializes_and_checks_protocol_stamps():
+    from core.runconfig import RunConfig, load_run_config
+
+    config = load_run_config()
+    raw = config.to_dict()
+    assert raw["evaluation"]["protocol_version"] == eval_protocol.PROTOCOL_VERSION
+    assert raw["evaluation"]["protocol_fingerprint"] == eval_protocol.protocol_fingerprint()
+    assert RunConfig.from_dict(raw) == config
+    raw["evaluation"]["protocol_fingerprint"] = "old"
+    with pytest.raises(ValueError, match="stored protocol"):
+        RunConfig.from_dict(raw)
