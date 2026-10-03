@@ -1304,3 +1304,28 @@ def test_source_search_settings_control_verdict_authority(tmp_path, budget):
     assert payload["delta"] is not None
     if budget != 512:
         assert "non-production" in payload["reason"]
+
+
+@pytest.mark.parametrize(
+    "identity", ["largest-shape", "random-seeded", "rung4-search", "custom-v2-s64"]
+)
+def test_production_identity_keeps_network_free_names_opaque(identity):
+    from core.eval_artifacts import _production_identity
+
+    assert _production_identity(identity) is True
+
+
+@pytest.mark.parametrize(
+    "identity, expected",
+    [
+        ("rung5-v1-3", True),
+        ("rung7-v1-30", True),
+        ("rung7-v1-s64-3", False),
+        ("rung6-v2-3", False),
+        ("rung7-v1-not-a-version", False),
+    ],
+)
+def test_production_identity_requires_full_bare_v1_network_names(identity, expected):
+    from core.eval_artifacts import _production_identity
+
+    assert _production_identity(identity) is expected
