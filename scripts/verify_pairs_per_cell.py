@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Independently check the precision basis of the 24-pairs-per-cell pin (§9 pin 1).
 
-Deliberately standalone — pure stdlib, no ``core/`` import — so agreement with the
-protocol is evidence, not a shared bug. It re-derives the one-agent step of the
+The precision calculation is independent, pure stdlib, with its own fit step.
+The Gaussian sensitivity check uses the production Mann–Kendall implementation.
+The precision calculation re-derives the one-agent step of the
 pin-6 fit (bracket expansion + bisection with one virtual draw per matchup) and
 checks two independent routes against each other: the closed-form
 Fisher-information standard error, and a seeded Monte-Carlo through that fit
@@ -67,6 +68,7 @@ SCENARIOS: tuple[tuple[str, float, tuple[float, ...]], ...] = (
     ("early", 100.0, RUNG_ELOS),
     ("mid", 400.0, RUNG_ELOS + (370.0, 250.0, 100.0)),
     ("late", 900.0, RUNG_ELOS + (880.0, 700.0, 100.0)),
+    ("plateau-late", 900.0, RUNG_ELOS + (900.0, 900.0, 100.0)),
 )
 
 IDEALIZATIONS = (
