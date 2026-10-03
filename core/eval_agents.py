@@ -26,14 +26,26 @@ schema v2. Strict loading rejects missing components as well as individual keys.
 
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
 
 from core.agents import Agent
 from core.checkpoint import CheckpointFormatError, load_checkpoint
 from core.game import Action, Game, State
-from core.mcts import Evaluator
+from core.mcts import MCTS, Evaluator
 from core.network import Network, make_network_evaluator
 from core.runner import AgentFactory
+
+#: Ladder rung 6/7 eval search-form simulation budget — design doc §9's
+#: "Pre-registered protocol (M4 pins)" block, pin 4: "Rung-6/7 eval sim
+#: budget — S = 512 (gap-fill pin)", matching D6's 512-sim full tier, the
+#: same budget plies 0-1 of self-play always search at (the amendment is
+#: ``tasks/m4/001``'s doc-first deliverable; this constant is the
+#: code-side mirror, not a second pin). Frozen into every
+#: :class:`SearchAgent`'s ``v1`` form
+#: identity (see its docstring): changing this number is a new form
+#: version, never an edit of ``v1``.
+EVAL_SIMS = 512
 
 
 def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tuple[Evaluator, int]:
@@ -160,5 +172,182 @@ def rung5_agent_factory(path: Path | str, game: Game, device: str = "cpu") -> Ag
     def factory(seed: int) -> NetworkPolicyAgent:
         del seed  # rung 5 has no per-agent RNG state
         return NetworkPolicyAgent(evaluator, model_version)
+
+    return factory
+
+
+class SearchForm(Enum):
+    """The two network-backed evaluation search forms."""
+
+    UNIFORM_VALUE = 6
+    POLICY_VALUE = 7
+
+    @property
+    def uniform_prior(self) -> bool:
+        return self is SearchForm.UNIFORM_VALUE
+
+    def identity(self, model_version: int, sims: int) -> str:
+        budget = "" if sims == EVAL_SIMS else f"-s{sims}"
+        return f"rung{self.value}-v1{budget}-{model_version}"
+
+    @classmethod
+    def parse(cls, form: SearchForm | int) -> SearchForm:
+        if isinstance(form, cls):
+            return form
+        if type(form) is not int or form not in (6, 7):
+            raise ValueError(f"form must be SearchForm or integer 6 or 7, got {form!r}")
+        return cls(form)
+
+
+def _validate_search_budget(sims: int) -> None:
+    if type(sims) is not int or sims < 2:
+        raise ValueError(f"sims must be an integer >= 2, got {sims!r}")
+
+
+class SearchAgent(Agent):
+    """Ladder rungs 6 and 7: fresh deterministic MCTS search, argmax-N (§9).
+
+    One class realizes both search forms — rung 6 ("uniform-prior MCTS with
+    network value") and rung 7 ("full policy-and-value MCTS") — because they
+    differ by exactly the ``uniform_prior`` flag the M0 engine built for this
+    purpose (design doc §12 M0; no leaf-evaluator abstraction): rung 6
+    discards the evaluator's priors in favor of uniform ones but keeps its
+    *value*, so both forms call the evaluator exactly the same number of
+    times and cost identical inference. This class adds nothing to
+    ``core/mcts.py`` — zero engine diff is part of the acceptance.
+
+    **Per-move lifecycle (frozen; ``tasks/m4/001``, review S1/P2) — every**
+    **``select_action`` call, complete:**
+
+    1. Construct a **fresh** ``MCTS`` from the ``game`` argument received on
+       *that* call — never a cached game or a search object carried on
+       ``self`` beyond the evaluator/config. ``uniform_prior`` is ``True``
+       iff this is a rung-6 agent; ``root_noise`` is always ``None`` — the D7
+       hook's default leaves search bit-identical to the noiseless engine,
+       so self-play-only exploration noise can never leak into eval.
+    2. ``mcts.run(self._sims, root_state=state)`` — exactly the budget
+       encoded in the identity executes, no more, no fewer.
+    3. Return ``mcts.best_action()`` — argmax N, ties to the lowest action
+       id, **no RNG** — never ``MCTS.select_action``'s temperature/rng
+       sampling path, whose ``rng`` parameter this class never supplies.
+
+    **Why fresh-per-move, not subtree reuse (review S1):** the ``Agent``
+    contract forbids carrying game state between calls
+    (``core/agents.py:21-23``); a reused tree would carry prior visits into
+    the root, leaving "exactly S sims per move" ill-defined for a
+    pre-registered budget. Per-call construction also binds the search to
+    the *actual* game object the runner passed for that call — including the
+    balanced second game of a mirrored pair, wrapped in
+    ``core.runner._OpeningRestricted`` (its opening filter bites only at the
+    initial state; the evaluator's cross-wiring guard passes delegating
+    wrappers by design, so the wrapped game searches correctly). Rung 4
+    (``core/uct.py``'s ``UCTAgent``) already established this per-move
+    lifecycle; subtree reuse (``MCTS.advance``) stays a self-play-only
+    concern, outside this form definition.
+
+    **Identity is form-versioned (review S3):** ``name`` is
+    ``f"rung6-v1-{model_version}"`` or ``f"rung7-v1-{model_version}"``
+    only at S=512. Explicit alternate budgets use ``-s<S>`` before the
+    model version and are separate experimental identities. The pinned
+    ``v1`` constants — frozen together, never edited independently — are:
+    the M0 engine at its D11 defaults (``c_init=1.25``, ``c_base=19652``,
+    first-play-urgency ``Q=0``), the pinned sim budget :data:`EVAL_SIMS`,
+    fresh-search-per-move, argmax-N with lowest-id tie-break, and no root
+    noise. Any change to any of these is a new form version (``v2``, ...),
+    never a silent edit of ``v1`` — the same rule ``core.uct.UCTAgent`` pins
+    for ``uct-rollout-v1``.
+
+    Args:
+        evaluator: An ``Evaluator`` (e.g. from :func:`load_eval_network`)
+            supplying the leaf value for both forms and, for rung 7, the
+            policy priors; rung 6 calls the identical evaluator and simply
+            discards its priors (the ``uniform_prior`` flag).
+        model_version: The checkpoint's model-version ordinal, for
+            :attr:`name`.
+        form: ``6`` for uniform-prior MCTS with network value, ``7`` for
+            full policy-and-value MCTS.
+        sims: Simulations per move (default :data:`EVAL_SIMS`, the pinned
+            ``v1`` budget). Other budgets receive a distinct ``-s<S>``
+            identity suffix, e.g. ``rung7-v1-s64-3``, and cannot alias the
+            pinned evaluation form. At least two simulations are required:
+            the first expands the root, the second visits a root edge.
+
+    Raises:
+        ValueError: If the form is invalid or sims is not an integer >= 2.
+    """
+
+    def __init__(
+        self,
+        evaluator: Evaluator,
+        model_version: int,
+        *,
+        form: SearchForm | int,
+        sims: int = EVAL_SIMS,
+    ):
+        form = SearchForm.parse(form)
+        _validate_search_budget(sims)
+        self._evaluator = evaluator
+        self._uniform_prior = form.uniform_prior
+        self._sims = sims
+        self._name = form.identity(model_version, sims)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def select_action(self, game: Game, state: State) -> Action:
+        mcts = MCTS(
+            game,
+            evaluate=self._evaluator,
+            uniform_prior=self._uniform_prior,
+            root_noise=None,
+        )
+        mcts.run(self._sims, root_state=state)
+        return mcts.best_action()
+
+
+def rung_search_agent_factory(
+    path: Path | str,
+    game: Game,
+    form: SearchForm | int,
+    device: str = "cpu",
+    sims: int = EVAL_SIMS,
+) -> AgentFactory:
+    """Build a ``core.runner.AgentFactory`` sharing one loaded checkpoint (rungs 6/7).
+
+    Mirrors :func:`rung5_agent_factory`'s shape exactly: :func:`load_eval_network`
+    runs once, here, outside the returned closure. Every call to the closure
+    builds a lightweight :class:`SearchAgent` sharing the one loaded
+    evaluator; unlike rung 5, each :class:`SearchAgent` call in turn
+    constructs its own fresh ``MCTS`` per move (see its docstring) — never
+    shared across agents or across moves.
+
+    Args:
+        path: The checkpoint file to load once.
+        game: The adapter to load against — also the game the returned
+            factory should be used with.
+        form: ``6`` or ``7`` — selects the search form; see
+            :class:`SearchAgent`.
+        device: Torch device for inference.
+        sims: Simulations per move (default :data:`EVAL_SIMS`).
+
+    Returns:
+        A ``seed -> SearchAgent`` factory matching ``core.runner.AgentFactory``'s
+        shape. Both search forms are deterministic and consume no RNG, so the
+        seed argument is accepted (for the shared factory signature) and
+        otherwise unused; every call returns an agent sharing the one
+        evaluator loaded above.
+
+    Raises:
+        ValueError: If the form is invalid or sims is not an integer >= 2,
+            before loading the checkpoint.
+    """
+    form = SearchForm.parse(form)
+    _validate_search_budget(sims)
+    evaluator, model_version = load_eval_network(path, game, device)
+
+    def factory(seed: int) -> SearchAgent:
+        del seed  # search forms have no per-agent RNG state
+        return SearchAgent(evaluator, model_version, form=form, sims=sims)
 
     return factory
