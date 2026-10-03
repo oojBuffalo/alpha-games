@@ -26,11 +26,19 @@ schema v2. Strict loading rejects missing components as well as individual keys.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 
 from core.agents import Agent
-from core.checkpoint import CheckpointFormatError, load_checkpoint
+from core.checkpoint import (
+    CheckpointBundle,
+    CheckpointFormatError,
+    FingerprintMismatchError,
+    load_checkpoint,
+    published_checkpoint_path,
+)
 from core.game import Action, Game, State
 from core.mcts import MCTS, Evaluator
 from core.network import Network, make_network_evaluator
@@ -97,6 +105,13 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
             (``load_state_dict(strict=True)``).
     """
     bundle = load_checkpoint(path, game)  # step 1: fingerprint validated or raised
+    return _eval_network_from_bundle(bundle, game, device)
+
+
+def _eval_network_from_bundle(
+    bundle: CheckpointBundle, game: Game, device: str
+) -> tuple[Evaluator, int]:
+    """Restore an evaluator from a fingerprint-validated bundle."""
     if bundle.artifact_kind != "published":
         raise CheckpointFormatError(
             "evaluation requires a published checkpoint, not a resume snapshot"
@@ -349,5 +364,100 @@ def rung_search_agent_factory(
     def factory(seed: int) -> SearchAgent:
         del seed  # search forms have no per-agent RNG state
         return SearchAgent(evaluator, model_version, form=form, sims=sims)
+
+    return factory
+
+
+def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: int) -> list[int]:
+    """Select the historical set pinned by design doc §9, pin 5.
+
+    Return ``{v - 1, v - ceil(K/4), 1}``, intersected with available versions
+    in ``[1, v - 1]``, deduplicated and ascending. The keyword-only ``k_total``
+    fixes the lag across a growing prefix of published checkpoints.
+
+    Args:
+        versions: Available member checkpoint ids, each in ``1..K``.
+        candidate: Member id in ``1..K`` that must appear in ``versions``.
+        k_total: The run's fixed total checkpoint count ``K``.
+
+    Raises:
+        ValueError: If ``K < 1``, any id lies outside ``1..K``, or the
+            candidate is absent from ``versions``.
+    """
+    if k_total < 1:
+        raise ValueError(f"k_total must be >= 1, got {k_total}")
+    invalid = sorted({v for v in versions if not 1 <= v <= k_total})
+    if invalid:
+        raise ValueError(
+            f"versions must contain member checkpoint ids 1..{k_total} only; "
+            f"got non-member id(s) {invalid}"
+        )
+    if not 1 <= candidate <= k_total:
+        raise ValueError(f"candidate {candidate} must be a member checkpoint id in 1..{k_total}")
+    if candidate not in versions:
+        raise ValueError(
+            f"candidate {candidate} is not a member of the supplied versions {sorted(versions)}"
+        )
+    lag = math.ceil(k_total / 4)
+    wanted = {candidate - 1, candidate - lag, 1}
+    available = set(versions)
+    return sorted(u for u in wanted if 1 <= u < candidate and u in available)
+
+
+def _load_historical_checkpoint(path: Path | str, game: Game) -> CheckpointBundle:
+    """Validate once and prefix fingerprint mismatches with the checkpoint path."""
+    try:
+        return load_checkpoint(path, game)
+    except FingerprintMismatchError as exc:
+        raise FingerprintMismatchError(
+            f"rung-8 pre-load fingerprint assert failed for historical checkpoint "
+            f"{path} -- refusing to seat it as an opponent: {exc}"
+        ) from exc
+
+
+def assert_historical_checkpoint_matches_live_game(path: Path | str, game: Game) -> None:
+    """Validate a historical checkpoint before constructing its network.
+
+    Prefixes ``load_checkpoint``'s fingerprint mismatch with ``path``;
+    file and checkpoint-format errors propagate unchanged.
+    """
+    _load_historical_checkpoint(path, game)
+
+
+def historical_opponent_factory(
+    ckpt_dir: Path | str,
+    game: Game,
+    old_version: int,
+    device: str = "cpu",
+    sims: int = EVAL_SIMS,
+) -> AgentFactory:
+    """Load one historical member as a rung-7 search-agent factory.
+
+    The checkpoint is validated before network construction. Its payload
+    version must equal ``old_version``. The default budget preserves identity
+    ``rung7-v1-<u>``; custom budgets use the same suffix as candidate agents.
+
+    Raises:
+        ValueError: If ``old_version < 1``, the payload version differs, or
+            ``sims`` is not an integer >= 2.
+        FingerprintMismatchError: If the fingerprint differs from ``game``;
+            the message includes the checkpoint path and mismatched fields.
+        FileNotFoundError: If ``ckpt-<old_version>.pt`` does not exist.
+    """
+    if old_version < 1:
+        raise ValueError(f"old_version must be >= 1, got {old_version}")
+    _validate_search_budget(sims)
+    path = published_checkpoint_path(ckpt_dir, old_version)
+    bundle = _load_historical_checkpoint(path, game)
+    if bundle.version != old_version:
+        raise ValueError(
+            f"historical checkpoint {path} has payload version {bundle.version}, "
+            f"expected {old_version}"
+        )
+    evaluator, model_version = _eval_network_from_bundle(bundle, game, device)
+
+    def factory(seed: int) -> SearchAgent:
+        del seed
+        return SearchAgent(evaluator, model_version, form=7, sims=sims)
 
     return factory
