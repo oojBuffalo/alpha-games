@@ -97,6 +97,7 @@ from core.eval_store import (
     complete_cell,
     load_snapshot,
     open_cell_for_write,
+    parse_cell_id,
     read_cell,
     register_member,
 )
@@ -1274,14 +1275,13 @@ def test_on_member_complete_fires_exactly_once_per_newly_completed_member(tmp_pa
     )
     assert calls == [1, 2]
 
-    # A member already complete before a poll examines it never re-fires the
-    # hook (its `pending` list is empty -- the loop never reaches the callback
-    # for it): a second, idempotent pass calls the hook zero more times.
+    # Relaunch refreshes reports for complete members, covering a failed hook
+    # immediately before the previous process stopped.
     calls.clear()
     run_watch_loop(
         run_dir, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
     )
-    assert calls == []
+    assert calls == [1, 2]
 
 
 def test_run_watch_loop_defaults_to_no_hook_at_all(tmp_path):
@@ -1339,28 +1339,29 @@ def test_bench_candidate_rejects_non_positive_n_pairs(tmp_path):
         bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=0)
 
 
-def test_publish_cadence_hours_averages_consecutive_gpu_hour_gaps(tmp_path, monkeypatch):
-    class _FakeReduced:
-        checkpoints = {1: (10, 100, 2.0), 2: (20, 200, 5.0), 3: (30, 300, 9.0)}
+@pytest.mark.parametrize("closed", [False, True])
+def test_publish_cadence_hours_uses_real_wall_clock_markers(tmp_path, closed):
+    writer = EpochMetricsWriter(tmp_path, "learner")
+    writer.append({"kind": "segment_start", "timestamp": 0, "is_cuda": True, "device": "cuda"})
+    for version, hours in [(0, 0), (1, 2), (2, 5), (3, 9), (99, 99)]:
+        writer.append(
+            {"kind": CHECKPOINT_PUBLISHED_KIND, "model_version": version, "timestamp": hours * 3600}
+        )
+    if closed:
+        writer.append({"kind": "segment_end", "timestamp": 100 * 3600})
+    assert eval_run._publish_cadence_hours(tmp_path, 3) == pytest.approx(3.5)
+    assert eval_run._publish_cadence_hours(tmp_path, 2) == pytest.approx(3)
+    assert eval_run._publish_cadence_hours(tmp_path, 1) is None
 
-    monkeypatch.setattr(eval_run, "reduce_run", lambda run_dir: _FakeReduced())
-    assert eval_run._publish_cadence_hours(tmp_path, k_total=3) == pytest.approx((3.0 + 4.0) / 2)
 
-
-def test_publish_cadence_hours_none_with_fewer_than_two_members(tmp_path, monkeypatch):
-    class _FakeReduced:
-        checkpoints = {1: (10, 100, 2.0)}
-
-    monkeypatch.setattr(eval_run, "reduce_run", lambda run_dir: _FakeReduced())
-    assert eval_run._publish_cadence_hours(tmp_path, k_total=3) is None
-
-
-def test_publish_cadence_hours_ignores_versions_beyond_k_total(tmp_path, monkeypatch):
-    class _FakeReduced:
-        checkpoints = {1: (10, 100, 2.0), 2: (20, 200, 5.0), 99: (999, 999, 999.0)}
-
-    monkeypatch.setattr(eval_run, "reduce_run", lambda run_dir: _FakeReduced())
-    assert eval_run._publish_cadence_hours(tmp_path, k_total=2) == pytest.approx(3.0)
+@pytest.mark.parametrize("timestamps", [(0, 0), (2, 1)])
+def test_publish_cadence_nonpositive_is_undefined(tmp_path, timestamps):
+    writer = EpochMetricsWriter(tmp_path, "learner")
+    for version, timestamp in enumerate(timestamps, 1):
+        writer.append(
+            {"kind": CHECKPOINT_PUBLISHED_KIND, "model_version": version, "timestamp": timestamp}
+        )
+    assert eval_run._publish_cadence_hours(tmp_path, 2) is None
 
 
 def test_render_bench_includes_every_documented_field(tmp_path):
@@ -1497,3 +1498,254 @@ def test_report_with_a_cell_mid_write_never_opens_it_and_matches_last_complete_p
     cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
     payload = run_eval.cmd_report(cfg_path)
     assert payload["verdict"] == report_after == report_before
+
+
+def test_rung8_config_values_select_the_stamped_opponents():
+    cells = required_cell_ids(10, FAST_PROFILE, range(1, 11), 32, (7,), lag_divisor=2, earliest=2)
+    historical = {parse_cell_id(cid).opponent_id for cid in cells if "rung7-v1-" in cid}
+    assert historical == {agent_identity(7, 2), agent_identity(7, 9)}
+
+
+def test_eval_profile_rejects_duplicate_agent_names():
+    with pytest.raises(ValueError, match="unique"):
+        EvalProfile({1: RandomAgent, 2: RandomAgent})
+
+
+def test_interruption_inside_game_preserves_finished_pairs(tmp_path, monkeypatch):
+    import core.runner as runner
+
+    baseline = tmp_path / "baseline"
+    killed = tmp_path / "killed"
+    for directory in (baseline, killed):
+        _build_watched_run(directory, k_total=1)
+    config = _eval_config(baseline, pairs_per_cell=4, forms=(5,))
+    run_watch_loop(baseline, config, FAST_PROFILE, GAME, single_pass=True)
+    real_play = runner.play_game
+    calls = 0
+
+    def interrupt(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 7:
+            raise KeyboardInterrupt()
+        return real_play(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "play_game", interrupt)
+    config = dataclasses.replace(config, run_dir=str(killed))
+    with pytest.raises(KeyboardInterrupt):
+        run_watch_loop(killed, config, FAST_PROFILE, GAME, single_pass=True)
+    paths = sorted(cells_dir(killed).glob("*.jsonl"))
+    assert len(paths) == 1
+    assert len(read_cell(paths[0])[1]) == 3
+    monkeypatch.setattr(runner, "play_game", real_play)
+    run_watch_loop(killed, config, FAST_PROFILE, GAME, single_pass=True)
+    assert _cell_bytes(killed) == _cell_bytes(baseline)
+
+
+def test_failed_report_hook_does_not_stop_scoring_and_relaunch_retries(tmp_path):
+    _build_watched_run(tmp_path, k_total=2)
+    calls = []
+
+    def fail(version):
+        calls.append(version)
+        raise ValueError("missing metrics")
+
+    config = _eval_config(tmp_path, forms=(5,))
+    result = run_watch_loop(
+        tmp_path, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=fail
+    )
+    assert result.completed_members == (1, 2)
+    assert calls == [1, 2]
+    calls.clear()
+    run_watch_loop(
+        tmp_path, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
+    )
+    assert calls == [1, 2]
+
+
+@pytest.mark.parametrize("mode", ["--report", "--plateau"])
+def test_report_modes_refuse_drift_before_writing(tmp_path, mode):
+    _hand_built_store(tmp_path, checkpoint_count=1, scored_versions=[1])
+    original = _make_config(str(tmp_path))
+    eval_run.write_eval_provenance(tmp_path, original)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    config_path = _write_eval_config_file(
+        tmp_path / "changed.json", dataclasses.replace(original, bootstrap_b=79)
+    )
+    with pytest.raises(EvalRelaunchRefusedError, match="bootstrap_b"):
+        (run_eval.cmd_report if mode == "--report" else run_eval.cmd_plateau)(config_path)
+    assert all(p.read_bytes() == content for p, content in before.items())
+    assert run_eval.main([str(config_path), mode]) == 1
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--poll-interval", "-1"],
+        ["--poll-interval", "nan"],
+        ["--poll-interval", "inf"],
+        ["--max-idle-polls", "0"],
+        ["--bench", "--bench-pairs", "0"],
+        ["--report", "--single-pass"],
+        ["--plateau", "--poll-interval", "1"],
+        ["--bench-pairs", "1"],
+    ],
+)
+def test_cli_rejects_invalid_or_irrelevant_flags(flags):
+    with pytest.raises(SystemExit) as exc:
+        run_eval.main(["unused.json", *flags])
+    assert exc.value.code == 2
+
+
+def test_invalid_training_directory_creates_no_eval_artifacts(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        run_watch_loop(tmp_path, _eval_config(tmp_path), FAST_PROFILE, GAME, single_pass=True)
+    assert not (tmp_path / "eval").exists()
+
+
+def test_liveness_constants_golden():
+    assert (
+        eval_protocol.LIVENESS_MAX_LAG,
+        eval_protocol.LIVENESS_BREACH_CONSECUTIVE,
+        eval_protocol.LIVENESS_MAX_THROUGHPUT_DEGRADATION,
+    ) == (4, 2, 0.05)
+
+
+def test_liveness_samples_publishes_while_play_is_blocked(tmp_path, monkeypatch):
+    _build_watched_run(tmp_path, k_total=6, versions=[])
+    (tmp_path / "eval").mkdir()
+    with eval_run._monitor_liveness(tmp_path, 6, 0.01) as monitor:
+        for version in range(1, 7):
+            (checkpoint_dir(tmp_path) / f"ckpt-{version}.pt").parent.mkdir(exist_ok=True)
+            (checkpoint_dir(tmp_path) / f"ckpt-{version}.pt").touch()
+        import time
+
+        deadline = time.monotonic() + 3
+        while len(monitor.samples) < 6 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert [sample["lag"] for sample in monitor.samples] == list(range(1, 7))
+    report = json.loads((tmp_path / "eval" / "liveness.json").read_text())
+    assert report["lag_breached"] is True
+    assert report["final_post_training_lag"] == 6
+    assert report["constants"] == {
+        "max_lag": 4,
+        "breach_consecutive": 2,
+        "max_throughput_degradation": 0.05,
+    }
+
+
+def test_two_processes_cannot_write_same_store(tmp_path):
+    import subprocess
+
+    _build_watched_run(tmp_path, k_total=1)
+    config = _eval_config(tmp_path)
+    # A separate interpreter holds the OS lock, avoiding inherited descriptors.
+    code = (
+        "import fcntl, pathlib, sys; p=pathlib.Path(sys.argv[1]); "
+        "p.parent.mkdir(exist_ok=True); f=p.open('a+'); "
+        "fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(tmp_path / "eval" / ".writer.lock")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "locked"
+        with pytest.raises(ValueError, match="writer already running"):
+            run_watch_loop(tmp_path, config, FAST_PROFILE, GAME, single_pass=True)
+        assert not eval_run.eval_config_path(tmp_path).exists()
+    finally:
+        process.communicate(timeout=5)
+    result = run_watch_loop(tmp_path, config, FAST_PROFILE, GAME, single_pass=True)
+    assert result.completed_members == (1,)
+    assert (
+        json.loads((tmp_path / "eval" / "liveness.json").read_text())["final_post_training_lag"]
+        == 0
+    )
+
+
+def test_liveness_recovers_publish_time_lag_after_downtime(tmp_path):
+    import time
+
+    _build_watched_run(tmp_path, k_total=1)
+    published_at = time.time() - 60
+    writer = EpochMetricsWriter(tmp_path, "learner")
+    writer.append(
+        {"kind": CHECKPOINT_PUBLISHED_KIND, "model_version": 1, "timestamp": published_at}
+    )
+    _write_scored_member(tmp_path, 1, [1.0])
+    with eval_run._monitor_liveness(tmp_path, 1, 0.01) as monitor:
+        assert monitor.samples[0]["lag"] == 1
+        assert monitor.samples[0]["timestamp"] == published_at
+        assert monitor.samples[0]["source"] == "publish_marker"
+    report = json.loads((tmp_path / "eval" / "liveness.json").read_text())
+    assert report["final_post_training_lag"] == 0
+    assert report["caught_up"] is True
+
+
+def _throughput_windows(on_duration=100):
+    common = {
+        "restored_checkpoint": "sha256:optimizer-replay",
+        "config_identity": "sha256:config",
+        "hardware_identity": "one-gpu-A100",
+        "seeds": {"run": 9},
+        "start_monotonic": 1000.0,
+        "start_completed_games": 5,
+        "end_completed_games": 15,
+        "start_learner_steps": 100,
+        "end_learner_steps": 200,
+    }
+    return {
+        "warmup_games": 5,
+        "measure_games": 10,
+        "harness_off": {**common, "end_monotonic": 1100.0, "eval_active": False},
+        "harness_on": {
+            **common,
+            "end_monotonic": 1000.0 + on_duration,
+            "eval_active": True,
+            "eval_sims": 512,
+            "eval_device": "cpu",
+            "eval_checkpoint": "sha256:fixed-eval",
+        },
+    }
+
+
+@pytest.mark.parametrize("duration, breached", [(100, False), (100 / 0.95, False), (120, True)])
+def test_liveness_throughput_comparison_and_breach(duration, breached):
+    report = eval_run.compare_liveness_throughput(_throughput_windows(duration))
+    assert report["throughput_breached"] is breached
+    assert report["throughput_degradation"] == pytest.approx(1 - 100 / duration)
+    assert report["games_per_gpu_hour"]["harness_off"] == 360
+    assert report["learner_steps_per_second"]["harness_on"] == pytest.approx(100 / duration)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("restored_checkpoint", "different"),
+        ("eval_active", False),
+        ("end_completed_games", 14),
+        ("end_learner_steps", 100),
+        ("eval_sims", 4),
+        ("end_monotonic", float("nan")),
+    ],
+)
+def test_liveness_throughput_rejects_unmatched_or_invalid_evidence(field, value):
+    windows = _throughput_windows()
+    windows["harness_on"][field] = value
+    with pytest.raises(ValueError):
+        eval_run.compare_liveness_throughput(windows)
+
+
+def test_liveness_cli_records_and_reuses_counterfactual_evidence(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    config = _eval_config(tmp_path)
+    config_path = _write_eval_config_file(tmp_path / "eval-input.json", config)
+    windows_path = tmp_path / "windows.json"
+    windows_path.write_text(json.dumps(_throughput_windows(120)))
+    report = run_eval.cmd_liveness(config_path, windows_path)
+    assert report["throughput_breached"] is True
+    assert run_eval.cmd_liveness(config_path)["throughput_windows"] == report["throughput_windows"]
+    assert eval_run.compare_liveness_throughput(None)["throughput_breached"] is None

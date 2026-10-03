@@ -60,6 +60,7 @@ from core.checkpoint import (
     load_checkpoint,
     published_checkpoint_path,
 )
+from core.eval_protocol import RUNG8_EARLIEST_VERSION, RUNG8_LAG_DIVISOR
 from core.game import Action, Game, State
 from core.mcts import MCTS, Evaluator
 from core.network import Network, NetworkConfig, make_network_evaluator
@@ -434,7 +435,14 @@ def rung_search_agent_factory(
 # and no re-rating machinery is built here.
 
 
-def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: int) -> list[int]:
+def historical_opponents(
+    versions: Sequence[int],
+    candidate: int,
+    *,
+    k_total: int,
+    lag_divisor: int = RUNG8_LAG_DIVISOR,
+    earliest: int = RUNG8_EARLIEST_VERSION,
+) -> list[int]:
     """Select rung-8 historical-opponent versions for one candidate checkpoint.
 
     Implements the pinned rule (``tasks/m4/001``, pin 5): the opponents of
@@ -473,6 +481,8 @@ def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: in
             non-member id is a domain violation, not silently dropped.
         candidate: The checkpoint version being evaluated. Must appear in
             ``versions``.
+        lag_divisor: Positive divisor for the historical lag; production uses 4.
+        earliest: Always-included historical member; production uses 1.
         k_total: The run's total, fixed checkpoint count ``K``, used to
             compute the ``ceil(K/4)`` lag (see above for why this is never
             derived from ``versions``).
@@ -501,8 +511,10 @@ def historical_opponents(versions: Sequence[int], candidate: int, *, k_total: in
         raise ValueError(
             f"candidate {candidate} is not a member of the supplied versions {sorted(versions)}"
         )
-    lag = math.ceil(k_total / 4)
-    wanted = {candidate - 1, candidate - lag, 1}
+    if lag_divisor < 1 or earliest < 1:
+        raise ValueError("lag_divisor and earliest must be positive")
+    lag = math.ceil(k_total / lag_divisor)
+    wanted = {candidate - 1, candidate - lag, earliest}
     available = set(versions)
     return sorted(u for u in wanted if 1 <= u < candidate and u in available)
 

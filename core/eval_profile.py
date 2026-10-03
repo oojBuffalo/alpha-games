@@ -31,20 +31,8 @@ from core.runner import AgentFactory, OpeningBalancer
 class EvalProfile:
     """One game's frozen network-free eval ladder + opening-balancer hook.
 
-    **The one contract a registered rung must satisfy, and why (review-grade**
-    **load-bearing detail):** the agent a rung's factory builds must report a
-    ``.name`` that does not depend on the seed the factory was called with.
-    Every rung-1..4 baseline already satisfies this by construction
-    (``core.agents.RandomAgent``/``MobilityAgent``, a game's own baselines,
-    ``core.uct.UCTAgent`` all return a fixed string from ``name`` regardless of
-    their constructor's ``seed`` argument) -- documented here as a requirement
-    rather than assumed silently, because :meth:`rung_identity` reads it
-    *before* any per-cell seed exists: a cell's id
-    (``core.eval_store.build_cell_id``) is built from the opponent's identity
-    string, and the eval orchestrator in turn derives that per-cell seed from
-    the finished cell id (``derive_seed(eval_seed, PURPOSE_EVAL, cell_id)``) --
-    a rung whose identity depended on the seed would make the cell id and the
-    seed used to reach it mutually circular.
+    Agent names must be seed-independent because ``rung_identity`` is read
+    before the per-cell seed exists, and unique across declared rungs.
 
     Attributes:
         network_free_rungs: Mapping of frozen ladder rung id (1-4 in v1, per
@@ -79,6 +67,10 @@ class EvalProfile:
         ]
         if bad:
             raise ValueError(f"network_free_rungs keys must be positive ints, got {bad!r}")
+
+        names = [factory(0).name for factory in self.network_free_rungs.values()]
+        if len(set(names)) != len(names):
+            raise ValueError(f"network_free_rungs agent names must be unique, got {names!r}")
 
     def rungs(self) -> tuple[int, ...]:
         """Return the declared rung ids, ascending.

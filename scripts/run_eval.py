@@ -47,6 +47,8 @@ hands both to ``core.eval_run``'s game-generic functions -- mirroring exactly ho
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -59,9 +61,11 @@ from core.eval_run import (  # noqa: E402
     EvalConfig,
     WatchLoopResult,
     bench_candidate,
+    build_liveness_report,
     eval_lag,
     load_eval_config,
     run_watch_loop,
+    validate_eval_provenance,
     watched_k_total,
 )
 from core.eval_stats import PlateauResult, build_verdict, detect_plateau  # noqa: E402
@@ -118,6 +122,7 @@ def _build_report(config: EvalConfig) -> dict:
     Returns:
         ``{"verdict": <verdict.json payload>, "eval_lag": int}``.
     """
+    validate_eval_provenance(config.run_dir, config)
     verdict = build_verdict(config.run_dir, B=config.bootstrap_b)
     lag = eval_lag(config.run_dir, watched_k_total(config.run_dir))
     return {"verdict": verdict, "eval_lag": lag}
@@ -145,7 +150,16 @@ def cmd_plateau(config_path: Path | str) -> PlateauResult:
         The tri-state :class:`~core.eval_stats.PlateauResult`.
     """
     config = load_eval_config(config_path)
+    validate_eval_provenance(config.run_dir, config)
     return detect_plateau(config.run_dir, B=config.bootstrap_b)
+
+
+def cmd_liveness(config_path: Path | str, throughput_windows: Path | str | None = None) -> dict:
+    """Report publish-time lag and optional matched off/on learner throughput."""
+    config = load_eval_config(config_path)
+    validate_eval_provenance(config.run_dir, config)
+    windows = json.loads(Path(throughput_windows).read_text()) if throughput_windows else None
+    return build_liveness_report(config.run_dir, throughput_windows=windows)
 
 
 def cmd_bench(config_path: Path | str, *, n_pairs: int = DEFAULT_BENCH_PAIRS) -> BenchResult:
@@ -282,6 +296,20 @@ def _render_bench(result: BenchResult) -> str:
     )
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build this script's argument parser.
 
@@ -320,9 +348,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "throughput/feasibility, then exit"
         ),
     )
+    mode.add_argument(
+        "--liveness",
+        action="store_true",
+        help="refresh liveness.json and print lag/throughput bounds",
+    )
+    parser.add_argument(
+        "--throughput-windows",
+        help="JSON matched harness_off/harness_on learner-update windows (requires --liveness)",
+    )
     parser.add_argument(
         "--bench-pairs",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_BENCH_PAIRS,
         help=(
             "mirrored pairs sampled per required cell during --bench "
@@ -331,13 +368,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--poll-interval",
-        type=float,
+        type=_nonnegative_float,
         default=DEFAULT_POLL_INTERVAL,
         help="seconds between watch-loop polls (default launch mode only)",
     )
     parser.add_argument(
         "--max-idle-polls",
-        type=int,
+        type=_positive_int,
         default=None,
         help=(
             "test-facing: stop the watch loop after this many idle polls in a row; "
@@ -363,26 +400,43 @@ def main(argv: list[str] | None = None) -> int:
         The process exit code (``0`` on success).
     """
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    values = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(values)
+    flags = {value.split("=", 1)[0] for value in values if value.startswith("--")}
+    if args.report or args.plateau or args.bench or args.liveness:
+        invalid = flags & {"--poll-interval", "--max-idle-polls", "--single-pass"}
+        if invalid:
+            parser.error(f"watch flags do not apply to this mode: {', '.join(sorted(invalid))}")
+    if not args.bench and "--bench-pairs" in flags:
+        parser.error("--bench-pairs requires --bench")
 
-    if args.report:
-        print(_render_report(cmd_report(args.config)))
-    elif args.plateau:
-        print(_render_plateau(cmd_plateau(args.config)))
-    elif args.bench:
-        print(_render_bench(cmd_bench(args.config, n_pairs=args.bench_pairs)))
-    else:
-        result = cmd_launch(
-            args.config,
-            poll_interval=args.poll_interval,
-            max_idle_polls=args.max_idle_polls,
-            single_pass=args.single_pass,
-        )
-        print(
-            f"[run_eval] stopped: {result.stopped_reason} (polls={result.polls}, "
-            f"pairs_played={result.pairs_played}, "
-            f"completed_members={list(result.completed_members)})"
-        )
+    if args.throughput_windows and not args.liveness:
+        parser.error("--throughput-windows requires --liveness")
+
+    try:
+        if args.liveness:
+            print(json.dumps(cmd_liveness(args.config, args.throughput_windows), indent=2))
+        elif args.report:
+            print(_render_report(cmd_report(args.config)))
+        elif args.plateau:
+            print(_render_plateau(cmd_plateau(args.config)))
+        elif args.bench:
+            print(_render_bench(cmd_bench(args.config, n_pairs=args.bench_pairs)))
+        else:
+            result = cmd_launch(
+                args.config,
+                poll_interval=args.poll_interval,
+                max_idle_polls=args.max_idle_polls,
+                single_pass=args.single_pass,
+            )
+            print(
+                f"[run_eval] stopped: {result.stopped_reason} (polls={result.polls}, "
+                f"pairs_played={result.pairs_played}, "
+                f"completed_members={list(result.completed_members)})"
+            )
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -46,8 +46,8 @@ This module owns seven things (the CLI face itself,
   :class:`BenchResult`; subtask 9.3, second pass P2.6) -- the plumbing
   ``scripts/run_eval.py`` needs and this module alone can supply without
   duplicating any of the arithmetic/cache machinery above: a callback fired
-  exactly when a member transitions to complete during a live poll (so a
-  caller regenerates the §1 report artifacts with zero manual steps), and a
+  once per complete member per invocation, retrying failures on later polls,
+  so a caller regenerates the §1 report artifacts with zero manual steps, and a
   read-and-measure-only mode that plays a small pair count against the
   newest published member at the configured production budget to report
   real seconds/game, games/hour, and the projected per-checkpoint cost
@@ -65,11 +65,18 @@ mirroring exactly how ``games.registry.build_game_factory`` resolves a
 
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
+import math
+import os
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -83,10 +90,20 @@ from core.eval_agents import (
     load_eval_network,
 )
 from core.eval_profile import EvalProfile
-from core.eval_protocol import PROTOCOL_VERSION, protocol_fingerprint
+from core.eval_protocol import (
+    EVAL_SIMS,
+    LIVENESS_BREACH_CONSECUTIVE,
+    LIVENESS_MAX_LAG,
+    LIVENESS_MAX_THROUGHPUT_DEGRADATION,
+    PROTOCOL_VERSION,
+    RUNG8_EARLIEST_VERSION,
+    RUNG8_LAG_DIVISOR,
+    protocol_fingerprint,
+)
 from core.eval_stats import _validate_admissible_B
 from core.eval_store import (
     CellId,
+    _read_manifest,
     append_pair_record,
     build_cell_id,
     build_header,
@@ -102,7 +119,8 @@ from core.eval_store import (
 )
 from core.game import Game
 from core.mcts import Evaluator
-from core.observability import reduce_run
+from core.metrics import iter_epoch_records, list_procs
+from core.observability import CHECKPOINT_PUBLISHED_KIND
 from core.replay_shard import _atomic_write_json
 from core.run_identity import read_run_record, read_stored_config
 from core.runconfig import _check_keys, _int, _non_empty, _positive, _str
@@ -586,7 +604,13 @@ def resolve_eval_launch(run_dir: Path | str, config: EvalConfig) -> EvalConfig:
     if not path.exists():
         write_eval_provenance(run_dir, config)
         return config
+    return validate_eval_provenance(run_dir, config)
 
+
+def validate_eval_provenance(run_dir: Path | str, config: EvalConfig) -> EvalConfig:
+    """Refuse material/protocol drift without creating or writing provenance."""
+    if not eval_config_path(run_dir).exists():
+        return config
     stored = read_eval_provenance(run_dir)
     config_diff = _diff_eval_configs(stored.config, config)
 
@@ -703,6 +727,9 @@ def required_cell_ids(
     available_versions: Sequence[int],
     k_total: int,
     forms: Sequence[int],
+    *,
+    lag_divisor: int = RUNG8_LAG_DIVISOR,
+    earliest: int = RUNG8_EARLIEST_VERSION,
 ) -> list[str]:
     """Return one member's full required cell-id set (design doc §9's cell semantics).
 
@@ -747,7 +774,13 @@ def required_cell_ids(
         for opponent in opponent_identities
     }
     if RUNG8_CANDIDATE_FORM in forms_sorted:
-        for u in historical_opponents(available_versions, member_version, k_total=k_total):
+        for u in historical_opponents(
+            available_versions,
+            member_version,
+            k_total=k_total,
+            lag_divisor=lag_divisor,
+            earliest=earliest,
+        ):
             cells.add(
                 build_cell_id(
                     member_version,
@@ -1009,17 +1042,17 @@ def _play_pending_cell(
     played = 0
     if remaining > 0:
         file_path = cell_path(run_dir, cell_id)
-        results = play_pairs(
-            game,
-            candidate_factory,
-            opponent_factory,
-            n_pairs=remaining,
-            seed=cell_seed(config.eval_seed, cell_id),
-            opening_balancer=profile.opening_balancer,
-            start_pair_index=start_index,
-        )
-        for result in results:
-            append_pair_record(file_path, pair_result_to_record(result))
+        for pair_index in range(start_index, config.pairs_per_cell):
+            results = play_pairs(
+                game,
+                candidate_factory,
+                opponent_factory,
+                n_pairs=1,
+                seed=cell_seed(config.eval_seed, cell_id),
+                opening_balancer=profile.opening_balancer,
+                start_pair_index=pair_index,
+            )
+            append_pair_record(file_path, pair_result_to_record(results[0]))
             played += 1
     complete_cell(run_dir, cell_id)
     return played
@@ -1050,6 +1083,248 @@ class WatchLoopResult:
     stopped_reason: str
 
 
+def _exclusive_writer(function):
+    """Hold a process-scoped, non-blocking lock through provenance and all writes."""
+
+    @wraps(function)
+    def locked(run_dir, *args, **kwargs):
+        # Reject family roots before creating any eval artifacts.
+        read_run_record(run_dir)
+        read_stored_config(run_dir)
+        directory = eval_dir(run_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / ".writer.lock").open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError(f"eval writer already running for {run_dir}") from None
+            lock.seek(0)
+            lock.truncate()
+            lock.write(str(os.getpid()))
+            lock.flush()
+            try:
+                return function(run_dir, *args, **kwargs)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    return locked
+
+
+def _try_report(version, callback, reported):
+    if callback is None or version in reported:
+        return
+    try:
+        callback(version)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "eval report failed for member %s; retrying on next poll/relaunch", version
+        )
+    else:
+        reported.add(version)
+
+
+def compare_liveness_throughput(windows: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Compare matched single-GPU off/on windows after a fixed game warmup.
+
+    Both trials restore the same immutable checkpoint/optimizer/replay state,
+    hardware, config and seeds. Boundaries are monotonic seconds with completed
+    games and learner-step counters after warmup and after measure_games games.
+    This function validates recorded evidence; it does not run the A/B trial.
+    """
+    if windows is None:
+        return {
+            "throughput_degradation": None,
+            "throughput_breached": None,
+            "throughput_reason": "insufficient_data: supply matched harness_off/harness_on windows",
+            "throughput_windows": None,
+        }
+    try:
+        warmup = windows["warmup_games"]
+        measure = windows["measure_games"]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (warmup, measure)
+        ):
+            raise ValueError("warmup_games and measure_games must be positive integers")
+        off, on = windows["harness_off"], windows["harness_on"]
+        for key in ("restored_checkpoint", "config_identity", "hardware_identity", "seeds"):
+            if not off[key] or off[key] != on[key]:
+                raise ValueError(f"off/on {key} must identify the same restored trial conditions")
+        if off["eval_active"] is not False or on["eval_active"] is not True:
+            raise ValueError("eval must be idle OFF and active throughout ON")
+        if on["eval_sims"] != EVAL_SIMS or on["eval_device"] != "cpu":
+            raise ValueError("ON window must use production eval_sims=512 and device=cpu")
+        if not on["eval_checkpoint"]:
+            raise ValueError("ON window must identify its fixed eval checkpoint")
+        rates = {}
+        steps_per_second = {}
+        for name, window in (("harness_off", off), ("harness_on", on)):
+            values = [
+                window[key]
+                for key in (
+                    "start_monotonic",
+                    "end_monotonic",
+                    "start_completed_games",
+                    "end_completed_games",
+                    "start_learner_steps",
+                    "end_learner_steps",
+                )
+            ]
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in values
+            ):
+                raise ValueError(f"{name}: throughput boundaries must be finite numbers")
+            start, end, games_start, games_end, steps_start, steps_end = values
+            if (
+                end <= start
+                or games_start < warmup
+                or games_end - games_start != measure
+                or steps_start < 0
+                or steps_end <= steps_start
+            ):
+                raise ValueError(
+                    f"{name}: positive duration/learner-step delta and "
+                    "exactly measure_games completions required"
+                )
+            if any(not isinstance(value, int) for value in values[2:]):
+                raise ValueError(f"{name}: counters must be integers")
+            rates[name] = 3600 * measure / (end - start)
+            steps_per_second[name] = (steps_end - steps_start) / (end - start)
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"invalid throughput window evidence: {exc}") from exc
+    degradation = 1 - rates["harness_on"] / rates["harness_off"]
+    return {
+        "throughput_degradation": degradation,
+        "throughput_breached": degradation > LIVENESS_MAX_THROUGHPUT_DEGRADATION + 1e-12,
+        "throughput_reason": None,
+        "throughput_windows": windows,
+        "games_per_gpu_hour": rates,
+        "learner_steps_per_second": steps_per_second,
+    }
+
+
+@_exclusive_writer
+def build_liveness_report(
+    run_dir: Path | str, *, throughput_windows: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Refresh the liveness report, optionally recording matched off/on evidence."""
+    if throughput_windows is not None:
+        compare_liveness_throughput(throughput_windows)
+        _atomic_write_json(eval_dir(run_dir) / "liveness-throughput.json", dict(throughput_windows))
+    monitor = _LivenessMonitor(Path(run_dir), watched_k_total(run_dir))
+    monitor.sample()
+    return monitor.report()
+
+
+class _LivenessMonitor:
+    """Observe every newly published member while game play blocks the writer."""
+
+    def __init__(self, run_dir, k_total):
+        self.run_dir = run_dir
+        self.k_total = k_total
+        self.path = eval_dir(run_dir) / "liveness.jsonl"
+        self.samples = []
+        if self.path.exists():
+            self.samples = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.seen = {sample["published_version"] for sample in self.samples}
+
+    def sample(self):
+        markers = _publish_timestamps(self.run_dir, self.k_total)
+        manifest = _read_manifest(self.run_dir)
+        for version in schedulable_versions(self.run_dir, self.k_total):
+            if version in self.seen:
+                continue
+            # With real learner metrics, wait for the marker after the atomic
+            # checkpoint publish. Completion timestamps reconstruct the prefix
+            # at the event itself, even across monitor delay or downtime.
+            if list_procs(self.run_dir) and version not in markers:
+                continue
+            observed_at = time.time()
+            published_at = markers.get(version, observed_at)
+            prefix = 0
+            for member in range(1, self.k_total + 1):
+                required = manifest["members"].get(str(member), {}).get("required_cells", [])
+                if not required or any(
+                    manifest["cells"][cid]["completed_at"] is None
+                    or manifest["cells"][cid]["completed_at"] > published_at
+                    for cid in required
+                ):
+                    break
+                prefix = member
+            sample = {
+                "published_version": version,
+                "lag": max(0, version - prefix),
+                "timestamp": published_at,
+                "observed_at": observed_at,
+                "source": "publish_marker" if version in markers else "checkpoint_observation",
+            }
+            with self.path.open("a") as stream:
+                stream.write(json.dumps(sample, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.samples.append(sample)
+            self.seen.add(version)
+
+    def report(self):
+        throughput_path = eval_dir(self.run_dir) / "liveness-throughput.json"
+        windows = json.loads(throughput_path.read_text()) if throughput_path.exists() else None
+        throughput = compare_liveness_throughput(windows)
+        consecutive = 0
+        breached = False
+        for sample in sorted(self.samples, key=lambda sample: sample["published_version"]):
+            consecutive = consecutive + 1 if sample["lag"] > LIVENESS_MAX_LAG else 0
+            breached |= consecutive >= LIVENESS_BREACH_CONSECUTIVE
+        training_complete = self.k_total in schedulable_versions(self.run_dir, self.k_total)
+        final_lag = eval_lag(self.run_dir, self.k_total)
+        payload = {
+            "constants": {
+                "max_lag": LIVENESS_MAX_LAG,
+                "breach_consecutive": LIVENESS_BREACH_CONSECUTIVE,
+                "max_throughput_degradation": LIVENESS_MAX_THROUGHPUT_DEGRADATION,
+            },
+            "samples": len(self.samples),
+            "lag_breached": breached,
+            "training_complete": training_complete,
+            "final_post_training_lag": final_lag if training_complete else None,
+            "caught_up": training_complete and final_lag == 0,
+            **throughput,
+        }
+        _atomic_write_json(eval_dir(self.run_dir) / "liveness.json", payload)
+        return payload
+
+
+@contextmanager
+def _monitor_liveness(run_dir, k_total, poll_interval):
+    monitor = _LivenessMonitor(run_dir, k_total)
+    monitor.sample()
+    stop = threading.Event()
+    errors = []
+
+    def watch():
+        while not stop.wait(max(0.01, min(poll_interval, 1.0))):
+            try:
+                monitor.sample()
+            except Exception as exc:
+                errors.append(exc)
+                return
+
+    thread = threading.Thread(target=watch, name="eval-publish-monitor", daemon=True)
+    thread.start()
+    try:
+        yield monitor
+    finally:
+        stop.set()
+        thread.join()
+        monitor.sample()
+        monitor.report()
+    if errors:
+        raise errors[0]
+
+
+@_exclusive_writer
 def run_watch_loop(
     run_dir: Path | str,
     config: EvalConfig,
@@ -1103,17 +1378,9 @@ def run_watch_loop(
             mode to model a kill/relaunch or a downtime/catch-up scenario.
         sleep: Injected sleep function (tests pass a no-op or a call-recording
             stub; production leaves this at the default, :func:`time.sleep`).
-        on_member_complete: Optional callback fired with a member's version
-            immediately after *this call* finishes playing its last pending
-            cell -- i.e. exactly the members that transition from incomplete
-            to complete during this call, never one already complete when a
-            poll examined it (that member's ``pending`` list is empty, so the
-            loop never reaches the callback for it). Subtask 9.3's "loop
-            hook": a caller wires this to regenerate the §1 report artifacts
-            from a fresh snapshot after every checkpoint the harness itself
-            just finished scoring, with zero manual steps. ``None`` (the
-            default) fires nothing -- this function's own scheduling/playing
-            behavior is identical either way.
+        on_member_complete: Optional report callback, called once per complete
+            member in this invocation. Exceptions are logged and retried on
+            subsequent polls or a relaunch, without interrupting scoring.
 
     Returns:
         A :class:`WatchLoopResult` summarizing the call.
@@ -1125,10 +1392,14 @@ def run_watch_loop(
             or ``run_record.json`` yet (:func:`watched_k_total`,
             ``core.run_identity.read_run_record``).
     """
-    resolve_eval_launch(run_dir, config)
     run_dir = Path(run_dir)
     run_id = read_run_record(run_dir).run_id
     k_total = watched_k_total(run_dir)
+    if not math.isfinite(poll_interval) or poll_interval < 0:
+        raise ValueError("poll_interval must be finite and non-negative")
+    if max_idle_polls is not None and max_idle_polls < 1:
+        raise ValueError("max_idle_polls must be positive")
+    resolve_eval_launch(run_dir, config)
     ckpt_dir = checkpoint_dir(run_dir)
     candidate_fingerprint = build_fingerprint(game)
     rung_identities = {
@@ -1144,55 +1415,64 @@ def run_watch_loop(
     completed_members: set[int] = set()
     stopped_reason = "single_pass"
 
-    while True:
-        polls += 1
-        available = schedulable_versions(run_dir, k_total)
-        pairs_this_poll = 0
+    reported: set[int] = set()
+    with _monitor_liveness(run_dir, k_total, poll_interval):
+        while True:
+            polls += 1
+            available = schedulable_versions(run_dir, k_total)
+            pairs_this_poll = 0
 
-        for version in available:
-            required = required_cell_ids(version, profile, available, k_total, config.forms)
-            register_member(run_dir, version, required)
-            pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
-            if not pending:
-                completed_members.add(version)
-                continue
-            for cid in pending:
-                parsed = parse_cell_id(cid)
-                candidate_factory = cache.candidate_factory(version, parsed.rung)
-                opponent_factory = _resolve_opponent_factory(
-                    parsed.opponent_id, rung_identities, cache
-                )
-                pairs_this_poll += _play_pending_cell(
-                    run_dir,
-                    run_id,
-                    config,
-                    game,
+            for version in available:
+                required = required_cell_ids(
+                    version,
                     profile,
-                    parsed,
-                    candidate_factory,
-                    opponent_factory,
-                    candidate_fingerprint,
+                    available,
+                    k_total,
+                    config.forms,
+                    lag_divisor=config.rung8_lag_divisor,
+                    earliest=config.rung8_earliest_version,
                 )
-            completed_members.add(version)
-            if on_member_complete is not None:
-                on_member_complete(version)
+                register_member(run_dir, version, required)
+                pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
+                if not pending:
+                    completed_members.add(version)
+                    _try_report(version, on_member_complete, reported)
+                    continue
+                for cid in pending:
+                    parsed = parse_cell_id(cid)
+                    candidate_factory = cache.candidate_factory(version, parsed.rung)
+                    opponent_factory = _resolve_opponent_factory(
+                        parsed.opponent_id, rung_identities, cache
+                    )
+                    pairs_this_poll += _play_pending_cell(
+                        run_dir,
+                        run_id,
+                        config,
+                        game,
+                        profile,
+                        parsed,
+                        candidate_factory,
+                        opponent_factory,
+                        candidate_fingerprint,
+                    )
+                completed_members.add(version)
+                _try_report(version, on_member_complete, reported)
 
-        total_pairs_played += pairs_this_poll
+            total_pairs_played += pairs_this_poll
 
-        if single_pass:
-            break
-        if len(completed_members) >= k_total:
-            stopped_reason = "k_complete"
-            break
-        if pairs_this_poll == 0:
-            idle_polls += 1
-            if max_idle_polls is not None and idle_polls >= max_idle_polls:
-                stopped_reason = "idle"
+            if single_pass:
                 break
-        else:
-            idle_polls = 0
-        sleep(poll_interval)
-
+            if len(completed_members) >= k_total:
+                stopped_reason = "k_complete"
+                break
+            if pairs_this_poll == 0:
+                idle_polls += 1
+                if max_idle_polls is not None and idle_polls >= max_idle_polls:
+                    stopped_reason = "idle"
+                    break
+            else:
+                idle_polls = 0
+            sleep(poll_interval)
     return WatchLoopResult(
         polls=polls,
         pairs_played=total_pairs_played,
@@ -1269,7 +1549,7 @@ class BenchResult:
             pairs_per_cell * 2``) -- never the smaller sampled count.
         projected_hours_per_checkpoint: ``games_per_checkpoint *
             seconds_per_game / 3600`` -- the pin-11 feasibility number itself.
-        publish_cadence_hours: The watched run's own average GPU-hour gap
+        publish_cadence_hours: The watched run's own average wall-clock-hour gap
             between consecutive published members' ``checkpoint_published``
             markers (the §1 x-axis join), or ``None`` if fewer than two
             members have published yet (an undefined cadence, never a
@@ -1314,8 +1594,20 @@ class BenchResult:
         }
 
 
+def _publish_timestamps(run_dir: Path, k_total: int) -> dict[int, float]:
+    """Join each member to its first durable publish event across epochs."""
+    markers = {}
+    for proc in list_procs(run_dir):
+        for record in iter_epoch_records(run_dir, proc):
+            if record.get("kind") == CHECKPOINT_PUBLISHED_KIND:
+                version = record["model_version"]
+                if 1 <= version <= k_total:
+                    markers.setdefault(version, record["timestamp"])
+    return markers
+
+
 def _publish_cadence_hours(run_dir: Path, k_total: int) -> float | None:
-    """Return the watched run's average GPU-hour gap between published members.
+    """Return the watched run's average wall-clock-hour gap between published members.
 
     Args:
         run_dir: The watched run's root directory.
@@ -1324,19 +1616,17 @@ def _publish_cadence_hours(run_dir: Path, k_total: int) -> float | None:
             of this average.
 
     Returns:
-        The mean of consecutive-member GPU-hour gaps (the §1 x-axis join's
-        own ``gpu_hours`` coordinate, ``core.observability.reduce_run``), or
+        The mean of consecutive-member wall-clock timestamp gaps, or
         ``None`` if fewer than two members ``1..k_total`` have a
         ``checkpoint_published`` marker yet -- an undefined cadence with only
         zero or one data point, never a fabricated ``0.0``.
     """
-    reduced = reduce_run(run_dir)
-    versions = sorted(v for v in reduced.checkpoints if 1 <= v <= k_total)
-    if len(versions) < 2:
+    markers = _publish_timestamps(run_dir, k_total)
+    timestamps = [markers[v] for v in sorted(markers)]
+    gaps = [b - a for a, b in zip(timestamps, timestamps[1:], strict=False)]
+    if not gaps or any(not math.isfinite(gap) or gap <= 0 for gap in gaps):
         return None
-    gpu_hours = [reduced.checkpoints[v][2] for v in versions]
-    gaps = [later - earlier for earlier, later in zip(gpu_hours, gpu_hours[1:], strict=False)]
-    return sum(gaps) / len(gaps)
+    return sum(gaps) / len(gaps) / 3600
 
 
 def bench_candidate(
@@ -1390,7 +1680,15 @@ def bench_candidate(
             "least one published checkpoint to measure real throughput against"
         )
     candidate_version = available[-1]
-    required = required_cell_ids(candidate_version, profile, available, k_total, config.forms)
+    required = required_cell_ids(
+        candidate_version,
+        profile,
+        available,
+        k_total,
+        config.forms,
+        lag_divisor=config.rung8_lag_divisor,
+        earliest=config.rung8_earliest_version,
+    )
 
     rung_identities = {
         profile.rung_identity(rung): profile.network_free_rungs[rung] for rung in profile.rungs()

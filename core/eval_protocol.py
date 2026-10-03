@@ -83,6 +83,11 @@ PAIRS_PER_CELL = 24
 #: this module is pure-stdlib by design (mirrors ``core.seeding``'s confinement).
 EVAL_SIMS = 512
 
+# Operational liveness thresholds are reported separately from the scoring registry.
+LIVENESS_MAX_LAG = 4
+LIVENESS_BREACH_CONSECUTIVE = 2
+LIVENESS_MAX_THROUGHPUT_DEGRADATION = 0.05
+
 #: Rung-8 historical-opponent selection rule (tasks/m4/001 pin 5): a candidate's
 #: opponents are ``{v - 1, v - ceil(K / RUNG8_LAG_DIVISOR), RUNG8_EARLIEST_VERSION}``,
 #: intersected with the available member versions -- see
