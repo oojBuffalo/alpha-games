@@ -368,10 +368,10 @@ def _build_real_shape_metrics_fixture(run_dir):
 
     Hand arithmetic (mirrors tests/test_observability.py's inline comments):
       v1 marker @t=2.0: positions before it = 10(t=1, actor-0) + 7(t=1.5, actor-1) = 17
-                        gpu segment #1 (0.0-2.5) not yet closed at t=2.0 -> 0.0h
+                        gpu segment #1 (0.0-10.0) elapsed at t=2.0 -> 2/3600 h
       v2 marker @t=5.0: positions before it = 17 + 15(t=3, actor-0 ep0)
                         + 5(t=4, actor-0 ep1, after its restart) + 3(t=4.5, actor-1) = 40
-                        gpu segment #1 closed at t=2.5 -> 2.5/3600 h
+                        gpu segment #1 still active at t=5.0 -> 5/3600 h
     """
     orch = EpochMetricsWriter(run_dir, "orchestrator")
     a0 = EpochMetricsWriter(run_dir, "actor-0")
@@ -382,13 +382,13 @@ def _build_real_shape_metrics_fixture(run_dir):
     a0.append(delta_record("positions_evaluated", 10, timestamp=1.0))
     a1.append(delta_record("positions_evaluated", 7, timestamp=1.5))
     _append_checkpoint_published(learner, version=1, learner_step=5, timestamp=2.0)
-    orch.append(segment_end_record(timestamp=2.5))
     a0.append(delta_record("positions_evaluated", 15, timestamp=3.0))
     a0_restarted = EpochMetricsWriter(run_dir, "actor-0")  # a crash + restart mid-series
     assert a0_restarted.epoch == 1
     a0_restarted.append(delta_record("positions_evaluated", 5, timestamp=4.0))
     a1.append(delta_record("positions_evaluated", 3, timestamp=4.5))
     _append_checkpoint_published(learner, version=2, learner_step=9, timestamp=5.0)
+    orch.append(segment_end_record(timestamp=10.0))
 
 
 def test_elo_curve_joins_correct_cumulative_x_values_on_a_real_shape_metrics_fixture(tmp_path):
@@ -408,11 +408,11 @@ def test_elo_curve_joins_correct_cumulative_x_values_on_a_real_shape_metrics_fix
 
     assert rows[0]["learner_step"] == 5
     assert rows[0]["net_evals"] == pytest.approx(17.0)
-    assert rows[0]["gpu_hours"] == pytest.approx(0.0)
+    assert rows[0]["gpu_hours"] == pytest.approx(2.0 / 3600.0)
 
     assert rows[1]["learner_step"] == 9
     assert rows[1]["net_evals"] == pytest.approx(40.0)
-    assert rows[1]["gpu_hours"] == pytest.approx(2.5 / 3600.0)
+    assert rows[1]["gpu_hours"] == pytest.approx(5.0 / 3600.0)
 
 
 def test_elo_curve_raises_when_a_scored_member_has_no_publication_marker(tmp_path):
@@ -446,3 +446,34 @@ def test_elo_curve_orders_by_model_version_regardless_of_build_order(tmp_path):
     result = elo_curve(tmp_path, snapshot)
 
     assert [row["model_version"] for row in result["rows"]] == [1, 2]
+
+
+@pytest.mark.parametrize("value", [1e6, -1e6, 1e308, 10**1000])
+def test_initial_ratings_rejects_huge_values_with_value_error(value):
+    with pytest.raises(ValueError, match="magnitude"):
+        fit_elo(
+            [("a", "r", 30.0, 48), ("b", "a", 10.0, 48)],
+            "r",
+            initial_ratings={"a": value, "b": -1e6},
+        )
+
+
+def test_elo_curve_rejects_cross_run_snapshot_before_writing(tmp_path):
+    run_a = tmp_path / "a"
+    run_b = tmp_path / "b"
+    _write_member(run_a, 1, [(7, "random", [1.0, 1.0])])
+    _build_real_shape_metrics_fixture(run_b)
+    with pytest.raises(ValueError, match="same run"):
+        elo_curve(run_b, load_snapshot(run_a))
+    assert not elo_curve_path(run_b).exists()
+
+
+def test_elo_curve_accepts_resolved_alias_of_snapshot_run(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_member(run_dir, 1, [(7, "random", [1.0, 1.0])])
+    _build_real_shape_metrics_fixture(run_dir)
+    alias = tmp_path / "alias"
+    alias.symlink_to(run_dir, target_is_directory=True)
+    assert elo_curve(alias, load_snapshot(run_dir))["rows"][0]["gpu_hours"] == pytest.approx(
+        2.0 / 3600.0
+    )

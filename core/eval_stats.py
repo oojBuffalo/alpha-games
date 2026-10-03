@@ -225,7 +225,8 @@ def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
         members (:func:`snapshot_matches`'s member-prefix scope).
 
     Raises:
-        ValueError: If :func:`fit_snapshot_elo` raises (a disconnected
+        ValueError: If the resolved ``run_dir`` differs from the snapshot
+            root; if :func:`fit_snapshot_elo` raises (a disconnected
             agent), or if some member version :func:`checkpoint_elo` returns
             has no matching entry in ``reduce_run(run_dir).checkpoints`` --
             an eval-store/observability inconsistency (e.g. a candidate
@@ -233,6 +234,8 @@ def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
             ``checkpoint_published`` marker for it) this function refuses to
             paper over.
     """
+    if Path(run_dir).resolve() != Path(snapshot.run_dir).resolve():
+        raise ValueError("run_dir must identify the same run as snapshot.run_dir")
     ratings = fit_snapshot_elo(snapshot)
     reduced = reduce_run(run_dir)
 
