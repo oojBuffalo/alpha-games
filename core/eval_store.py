@@ -17,6 +17,10 @@ durable artifacts under ``<run_dir>/eval/``:
     snapshot never races a live writer, and a partial cell is structurally invisible
     to it.
 
+**Schema v2.** Full candidate-form IDs and the required ``cell_seed`` stamp replace
+the legacy schema-v1 cell layout. Older records fail with ``SchemaVersionError``
+before parsing their fields; they must be regenerated in a fresh eval store.
+
 **Cell identity (bijective, filesystem-safe).** A cell is the triple
 ``(candidate_identity, opponent_identity)`` -- both full form-versioned identities.
 The candidate includes its checkpoint version and
@@ -143,6 +147,15 @@ class CellId:
     opponent_id: str
     form_version: int = 1
     full_candidate_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.full_candidate_identity is not None:
+            version, rung, form = _candidate_parts(self.full_candidate_identity)
+            if (version, rung) != (self.candidate_version, self.rung):
+                raise ValueError("candidate identity disagrees with version/rung")
+            object.__setattr__(self, "form_version", form)
+            if self.full_candidate_identity == f"rung{rung}-v{form}-{version}":
+                object.__setattr__(self, "full_candidate_identity", None)
 
     @property
     def candidate_identity(self) -> str:

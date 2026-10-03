@@ -51,7 +51,8 @@ PROTOCOL_VERSION = 1
 #: ``PROTOCOL_VERSION``: the record *shape* a reader must recognize can move
 #: separately from the *values* the protocol pins). ``core.eval_store`` rejects any
 #: schema_version it does not equal, loudly.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# v2 adds required cell_seed and full candidate-form identity in the cell path.
 
 # --- seed-derivation labels (core.seeding.derive_seed literal label parts) --------
 
