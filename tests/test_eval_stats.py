@@ -1857,7 +1857,7 @@ def test_conjunction_regressing_at_the_newest_member_discards_the_stale_credit(t
     assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
 
 
-@pytest.mark.parametrize("delta", [110.0, -110.0])
+@pytest.mark.parametrize("delta", [110.0, -110.0, 75.0, -75.0])
 def test_precise_non_significant_material_contrast_blocks_plateau(delta, monkeypatch):
     import core.eval_stats as stats
 
@@ -1929,3 +1929,23 @@ def test_material_climb_at_pinned_24_pairs_is_no_plateau(tmp_path):
     result = detect_plateau(tmp_path, B=399)
     assert result.outcome == PLATEAU_OUTCOME_NO_PLATEAU
     assert result.current.ci_equivalent is False
+
+
+def test_precise_positive_ci_excluding_zero_is_not_equivalent(monkeypatch):
+    import core.eval_stats as stats
+
+    versions = tuple(range(1, 17))
+    curve = {v: (0.0 if v <= 8 else 45.0) for v in versions}
+    replicate_curves = [
+        {v: (0.0 if v <= 8 else 10.0 + 70.0 * b / 38) for v in versions} for b in range(39)
+    ]
+    monkeypatch.setattr(
+        stats, "mann_kendall", lambda values: MannKendallResult(len(values), False, 0, 0.0, 0.266)
+    )
+    window = stats._window_condition(
+        16, versions, curve, replicate_curves, {v: float(v) for v in versions}, 39
+    )
+    assert window.contrast_ci == (10.0, 80.0)
+    assert window.mk_non_significant and window.ci_narrow and window.gpu_span_sufficient
+    assert window.ci_equivalent is False
+    assert window.satisfied is False
