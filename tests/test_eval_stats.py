@@ -2064,3 +2064,28 @@ def test_derived_snapshot_cannot_expand_its_prefix(tmp_path):
     _write_member(tmp_path, 1, [(7, "random", [1.0, 0.0])])
     with pytest.raises(ValueError, match="only truncate"):
         stats._snapshot_truncated_to(load_snapshot(tmp_path), 2)
+
+
+@pytest.mark.parametrize(
+    "identity", ["largest-shape", "random-seeded", "rung4-search", "custom-v2-s64"]
+)
+def test_production_identity_keeps_network_free_names_opaque(identity):
+    from core.eval_artifacts import _production_identity
+
+    assert _production_identity(identity) is True
+
+
+@pytest.mark.parametrize(
+    "identity, expected",
+    [
+        ("rung5-v1-3", True),
+        ("rung7-v1-30", True),
+        ("rung7-v1-s64-3", False),
+        ("rung6-v2-3", False),
+        ("rung7-v1-not-a-version", False),
+    ],
+)
+def test_production_identity_requires_full_bare_v1_network_names(identity, expected):
+    from core.eval_artifacts import _production_identity
+
+    assert _production_identity(identity) is expected

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -152,10 +153,8 @@ def _file_sha256(path: Path) -> str:
 
 def _production_identity(identity: str) -> bool:
     """Require bare v1 network forms; frozen network-free names stay opaque."""
-    if "-s" in identity:
-        return False
     if identity.startswith(("rung5-", "rung6-", "rung7-")):
-        return identity.startswith(("rung5-v1-", "rung6-v1-", "rung7-v1-"))
+        return re.fullmatch(r"rung[567]-v1-\d+", identity) is not None
     return True
 
 
