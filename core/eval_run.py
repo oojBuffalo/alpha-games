@@ -1279,6 +1279,7 @@ class _LivenessMonitor:
             breached |= consecutive >= LIVENESS_BREACH_CONSECUTIVE
         training_complete = self.k_total in schedulable_versions(self.run_dir, self.k_total)
         final_lag = eval_lag(self.run_dir, self.k_total)
+        samples_complete = self.seen == set(range(1, self.k_total + 1))
         payload = {
             "constants": {
                 "max_lag": LIVENESS_MAX_LAG,
@@ -1286,7 +1287,9 @@ class _LivenessMonitor:
                 "max_throughput_degradation": LIVENESS_MAX_THROUGHPUT_DEGRADATION,
             },
             "samples": len(self.samples),
-            "lag_breached": breached,
+            "lag_breached": breached if breached or samples_complete else None,
+            "lag_samples_complete": samples_complete,
+            "lag_bound_met": (not breached and final_lag == 0) if samples_complete else None,
             "training_complete": training_complete,
             "final_post_training_lag": final_lag if training_complete else None,
             "caught_up": training_complete and final_lag == 0,

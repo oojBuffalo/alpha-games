@@ -1749,3 +1749,14 @@ def test_liveness_cli_records_and_reuses_counterfactual_evidence(tmp_path):
     assert report["throughput_breached"] is True
     assert run_eval.cmd_liveness(config_path)["throughput_windows"] == report["throughput_windows"]
     assert eval_run.compare_liveness_throughput(None)["throughput_breached"] is None
+
+
+def test_liveness_missing_publish_markers_cannot_pass_bound(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    EpochMetricsWriter(tmp_path, "learner").append({"kind": "segment_start", "timestamp": 0})
+    report = run_eval.cmd_liveness(
+        _write_eval_config_file(tmp_path / "eval.json", _eval_config(tmp_path))
+    )
+    assert report["lag_samples_complete"] is False
+    assert report["lag_breached"] is None
+    assert report["lag_bound_met"] is None
