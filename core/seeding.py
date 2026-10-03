@@ -32,6 +32,8 @@ import hashlib
 import random
 from dataclasses import dataclass
 
+from core.eval_protocol import SEED_LABEL_BOOTSTRAP
+
 # Domain separator: seeds derived here can never collide with another use of sha256 over
 # similar-looking bytes, and bumping the version deliberately re-keys every stream.
 _DOMAIN = b"alpha-games/seeding/v1"
@@ -51,7 +53,7 @@ PURPOSE_WINDOW_SAMPLING = "replay-sampling"
 #: pin 7, tasks/m4/007): ``core.eval_stats.bootstrap_seed`` derives the §1 paired-
 #: bootstrap's own seed as ``derive_seed(eval_seed, PURPOSE_BOOTSTRAP)`` -- independent
 #: of every self-play purpose above, which all fan out from the run seed instead.
-PURPOSE_BOOTSTRAP = "bootstrap"
+PURPOSE_BOOTSTRAP = SEED_LABEL_BOOTSTRAP
 
 #: M4's eval-orchestrator purpose (tasks/m4/009): ``core.eval_run.cell_seed`` derives
 #: one cell's seed as ``derive_seed(eval_seed, PURPOSE_EVAL, cell_id)`` -- independent

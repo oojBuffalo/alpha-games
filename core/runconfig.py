@@ -53,10 +53,12 @@ from __future__ import annotations
 import json
 import pkgutil
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+
+from core.eval_protocol import PROTOCOL_VERSION, protocol_fingerprint
 
 # Repo-root ``configs/`` — the run-config files live beside the code, not inside
 # the installed package (``pyproject`` ships ``core*``/``games*`` only).
@@ -507,6 +509,9 @@ class EvaluationConfig:
             ``RunConfig.run_seed`` so the paired set is not coupled to training.
         min_score_rate: Score-rate floor the trained side must reach, where a
             draw scores 0.5.
+        protocol_version: Version of the registered evaluation conventions.
+        protocol_fingerprint: Hash of those conventions, serialized with config
+            and checked when reading a stamped config.
     """
 
     agent_form: str
@@ -517,6 +522,8 @@ class EvaluationConfig:
     n_pairs: int
     eval_seed: int
     min_score_rate: float
+    protocol_version: int = field(default=PROTOCOL_VERSION, init=False)
+    protocol_fingerprint: str = field(default_factory=protocol_fingerprint, init=False)
 
     def __post_init__(self) -> None:
         """Validate the evaluation protocol.
@@ -689,9 +696,9 @@ class RunConfig:
         """Return the config as nested plain dicts.
 
         The result round-trips: ``RunConfig.from_dict(cfg.to_dict()) == cfg``,
-        and it equals the source JSON with the ``_``-prefixed documentation keys
-        removed (JSON integers in float fields compare equal to their widened
-        values).
+        and reproduces the source JSON with documentation keys removed and
+        the current evaluation protocol stamps added. JSON integers in float
+        fields compare equal to their widened values.
 
         Returns:
             A nested ``dict`` mirroring the JSON layout.
@@ -838,6 +845,15 @@ def _evaluation_from_dict(raw: Mapping[str, Any]) -> EvaluationConfig:
         ValueError: On unknown/missing keys or out-of-range values.
         TypeError: On a wrong value type.
     """
+    # Legacy source configs acquire stamps on load; serialized configs must carry
+    # current stamps, so a registry change cannot silently relabel stored configs.
+    raw = dict(raw)
+    for key, current in (
+        ("protocol_version", PROTOCOL_VERSION),
+        ("protocol_fingerprint", protocol_fingerprint()),
+    ):
+        if key in raw and raw.pop(key) != current:
+            raise ValueError(f"evaluation.{key}: stored protocol does not match current registry")
     where = "evaluation"
     _check_keys(
         raw,
