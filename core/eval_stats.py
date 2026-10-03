@@ -105,6 +105,7 @@ from core.eval_protocol import (
     BOOTSTRAP_CI_UPPER_QUANTILE,
     DELTA_GATE_THRESHOLD,
     DELTA_WINDOW_DIVISOR,
+    EVAL_SIMS,
     MK_MIN_OBSERVATIONS,
     PLATEAU_CI_WIDTH_THRESHOLD_ELO,
     PLATEAU_CONFIRMATION_COUNT,
@@ -121,6 +122,7 @@ from core.eval_store import (
     PairRecord,
     iter_cells,
     load_snapshot,
+    parse_cell_id,
     read_cell,
     records_to_match,
 )
@@ -139,7 +141,7 @@ ANCHOR_AGENT = "random"
 #: convention for ``form == 7``, matched here as a plain string pattern rather than by
 #: importing that module (which pulls in the checkpoint-loading machinery this module
 #: has no other reason to depend on).
-_RUNG7_IDENTITY = re.compile(r"^rung7-v1-(\d+)$")
+_RUNG7_IDENTITY = re.compile(r"^rung7-v1-(?:s(\d+)-)?(\d+)$")
 
 
 def _snapshot_cell_records(
@@ -153,18 +155,9 @@ def _snapshot_cell_records(
     order, so the filter lives in one place rather than two copies that could
     silently drift apart.
 
-    Reads every cell the snapshot marks complete (``core.eval_store.iter_cells``)
-    but keeps only those belonging to the snapshot's *complete contiguous member
-    prefix* (``snapshot.member_prefix``): a completed cell whose candidate version
-    sits beyond that prefix is real evidence for a not-yet-fully-scored member
-    (``EvalSnapshot.completed_cell_ids``'s own docstring notes such cells are
-    visible there -- "per-checkpoint live reporting reads this set directly" --
-    precisely because they sit *outside* the contiguous prefix), so it is excluded
-    here rather than silently admitted into the §1 point estimate or the
-    bootstrap -- the "never partial data" analysis-snapshot convention both are
-    pinned to (task 1 pin 9, P2.2). A cell that is merely scheduled (never
-    completed at all) is already structurally absent from the snapshot and never
-    reaches this function in the first place.
+    Reads the complete contiguous member prefix via ``core.eval_store.iter_cells``.
+    Completed cells beyond it remain in ``snapshot.completed_cell_ids`` for live
+    reporting; only required prefix cells enter the fit and bootstrap.
 
     Args:
         snapshot: A frozen snapshot from ``core.eval_store.load_snapshot``.
@@ -181,8 +174,6 @@ def _snapshot_cell_records(
     cells: list[tuple[str, str, list[PairRecord]]] = []
     for path in iter_cells(snapshot):
         header, records = read_cell(path)
-        if header.cell_id.candidate_version > snapshot.member_prefix:
-            continue
         cells.append((header.candidate_identity, header.opponent_identity, records))
     return cells
 
@@ -418,16 +409,28 @@ def checkpoint_elo(ratings: dict[str, float]) -> list[tuple[int, float]]:
         ratings: A ``core.elo.fit_elo`` (or :func:`fit_snapshot_elo`) result.
 
     Returns:
-        ``(model_version, elo)`` pairs for every rung-7 (``"rung7-v1-<v>"``)
-        agent present in ``ratings``, ordered by ``model_version`` ascending --
+        ``(model_version, elo)`` pairs for every rung-7 identity, including
+        explicit ``-s<S>`` budgets, ordered by ``model_version`` ascending --
         the §6.2 provenance ordering, never file mtime and never dict/insertion
         order.
     """
     versions: list[tuple[int, float]] = []
+    budgets: set[int] = set()
+    seen_versions: set[int] = set()
     for name, elo in ratings.items():
         match = _RUNG7_IDENTITY.match(name)
         if match is not None:
-            versions.append((int(match.group(1)), elo))
+            version = int(match.group(2))
+            budget = int(match.group(1)) if match.group(1) else EVAL_SIMS
+            if budget <= 0:
+                raise ValueError("rung-7 search budget must be positive")
+            if version in seen_versions:
+                raise ValueError(f"multiple rung-7 identities for checkpoint {version}")
+            budgets.add(budget)
+            seen_versions.add(version)
+            versions.append((version, elo))
+    if len(budgets) > 1:
+        raise ValueError("rung-7 checkpoint curve mixes search budgets")
     versions.sort(key=lambda pair: pair[0])
     return versions
 
@@ -1014,36 +1017,19 @@ def _read_elo_curve_gpu_hours(run_dir: Path) -> tuple[dict[int, float], str | No
 
 
 def _snapshot_truncated_to(snapshot: EvalSnapshot, member_prefix: int) -> EvalSnapshot:
-    """Return ``snapshot`` restricted to an earlier, smaller ``member_prefix``.
+    """Restrict a frozen snapshot's authoritative evidence to an earlier prefix.
 
-    A confirmation window ending at some earlier member ``v`` must be fit from
-    exactly the evidence that existed back when ``v`` was the newest evaluated
-    member -- never from evidence a later candidate's own matches contributed
-    (§9 pin 2's shared Bradley-Terry graph means those matches can shift an
-    earlier checkpoint's rating too; see :func:`detect_plateau`'s docstring).
-    Reusing :func:`_snapshot_cell_records`'s own ``candidate_version >
-    snapshot.member_prefix`` filter by simply handing it a copy of ``snapshot``
-    with a smaller ``member_prefix`` reconstructs exactly that earlier
-    evidence set: pin 9's raw-cell immutability guarantees every cell this
-    smaller prefix admits has the identical content it had back then, and no
-    cell it excludes could have existed yet either (a candidate's own cells
-    cannot complete before that candidate itself was evaluated).
-
-    Args:
-        snapshot: A frozen snapshot from ``core.eval_store.load_snapshot`` (or
-            an already-truncated one -- truncating is idempotent/composable).
-        member_prefix: The smaller prefix to restrict to. Not validated against
-            ``snapshot.member_prefix`` here -- every caller in this module only
-            ever truncates to a member version already known to be within the
-            snapshot's real, evaluated range.
-
-    Returns:
-        A copy of ``snapshot`` with ``member_prefix`` replaced; every other
-        field (including ``completed_cell_ids``, left at its full breadth --
-        the downstream ``candidate_version`` filter does the actual
-        narrowing) is unchanged.
+    Preserve the broad completed-cell set for live reporting, while filtering
+    the authoritative evidence set used by every point and bootstrap fit.
     """
-    return replace(snapshot, member_prefix=member_prefix)
+    if not 0 <= member_prefix <= snapshot.member_prefix:
+        raise ValueError("a derived snapshot can only truncate its member prefix")
+    evidence_ids = frozenset(
+        cid
+        for cid in snapshot.evidence_cell_ids
+        if parse_cell_id(cid).candidate_version <= member_prefix
+    )
+    return replace(snapshot, member_prefix=member_prefix, evidence_cell_ids=evidence_ids)
 
 
 def _fit_checkpoint_curves(

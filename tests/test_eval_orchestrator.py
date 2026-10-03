@@ -615,18 +615,37 @@ def test_watch_loop_schedules_and_plays_every_required_cell_in_one_pass(tmp_path
     # 3 forms x 3 network-free rungs = 9 cells/member, plus member 2's one
     # rung-8 historical opponent (lag = ceil(2/4) = 1; wanted = {1,1,1} -> {1}).
     expected_cells = {
-        build_cell_id(v, form, opp)
+        build_cell_id(
+            v, form, opp, candidate_identity=agent_identity(form, v, eval_sims=config.eval_sims)
+        )
         for v in (1, 2)
         for form in (5, 6, 7)
         for opp in ("random", "largest-piece", "mobility")
     }
     expected_cells.add(
-        build_cell_id(2, RUNG8_CANDIDATE_FORM, agent_identity(RUNG8_CANDIDATE_FORM, 1))
+        build_cell_id(
+            2,
+            RUNG8_CANDIDATE_FORM,
+            agent_identity(RUNG8_CANDIDATE_FORM, 1, eval_sims=config.eval_sims),
+            candidate_identity=agent_identity(7, 2, eval_sims=config.eval_sims),
+        )
     )
 
     snapshot = load_snapshot(run_dir)
     assert snapshot.completed_cell_ids == frozenset(expected_cells)
     assert snapshot.member_prefix == 2
+    assert snapshot.evidence_cell_ids == snapshot.completed_cell_ids
+    for cid in snapshot.evidence_cell_ids:
+        header, records = read_cell(cell_path(run_dir, cid))
+        parsed = parse_cell_id(cid)
+        assert header.candidate_identity == agent_identity(
+            parsed.rung, parsed.candidate_version, eval_sims=config.eval_sims
+        )
+        assert header.cell_seed == cell_seed(config.eval_seed, cid)
+        assert all(
+            record.pair_seed == derive_seed(header.cell_seed, "pair", record.pair_index)
+            for record in records
+        )
     assert result.pairs_played == len(expected_cells) * config.pairs_per_cell
 
 
@@ -783,6 +802,7 @@ def _lag_header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs:
         opponent_identity=opponent_id,
         eval_config={"pairs_per_cell": n_pairs},
         candidate_fingerprint={"orientation_table_hash": "test"},
+        cell_seed=0,
     )
 
 
@@ -794,7 +814,7 @@ def _lag_fill_and_complete(run_dir, header, scores):
             path,
             PairRecord(
                 pair_index=i,
-                pair_seed=i,
+                pair_seed=derive_seed(header.cell_seed, "pair", i),
                 score_a=score,
                 games=(
                     GameRecordSnapshot(plies=1, opening=0),
@@ -947,9 +967,11 @@ def test_resolve_opponent_factory_resolves_a_rung8_historical_identity(tmp_path)
     _write_checkpoint(ckpt_dir, GAME, version=1, seed=1)
     cache = _CandidateCache(ckpt_dir=ckpt_dir, game=GAME, device="cpu", eval_sims=4)
 
-    factory = _resolve_opponent_factory(agent_identity(RUNG8_CANDIDATE_FORM, 1), {}, cache)
+    factory = _resolve_opponent_factory(
+        agent_identity(RUNG8_CANDIDATE_FORM, 1, eval_sims=4), {}, cache
+    )
 
-    assert factory(seed=0).name == "rung7-v1-1"
+    assert factory(seed=0).name == "rung7-v1-s4-1"
 
 
 def test_resolve_opponent_factory_rejects_an_unrecognized_identity(tmp_path):
@@ -1181,7 +1203,8 @@ def test_acceptance_concurrent_run_scores_every_member_end_to_end(tmp_path):
     assert final_production_b["checkpoints_evaluated"] == k_total
     assert final_production_b["bootstrap_b"] == eval_protocol.BOOTSTRAP_B_PRODUCTION
     assert final_production_b["delta"] is not None
-    assert final_production_b["authoritative"] is True
+    # Production B alone cannot certify reduced pair/search-budget evidence.
+    assert final_production_b["authoritative"] is False
 
     assert eval_lag(run_dir, k_total) == 0
 
@@ -1476,7 +1499,7 @@ def test_report_with_a_cell_mid_write_never_opens_it_and_matches_last_complete_p
         path2,
         PairRecord(
             pair_index=next_index,
-            pair_seed=next_index,
+            pair_seed=derive_seed(header2.cell_seed, "pair", next_index),
             score_a=1.0,
             games=(
                 GameRecordSnapshot(plies=1, opening=0),
@@ -1502,7 +1525,11 @@ def test_report_with_a_cell_mid_write_never_opens_it_and_matches_last_complete_p
 
 def test_rung8_config_values_select_the_stamped_opponents():
     cells = required_cell_ids(10, FAST_PROFILE, range(1, 11), 32, (7,), lag_divisor=2, earliest=2)
-    historical = {parse_cell_id(cid).opponent_id for cid in cells if "rung7-v1-" in cid}
+    historical = {
+        parse_cell_id(cid).opponent_id
+        for cid in cells
+        if parse_cell_id(cid).opponent_id.startswith("rung7-v1-")
+    }
     assert historical == {agent_identity(7, 2), agent_identity(7, 9)}
 
 
@@ -1769,3 +1796,36 @@ def test_checkpoint_observation_alone_cannot_certify_publish_time_bound(tmp_path
     assert report["caught_up"] is True
     assert report["lag_bound_met"] is None
     assert report["lag_samples_complete"] is False
+
+
+@pytest.mark.parametrize("sims", [4, 64, 512])
+def test_scheduling_identities_match_actual_candidate_and_historical_factories(tmp_path, sims):
+    _build_watched_run(tmp_path, k_total=2)
+    cache = _CandidateCache(checkpoint_dir(tmp_path), GAME, "cpu", sims)
+    config = _eval_config(tmp_path, eval_sims=sims)
+    cells = required_cell_ids(2, FAST_PROFILE, (1, 2), 2, config.forms, eval_sims=sims)
+    rungs = {
+        FAST_PROFILE.rung_identity(rung): factory
+        for rung, factory in FAST_PROFILE.network_free_rungs.items()
+    }
+    for cid in cells:
+        parsed = parse_cell_id(cid)
+        assert cache.candidate_factory(2, parsed.rung)(0).name == parsed.candidate_identity
+        assert (
+            _resolve_opponent_factory(parsed.opponent_id, rungs, cache)(0).name
+            == parsed.opponent_id
+        )
+        assert ("-s" in parsed.candidate_identity) is (sims != 512 and parsed.rung in (6, 7))
+
+
+def test_historical_factory_refuses_identity_for_a_different_budget(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    cache = _CandidateCache(checkpoint_dir(tmp_path), GAME, "cpu", 4)
+    with pytest.raises(ValueError, match="budget"):
+        _resolve_opponent_factory(agent_identity(7, 1, eval_sims=64), {}, cache)
+
+
+def test_search_config_rejects_a_single_simulation_before_launch():
+    with pytest.raises(ValueError, match="integer >= 2"):
+        _make_config("unused", eval_sims=1)
+    assert _make_config("unused", eval_sims=1, forms=(5,)).eval_sims == 1

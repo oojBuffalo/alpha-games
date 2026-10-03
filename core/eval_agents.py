@@ -5,7 +5,7 @@ pyproject confinement pin; ``core/agents.py`` stays pure stdlib and torch-free,
 so :class:`NetworkPolicyAgent` sits beside the load path it depends on rather
 than beside ``RandomAgent``/``MobilityAgent``.
 
-Every network rung (5, and 6/7's shared ``SearchAgent``) stands on the same
+Every network rung (5 here; 6/7 at a later task) stands on the same
 load-bearing seam: reconstruct a published checkpoint's *exact* trained
 architecture, restore its weights, validate its fingerprint, and wrap it as an
 MCTS :data:`~core.mcts.Evaluator` — never a freshly initialized net wearing a
@@ -20,42 +20,21 @@ checkpoint. :func:`load_eval_network` makes that step explicit and
 un-skippable, and ``tests/test_eval_agents.py``'s distinct-weights golden
 proves the weights actually moved.
 
-Rung 8 (historical checkpoints as frozen opponents, §9) adds no new agent
-form: a historical opponent for checkpoint ``v`` is simply
-:class:`SearchAgent` in its rung-7 form, instantiated from an older
-published ``ckpt-<u>.pt`` — see :func:`historical_opponents` (the version
-selector) and :func:`historical_opponent_factory` (the pre-load-asserted
-factory) at the bottom of this module.
-
-**Reconstructing the architecture without a stored ``NetworkConfig`` field.**
-``core.checkpoint.CheckpointBundle`` bundles ``run_config`` (``RunConfig``, no
-network-shape fields — see ``core/runconfig.py``'s ``TrainingConfig``) and
-``model_state_dict``, but no explicit ``NetworkConfig``: a real training run
-always builds via ``NetworkConfig.from_game(game)`` and never persists the
-trunk width/depth it chose. Re-deriving via ``from_game`` here would silently
-assume every checkpoint used the D5 default trunk (8 blocks × 128 channels) —
-correct for production checkpoints, but exactly the "config the checkpoint
-did *not* actually train with" for any other trunk size (small test
-checkpoints included), and `` load_state_dict(strict=True)`` would then raise
-on the first shape mismatch instead of loading. So the trunk width/depth
-(and whether an aux head exists) are read directly off the persisted
-``model_state_dict`` tensors — the one artifact that cannot drift from what
-was actually trained — while the game-shape fields (``input_planes``,
-``input_shape``, ``policy_shape``) come from ``game``, already pinned equal to
-the checkpoint's by :func:`~core.checkpoint.load_checkpoint`'s fingerprint
-compare. This is the literal reading of "the checkpoint is the authority on
-the architecture it trained," not a re-derivation of D5 defaults.
+Architecture metadata is recorded independently of the weights in checkpoint
+schema v2. Strict loading rejects missing components as well as individual keys.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from enum import Enum
 from pathlib import Path
 
 from core.agents import Agent
 from core.checkpoint import (
     CheckpointBundle,
+    CheckpointFormatError,
     FingerprintMismatchError,
     load_checkpoint,
     published_checkpoint_path,
@@ -63,12 +42,8 @@ from core.checkpoint import (
 from core.eval_protocol import RUNG8_EARLIEST_VERSION, RUNG8_LAG_DIVISOR
 from core.game import Action, Game, State
 from core.mcts import MCTS, Evaluator
-from core.network import Network, NetworkConfig, make_network_evaluator
+from core.network import Network, make_network_evaluator
 from core.runner import AgentFactory
-
-_STEM_CONV_WEIGHT = "stem.0.weight"
-_AUX_FC_WEIGHT = "aux_fc.weight"
-_BLOCK_KEY_PREFIX = "blocks."
 
 #: Ladder rung 6/7 eval search-form simulation budget — design doc §9's
 #: "Pre-registered protocol (M4 pins)" block, pin 4: "Rung-6/7 eval sim
@@ -82,73 +57,6 @@ _BLOCK_KEY_PREFIX = "blocks."
 EVAL_SIMS = 512
 
 
-def _trunk_shape_from_state_dict(state_dict: dict) -> tuple[int, int]:
-    """Read ``(trunk_blocks, trunk_channels)`` off a saved ``model_state_dict``.
-
-    The stem conv's output channel count is the trunk width directly
-    (``core.network.Network.__init__``'s ``stem`` is
-    ``Conv2d(input_planes, trunk_channels, ...)``); the trunk depth is the
-    count of distinct residual-block indices present in the flat state-dict
-    keys (``blocks.<i>.conv1.weight`` etc., one index per
-    ``core.network.ResidualBlock``).
-
-    Args:
-        state_dict: A ``Network.state_dict()``-shaped mapping (bundle
-            ``model_state_dict``).
-
-    Returns:
-        ``(trunk_blocks, trunk_channels)``.
-    """
-    trunk_channels = int(state_dict[_STEM_CONV_WEIGHT].shape[0])
-    block_indices = {key.split(".")[1] for key in state_dict if key.startswith(_BLOCK_KEY_PREFIX)}
-    trunk_blocks = len(block_indices)
-    return trunk_blocks, trunk_channels
-
-
-def _num_aux_from_state_dict(state_dict: dict) -> int:
-    """Read the declared aux-head width off a saved ``model_state_dict``.
-
-    Args:
-        state_dict: A ``Network.state_dict()``-shaped mapping.
-
-    Returns:
-        ``aux_fc.weight``'s output width if the key is present (an aux head
-        was built), else ``0`` (``core.network.Network`` builds no aux
-        parameters at all when ``num_aux == 0`` — the pinned "absent"
-        convention, mirrored here).
-    """
-    if _AUX_FC_WEIGHT not in state_dict:
-        return 0
-    return int(state_dict[_AUX_FC_WEIGHT].shape[0])
-
-
-def _network_config_from_bundle(bundle: CheckpointBundle, game: Game) -> NetworkConfig:
-    """Reconstruct the exact trained :class:`~core.network.NetworkConfig`.
-
-    See the module docstring for why this reads the trunk shape off the
-    persisted weights rather than calling ``NetworkConfig.from_game(game)``.
-
-    Args:
-        bundle: A fingerprint-validated bundle
-            (:func:`~core.checkpoint.load_checkpoint`'s return).
-        game: The adapter the bundle was validated against — its declared
-            ``input_planes``/``input_shape``/``policy_shape`` are already
-            pinned equal to the checkpoint's by that validation.
-
-    Returns:
-        The config that reproduces the checkpoint's exact tensor shapes.
-    """
-    trunk_blocks, trunk_channels = _trunk_shape_from_state_dict(bundle.model_state_dict)
-    return NetworkConfig(
-        input_planes=game.input_planes,
-        input_shape=tuple(game.input_shape),
-        policy_shape=tuple(game.policy_shape),
-        trunk_blocks=trunk_blocks,
-        trunk_channels=trunk_channels,
-        num_aux=_num_aux_from_state_dict(bundle.model_state_dict),
-    )
-
-
 def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tuple[Evaluator, int]:
     """Load a published checkpoint into a ready-to-search MCTS evaluator.
 
@@ -158,10 +66,9 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
        compares the full artifact fingerprint (orientation hash included)
        against ``game``'s live one and fails loudly on any disagreement.
        This function never re-does that validation.
-    2. Rebuild the network architecture from the bundle's persisted weights
-       (:func:`_network_config_from_bundle`) — never ``NetworkConfig.from_game``
-       defaults: the checkpoint is the authority on the architecture it
-       trained.
+    2. Rebuild the network architecture from the bundle's recorded config,
+       never ``NetworkConfig.from_game`` defaults: the checkpoint records
+       the architecture it trained.
     3. ``net.load_state_dict(bundle.model_state_dict, strict=True)`` — strict,
        so any key or shape drift between the rebuilt architecture and the
        stored weights raises immediately instead of silently dropping or
@@ -177,7 +84,7 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
 
     Args:
         path: The checkpoint file to load (a published ``ckpt-<version>.pt``
-            or the rolling ``resume.pt`` — see ``core.checkpoint``).
+            — resume snapshots are rejected, including renamed copies).
         game: The adapter this checkpoint was trained against — validated by
             ``load_checkpoint`` before anything else here runs, and reused as
             the evaluator's factory-validated pairing.
@@ -199,8 +106,18 @@ def load_eval_network(path: Path | str, game: Game, device: str = "cpu") -> tupl
             (``load_state_dict(strict=True)``).
     """
     bundle = load_checkpoint(path, game)  # step 1: fingerprint validated or raised
-    config = _network_config_from_bundle(bundle, game)  # step 2: from the bundle, not from_game
-    net = Network(config)
+    return _eval_network_from_bundle(bundle, game, device)
+
+
+def _eval_network_from_bundle(
+    bundle: CheckpointBundle, game: Game, device: str
+) -> tuple[Evaluator, int]:
+    """Restore an evaluator from a fingerprint-validated bundle."""
+    if bundle.artifact_kind != "published":
+        raise CheckpointFormatError(
+            "evaluation requires a published checkpoint, not a resume snapshot"
+        )
+    net = Network(bundle.network_config)  # architecture is independent of the weights
     net.load_state_dict(bundle.model_state_dict, strict=True)  # step 3: strict restore
     evaluator = make_network_evaluator(net, game, device)  # step 4: device/eval/guard
     return evaluator, bundle.version  # step 5
@@ -275,6 +192,34 @@ def rung5_agent_factory(path: Path | str, game: Game, device: str = "cpu") -> Ag
     return factory
 
 
+class SearchForm(Enum):
+    """The two network-backed evaluation search forms."""
+
+    UNIFORM_VALUE = 6
+    POLICY_VALUE = 7
+
+    @property
+    def uniform_prior(self) -> bool:
+        return self is SearchForm.UNIFORM_VALUE
+
+    def identity(self, model_version: int, sims: int) -> str:
+        budget = "" if sims == EVAL_SIMS else f"-s{sims}"
+        return f"rung{self.value}-v1{budget}-{model_version}"
+
+    @classmethod
+    def parse(cls, form: SearchForm | int) -> SearchForm:
+        if isinstance(form, cls):
+            return form
+        if type(form) is not int or form not in (6, 7):
+            raise ValueError(f"form must be SearchForm or integer 6 or 7, got {form!r}")
+        return cls(form)
+
+
+def _validate_search_budget(sims: int) -> None:
+    if type(sims) is not int or sims < 2:
+        raise ValueError(f"sims must be an integer >= 2, got {sims!r}")
+
+
 class SearchAgent(Agent):
     """Ladder rungs 6 and 7: fresh deterministic MCTS search, argmax-N (§9).
 
@@ -296,8 +241,8 @@ class SearchAgent(Agent):
        iff this is a rung-6 agent; ``root_noise`` is always ``None`` — the D7
        hook's default leaves search bit-identical to the noiseless engine,
        so self-play-only exploration noise can never leak into eval.
-    2. ``mcts.run(self._sims, root_state=state)`` — exactly the pinned
-       budget executes, no more, no fewer.
+    2. ``mcts.run(self._sims, root_state=state)`` — exactly the budget
+       encoded in the identity executes, no more, no fewer.
     3. Return ``mcts.best_action()`` — argmax N, ties to the lowest action
        id, **no RNG** — never ``MCTS.select_action``'s temperature/rng
        sampling path, whose ``rng`` parameter this class never supplies.
@@ -317,7 +262,9 @@ class SearchAgent(Agent):
     concern, outside this form definition.
 
     **Identity is form-versioned (review S3):** ``name`` is
-    ``f"rung6-v1-{model_version}"`` or ``f"rung7-v1-{model_version}"``. The
+    ``f"rung6-v1-{model_version}"`` or ``f"rung7-v1-{model_version}"``
+    only at S=512. Explicit alternate budgets use ``-s<S>`` before the
+    model version and are separate experimental identities. The pinned
     ``v1`` constants — frozen together, never edited independently — are:
     the M0 engine at its D11 defaults (``c_init=1.25``, ``c_base=19652``,
     first-play-urgency ``Q=0``), the pinned sim budget :data:`EVAL_SIMS`,
@@ -336,12 +283,13 @@ class SearchAgent(Agent):
         form: ``6`` for uniform-prior MCTS with network value, ``7`` for
             full policy-and-value MCTS.
         sims: Simulations per move (default :data:`EVAL_SIMS`, the pinned
-            ``v1`` budget). Overridable for tests only — a real evaluation
-            run must use the default so every checkpoint is scored at the
-            same frozen budget.
+            ``v1`` budget). Other budgets receive a distinct ``-s<S>``
+            identity suffix, e.g. ``rung7-v1-s64-3``, and cannot alias the
+            pinned evaluation form. At least two simulations are required:
+            the first expands the root, the second visits a root edge.
 
     Raises:
-        ValueError: If ``form`` is not ``6`` or ``7``.
+        ValueError: If the form is invalid or sims is not an integer >= 2.
     """
 
     def __init__(
@@ -349,15 +297,15 @@ class SearchAgent(Agent):
         evaluator: Evaluator,
         model_version: int,
         *,
-        form: int,
+        form: SearchForm | int,
         sims: int = EVAL_SIMS,
     ):
-        if form not in (6, 7):
-            raise ValueError(f"form must be 6 or 7, got {form}")
+        form = SearchForm.parse(form)
+        _validate_search_budget(sims)
         self._evaluator = evaluator
-        self._uniform_prior = form == 6
+        self._uniform_prior = form.uniform_prior
         self._sims = sims
-        self._name = f"rung{form}-v1-{model_version}"
+        self._name = form.identity(model_version, sims)
 
     @property
     def name(self) -> str:
@@ -377,7 +325,7 @@ class SearchAgent(Agent):
 def rung_search_agent_factory(
     path: Path | str,
     game: Game,
-    form: int,
+    form: SearchForm | int,
     device: str = "cpu",
     sims: int = EVAL_SIMS,
 ) -> AgentFactory:
@@ -407,11 +355,11 @@ def rung_search_agent_factory(
         evaluator loaded above.
 
     Raises:
-        ValueError: If ``form`` is not ``6`` or ``7`` — raised by
-            :class:`SearchAgent` the first time the returned factory is
-            called, not by this function itself (the checkpoint load above
-            has no dependency on ``form``).
+        ValueError: If the form is invalid or sims is not an integer >= 2,
+            before loading the checkpoint.
     """
+    form = SearchForm.parse(form)
+    _validate_search_budget(sims)
     evaluator, model_version = load_eval_network(path, game, device)
 
     def factory(seed: int) -> SearchAgent:
@@ -445,35 +393,9 @@ def historical_opponents(
 ) -> list[int]:
     """Select rung-8 historical-opponent versions for one candidate checkpoint.
 
-    Implements the pinned rule (``tasks/m4/001``, pin 5): the opponents of
-    candidate ``v`` are ``{v - 1, v - ceil(K/4), 1}``, intersected with
-    ``[1, v - 1]`` and with the versions actually available, deduplicated,
-    ascending.
-
-    **Why ``k_total`` is a required, explicit keyword -- never inferred from**
-    **``versions``:** the live member list a real run scores against is a
-    *growing prefix* (more checkpoints exist by the time a later candidate is
-    evaluated than existed for an earlier one). Deriving the ``ceil(K/4)``
-    lag from ``len(versions)`` or ``max(versions)`` would make the very same
-    candidate's opponent set depend on *when* this function happened to be
-    called during the run -- silently breaking "a candidate's opponent set is
-    a pure function of the candidate" for every downstream record-store/Elo
-    consumer. ``k_total`` must therefore always be the run's fixed total
-    checkpoint count (``tasks/m3/001``'s pinned ``K``), supplied by the
-    caller every time, never recomputed from this call's ``versions``.
-
-    This function's domain is strictly the run's member versions ``1..K``
-    (``tasks/m3/001``'s boundary pins): version ``0`` -- the published,
-    recorded seed init -- is never a member and never an eligible opponent,
-    and neither are the rolling ``resume.pt`` snapshot or the ``latest``
-    pointer (those never produce an integer version at all --
-    ``core.checkpoint.list_published_versions``'s ``ckpt-<digits>.pt``-only
-    glob already excludes them, but *does* include a published ``ckpt-0.pt``
-    since that module intentionally records v0 as an artifact). Task 9 owns
-    computing the actual member list from the run directory/config; this
-    function only *enforces* that domain on whatever list it is handed --
-    belt-and-suspenders against a caller passing raw
-    ``list_published_versions`` output straight through.
+    Return ``{v - 1, v - ceil(K/4), 1}``, intersected with available versions
+    in ``[1, v - 1]``, deduplicated and ascending. The keyword-only ``k_total``
+    fixes the lag across a growing prefix of published checkpoints.
 
     Args:
         versions: The run's member versions actually available, in any
@@ -493,20 +415,19 @@ def historical_opponents(
         ``[1, candidate - 1]`` or outside ``versions``.
 
     Raises:
-        ValueError: If ``k_total < 1``; if any element of ``versions`` is
-            ``< 1`` (a v0 or otherwise non-member id entered the domain); or
-            if ``candidate`` is not itself a member of ``versions``.
+        ValueError: If ``K < 1``, any id lies outside ``1..K``, or the
+            candidate is absent from ``versions``.
     """
     if k_total < 1:
         raise ValueError(f"k_total must be >= 1, got {k_total}")
-    invalid = sorted({v for v in versions if v < 1})
+    invalid = sorted({v for v in versions if not 1 <= v <= k_total})
     if invalid:
         raise ValueError(
-            f"versions must contain member checkpoint ids 1..K only -- got non-member "
-            f"id(s) {invalid} (version 0, and any snapshot/latest artifact, must never "
-            "enter this function's domain; task 9's member-list computation is "
-            "responsible for excluding them before calling this function)"
+            f"versions must contain member checkpoint ids 1..{k_total} only; "
+            f"got non-member id(s) {invalid}"
         )
+    if not 1 <= candidate <= k_total:
+        raise ValueError(f"candidate {candidate} must be a member checkpoint id in 1..{k_total}")
     if candidate not in versions:
         raise ValueError(
             f"candidate {candidate} is not a member of the supplied versions {sorted(versions)}"
@@ -519,62 +440,24 @@ def historical_opponents(
     return sorted(u for u in wanted if 1 <= u < candidate and u in available)
 
 
-def assert_historical_checkpoint_matches_live_game(path: Path | str, game: Game) -> None:
-    """Pre-load fingerprint assert for a rung-8 historical opponent (§12 M4).
-
-    §12 M4 spells out an explicit guard: "before loading historical
-    checkpoints (rung 8): assert the orientation-table hash matches (the M3
-    read-side path)." :func:`core.checkpoint.load_checkpoint` already
-    recomputes and compares the *full* artifact fingerprint -- orientation
-    hash included -- the instant any checkpoint is loaded, historical or
-    candidate alike, and raises before returning anything
-    (:class:`~core.checkpoint.FingerprintMismatchError`). Calling this
-    function before instantiating a historical opponent is deliberate
-    belt-and-suspenders over that loader guard, not a substitute for it: the
-    doc singles out the historical path specifically because a stale
-    historical checkpoint is uniquely dangerous relative to the candidate
-    one -- it sits untouched on disk across arbitrarily many later
-    checkpoints and possible orientation-table regenerations, reachable at
-    any later point in the run, whereas the candidate's own checkpoint is
-    loaded and validated the moment it is produced. Naming this as its own
-    step at the scheduling layer means an old checkpoint written under a
-    different orientation table is impossible to seat as an opponent, with
-    an error that says why *before* any game is played against it.
-
-    This reuses ``load_checkpoint`` verbatim as the "build-and-compare"
-    helper (it builds ``game``'s live fingerprint via
-    ``core.artifact_fingerprint.build_fingerprint`` and compares it against
-    the checkpoint's stored one via ``compare_fingerprints`` -- never a
-    second, separate comparison implemented here) and re-raises only to
-    attach the one piece of context ``compare_fingerprints`` cannot know on
-    its own: which checkpoint file was being validated. The re-raised
-    message therefore always names both the checkpoint ``path`` and the
-    original field-level stored-vs-live detail -- the disagreeing
-    orientation hash's stored and live values included, whenever
-    ``orientation_hash`` is (as expected for this failure mode) among the
-    mismatched fields.
-
-    Args:
-        path: The historical checkpoint file (``ckpt-<old_version>.pt``) to
-            validate before it is seated as an opponent.
-        game: The live game/adapter this evaluation run is scored against.
-
-    Raises:
-        FileNotFoundError: If ``path`` does not exist.
-        core.checkpoint.CheckpointFormatError: If the payload is malformed or
-            carries an unsupported schema version.
-        core.checkpoint.FingerprintMismatchError: If the stored fingerprint
-            disagrees with ``game``'s live one on any field. The message
-            names ``path`` plus every mismatched field's stored and live
-            values.
-    """
+def _load_historical_checkpoint(path: Path | str, game: Game) -> CheckpointBundle:
+    """Validate once and prefix fingerprint mismatches with the checkpoint path."""
     try:
-        load_checkpoint(path, game)
+        return load_checkpoint(path, game)
     except FingerprintMismatchError as exc:
         raise FingerprintMismatchError(
             f"rung-8 pre-load fingerprint assert failed for historical checkpoint "
             f"{path} -- refusing to seat it as an opponent: {exc}"
         ) from exc
+
+
+def assert_historical_checkpoint_matches_live_game(path: Path | str, game: Game) -> None:
+    """Validate a historical checkpoint before constructing its network.
+
+    Prefixes ``load_checkpoint``'s fingerprint mismatch with ``path``;
+    file and checkpoint-format errors propagate unchanged.
+    """
+    _load_historical_checkpoint(path, game)
 
 
 def historical_opponent_factory(
@@ -584,37 +467,33 @@ def historical_opponent_factory(
     device: str = "cpu",
     sims: int = EVAL_SIMS,
 ) -> AgentFactory:
-    """Build the rung-8 ``AgentFactory`` for one historical opponent version.
+    """Load one historical member as a rung-7 search-agent factory.
 
-    Composes the two pieces above in the order §12 M4 requires: the pre-load
-    fingerprint assert (:func:`assert_historical_checkpoint_matches_live_game`)
-    runs first and raises before anything is instantiated; only then is the
-    checkpoint handed to :func:`rung_search_agent_factory` in its rung-7 form
-    -- the exact same factory :func:`historical_opponents`' callers use for a
-    checkpoint's *own* rung-7 evaluation, so a version appearing as both a
-    candidate and a later opponent shares one identity string by construction
-    (``f"rung7-v1-{old_version}"``), not by convention.
-
-    Args:
-        ckpt_dir: The run's checkpoint directory (``core.checkpoint``'s
-            ``ckpt-<version>.pt`` namespace).
-        game: The live game/adapter to validate and evaluate against.
-        old_version: The historical checkpoint's version ``u`` (one element
-            of :func:`historical_opponents`' return value).
-        device: Torch device for inference.
-        sims: Simulations per move (default :data:`EVAL_SIMS`, the pinned
-            rung-7 ``v1`` budget).
-
-    Returns:
-        A ``seed -> SearchAgent`` factory (rung-7 form) for
-        ``ckpt-<old_version>.pt``, matching ``core.runner.AgentFactory``'s
-        shape exactly like :func:`rung_search_agent_factory`'s.
+    The checkpoint is validated before network construction. Its payload
+    version must equal ``old_version``. The default budget preserves identity
+    ``rung7-v1-<u>``; custom budgets use the same suffix as candidate agents.
 
     Raises:
-        core.checkpoint.FingerprintMismatchError: If the pre-load assert
-            fails (see :func:`assert_historical_checkpoint_matches_live_game`).
+        ValueError: If ``old_version < 1``, the payload version differs, or
+            ``sims`` is not an integer >= 2.
+        FingerprintMismatchError: If the fingerprint differs from ``game``;
+            the message includes the checkpoint path and mismatched fields.
         FileNotFoundError: If ``ckpt-<old_version>.pt`` does not exist.
     """
+    if old_version < 1:
+        raise ValueError(f"old_version must be >= 1, got {old_version}")
+    _validate_search_budget(sims)
     path = published_checkpoint_path(ckpt_dir, old_version)
-    assert_historical_checkpoint_matches_live_game(path, game)
-    return rung_search_agent_factory(path, game, form=7, device=device, sims=sims)
+    bundle = _load_historical_checkpoint(path, game)
+    if bundle.version != old_version:
+        raise ValueError(
+            f"historical checkpoint {path} has payload version {bundle.version}, "
+            f"expected {old_version}"
+        )
+    evaluator, model_version = _eval_network_from_bundle(bundle, game, device)
+
+    def factory(seed: int) -> SearchAgent:
+        del seed
+        return SearchAgent(evaluator, model_version, form=7, sims=sims)
+
+    return factory

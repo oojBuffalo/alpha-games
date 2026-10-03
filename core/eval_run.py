@@ -85,6 +85,8 @@ from core.checkpoint import list_published_versions, published_checkpoint_path
 from core.eval_agents import (
     NetworkPolicyAgent,
     SearchAgent,
+    SearchForm,
+    _validate_search_budget,
     historical_opponent_factory,
     historical_opponents,
     load_eval_network,
@@ -282,6 +284,8 @@ class EvalConfig:
                 f"the only defined agent forms are {list(VALID_FORMS)}"
             )
         object.__setattr__(self, "forms", tuple(sorted(self.forms)))
+        if any(form in (6, 7) for form in self.forms):
+            _validate_search_budget(self.eval_sims)
 
         _validate_admissible_B(self.bootstrap_b)
 
@@ -703,8 +707,8 @@ def schedulable_versions(run_dir: Path | str, k_total: int) -> tuple[int, ...]:
 RUNG8_CANDIDATE_FORM = 7
 
 
-def agent_identity(rung: int, version: int) -> str:
-    """Return the ``f"rung{rung}-v1-{version}"`` agent identity string.
+def agent_identity(rung: int, version: int, *, eval_sims: int = EVAL_SIMS) -> str:
+    """Return a form identity, including non-production search budgets.
 
     Mirrors ``core.eval_agents``' ``NetworkPolicyAgent``/``SearchAgent``
     naming and ``core.eval_store.CellId.candidate_identity`` exactly -- a
@@ -714,10 +718,14 @@ def agent_identity(rung: int, version: int) -> str:
     Args:
         rung: The agent's form/rung number (5, 6, or 7 in v1).
         version: The checkpoint's model-version ordinal.
+        eval_sims: Search budget for forms 6/7; only 512 uses bare v1 names.
 
     Returns:
         The identity string.
     """
+    if rung in (6, 7):
+        _validate_search_budget(eval_sims)
+        return SearchForm.parse(rung).identity(version, eval_sims)
     return f"rung{rung}-v1-{version}"
 
 
@@ -730,6 +738,7 @@ def required_cell_ids(
     *,
     lag_divisor: int = RUNG8_LAG_DIVISOR,
     earliest: int = RUNG8_EARLIEST_VERSION,
+    eval_sims: int = EVAL_SIMS,
 ) -> list[str]:
     """Return one member's full required cell-id set (design doc §9's cell semantics).
 
@@ -748,6 +757,9 @@ def required_cell_ids(
             itself (``core.eval_agents.historical_opponents``' own domain
             check).
         k_total: The run's fixed, total checkpoint count *K*.
+        eval_sims: Search budget stamped in both candidate and historical identities.
+        lag_divisor: Historical lag divisor from the resolved config.
+        earliest: Always-included historical member from the resolved config.
         forms: The checkpoint-parameterized agent forms to schedule (a
             non-empty subset of ``{5, 6, 7}`` in v1 -- typically
             ``EvalConfig.forms``).
@@ -769,7 +781,12 @@ def required_cell_ids(
 
     opponent_identities = [profile.rung_identity(rung) for rung in profile.rungs()]
     cells = {
-        build_cell_id(member_version, form, opponent)
+        build_cell_id(
+            member_version,
+            form,
+            opponent,
+            candidate_identity=agent_identity(form, member_version, eval_sims=eval_sims),
+        )
         for form in forms_sorted
         for opponent in opponent_identities
     }
@@ -785,7 +802,10 @@ def required_cell_ids(
                 build_cell_id(
                     member_version,
                     RUNG8_CANDIDATE_FORM,
-                    agent_identity(RUNG8_CANDIDATE_FORM, u),
+                    agent_identity(RUNG8_CANDIDATE_FORM, u, eval_sims=eval_sims),
+                    candidate_identity=agent_identity(
+                        RUNG8_CANDIDATE_FORM, member_version, eval_sims=eval_sims
+                    ),
                 )
             )
     return sorted(cells)
@@ -942,7 +962,7 @@ class _CandidateCache:
         return self._historical[version]
 
 
-_HISTORICAL_OPPONENT_PATTERN = re.compile(r"^rung7-v1-(\d+)$")
+_HISTORICAL_OPPONENT_PATTERN = re.compile(r"^rung7-v1-(?:s(\d+)-)?(\d+)$")
 
 
 def _historical_opponent_version(opponent_id: str) -> int | None:
@@ -958,7 +978,7 @@ def _historical_opponent_version(opponent_id: str) -> int | None:
         e.g. ``"random"``).
     """
     match = _HISTORICAL_OPPONENT_PATTERN.match(opponent_id)
-    return int(match.group(1)) if match else None
+    return int(match.group(2)) if match else None
 
 
 def _resolve_opponent_factory(
@@ -988,7 +1008,12 @@ def _resolve_opponent_factory(
         return rung_identities[opponent_id]
     historical_version = _historical_opponent_version(opponent_id)
     if historical_version is not None:
-        return cache.historical_factory(historical_version)
+        factory = cache.historical_factory(historical_version)
+        if factory(0).name != opponent_id:
+            raise ValueError(
+                f"historical opponent identity {opponent_id!r} disagrees with configured budget"
+            )
+        return factory
     raise ValueError(
         f"opponent id {opponent_id!r} is neither one of the profile's declared "
         f"network-free rung identities {sorted(rung_identities)} nor a rung-8 "
@@ -1029,13 +1054,18 @@ def _play_pending_cell(
         :func:`core.eval_store.complete_cell` on a prior attempt).
     """
     cell_id = parsed.to_string()
+    if candidate_factory(0).name != parsed.candidate_identity:
+        raise ValueError("candidate identity disagrees with configured factory")
+    if opponent_factory(0).name != parsed.opponent_id:
+        raise ValueError("opponent identity disagrees with configured factory")
     header = build_header(
         run_id=run_id,
         cell_id=parsed,
-        candidate_identity=agent_identity(parsed.rung, parsed.candidate_version),
+        candidate_identity=parsed.candidate_identity,
         opponent_identity=parsed.opponent_id,
         eval_config=config.as_eval_config_snapshot(),
         candidate_fingerprint=candidate_fingerprint,
+        cell_seed=cell_seed(config.eval_seed, cell_id),
     )
     start_index = open_cell_for_write(run_dir, header)
     remaining = config.pairs_per_cell - start_index
@@ -1436,6 +1466,7 @@ def run_watch_loop(
                     config.forms,
                     lag_divisor=config.rung8_lag_divisor,
                     earliest=config.rung8_earliest_version,
+                    eval_sims=config.eval_sims,
                 )
                 register_member(run_dir, version, required)
                 pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
@@ -1693,6 +1724,7 @@ def bench_candidate(
         config.forms,
         lag_divisor=config.rung8_lag_divisor,
         earliest=config.rung8_earliest_version,
+        eval_sims=config.eval_sims,
     )
 
     rung_identities = {

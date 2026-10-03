@@ -8,8 +8,9 @@ pin-6 fit (bracket expansion + bisection with one virtual draw per matchup) and
 checks two independent routes against each other: the closed-form
 Fisher-information standard error, and a seeded Monte-Carlo through that fit
 step. Both rate one candidate's rung-7 form against fixed-rating opponents under
-three representative scenarios (an early, a mid-run, and a late member
-checkpoint) and three pairs-per-cell values (12, 24, 48). The script also
+three illustrative subset scenarios (early, mid-run, and late candidate
+ratings; these are not the full evidence of actual member checkpoints) and three
+pairs-per-cell values (12, 24, 48). The script also
 reproduces the §9 budget arithmetic: the 21,600-game bound and the exact rung-8
 schedule's 21,024 games.
 
@@ -18,7 +19,9 @@ Bernoulli draws (no draws, no within-pair correlation); opponents sit at their
 true ratings (the large-sample limit for rungs 1–4, which every form of every
 member rates); and the §1 Δ standard error treats the ⌈K/3⌉ checkpoints of each
 contrast group as independent. The paired bootstrap of §1 is the authoritative
-CI; these idealized numbers are neither upper nor lower bounds on its width.
+CI. These idealizations can move uncertainty in either direction; this script
+does not reproduce the full joint-fit CI or establish a bound on it. The rung
+and candidate ratings below are assumptions, not measured ladder strength.
 
 Run it twice: the output is deterministic and must be byte-identical.
 
@@ -62,8 +65,8 @@ ELO_PER_NAT = 400.0 / math.log(10.0)
 #: Representative true ratings of frozen rungs 1–4 (rung 1 is the Elo-0 anchor).
 RUNG_ELOS = (0.0, 120.0, 250.0, 380.0)
 
-#: (name, candidate's true Elo, opponent true Elos) — the rung-7 form's own cells:
-#: the four rungs, plus the rung-8 opponents {v−1, v−8, member 1} where they exist.
+#: (name, assumed candidate Elo, assumed opponent Elos): illustrative subsets
+#: of evidence, omitting incoming rung-8 cells and all joint-fit dependencies.
 SCENARIOS: tuple[tuple[str, float, tuple[float, ...]], ...] = (
     ("early", 100.0, RUNG_ELOS),
     ("mid", 400.0, RUNG_ELOS + (370.0, 250.0, 100.0)),
@@ -72,6 +75,7 @@ SCENARIOS: tuple[tuple[str, float, tuple[float, ...]], ...] = (
 )
 
 IDEALIZATIONS = (
+    "rung/candidate ratings and subset opponent lists are assumed, not measured",
     "games are independent Bernoulli draws (no draws, no within-pair correlation)",
     "opponents sit at their true ratings (large-sample limit for rungs 1-4)",
     "delta SE treats the ceil(K/3) checkpoints of each contrast group as independent",
@@ -184,7 +188,9 @@ def monte_carlo(
     fits.sort()
     mean = sum(fits) / reps
     sd = math.sqrt(sum((f - mean) ** 2 for f in fits) / reps)
-    lo, hi = fits[int(0.025 * reps)], fits[int(0.975 * reps)]
+    # Diagnostic MC quantiles use nearest-rank empirical percentiles. This is
+    # a sampling-distribution summary, not pin 7's admissible-B bootstrap CI.
+    lo, hi = fits[math.ceil(0.025 * reps) - 1], fits[math.ceil(0.975 * reps) - 1]
     return {"sd": sd, "mean": mean, "p2_5": lo, "p97_5": hi, "half_width_95": (hi - lo) / 2}
 
 
@@ -203,6 +209,16 @@ def rung8_opponents(v: int, k: int = K) -> tuple[int, ...]:
     """
     lag = -(-k // RUNG8_LAG_DIVISOR)
     return tuple(sorted({u for u in (v - 1, v - lag, RUNG8_EARLIEST) if 1 <= u <= v - 1}))
+
+
+def incident_rung8_counts(k: int = K) -> dict[int, int]:
+    """Count every member's rung-8 cells, as challenger or opponent."""
+    counts = dict.fromkeys(range(1, k + 1), 0)
+    for v in counts:
+        for u in rung8_opponents(v, k):
+            counts[v] += 1
+            counts[u] += 1
+    return counts
 
 
 def budget(pairs: int = PINNED_PAIRS, k: int = K) -> dict[str, int]:
@@ -299,6 +315,7 @@ def compute(reps: int = REPS, seed: int = SEED) -> dict:
                 "analytic_se": analytic_se(true_elo, opponents, 2 * pairs),
                 "mc_sd": mc["sd"],
                 "mc_mean": mc["mean"],
+                "mc_bias": mc["mean"] - true_elo,
                 "mc_p2_5": mc["p2_5"],
                 "mc_p97_5": mc["p97_5"],
                 "mc_half_width_95": mc["half_width_95"],
@@ -324,8 +341,10 @@ def compute(reps: int = REPS, seed: int = SEED) -> dict:
         "reps": reps,
         "seed": seed,
         "budget": budget(),
+        "incident_rung8_counts": incident_rung8_counts(),
+        "mc_quantile_rule": "nearest-rank empirical percentiles (not protocol bootstrap CI)",
         "scenarios": {
-            name: {"true_elo": true_elo, "opponents": list(opps), "pairs_form7": len(opps)}
+            name: {"true_elo": true_elo, "opponents": list(opps), "subset_cells": len(opps)}
             for name, true_elo, opps in SCENARIOS
         },
         "grid": grid,
@@ -336,7 +355,9 @@ def _report(data: dict) -> str:
     """Render ``compute()``'s output as the human-readable report."""
     b = data["budget"]
     lines = [
-        "verify_pairs_per_cell — §9 pin 1 precision basis (idealized; the bootstrap CI rules)",
+        "verify_pairs_per_cell — §9 pin 1 illustrative subset precision (not joint-fit CI)",
+        "MC percentiles: nearest-rank diagnostic summaries, not pin 7 bootstrap intervals",
+        f"form-7 incident rung-8 cells by member: {data['incident_rung8_counts']}",
         f"K = {data['k']}, contrast group = ceil(K/3) = {data['group']}, reps = {data['reps']}",
         (
             f"budget @ {data['pinned_pairs']} pairs: {b['rung_cells']} rung cells + "
@@ -349,10 +370,11 @@ def _report(data: dict) -> str:
         for name, s in entry["scenarios"].items():
             sc = data["scenarios"][name]
             lines.append(
-                f"{name:5s} true={sc['true_elo']:5.0f} cells={sc['pairs_form7']}  "
+                f"{name:5s} true={sc['true_elo']:5.0f} cells={sc['subset_cells']}  "
                 f"analytic SE={s['analytic_se']:5.1f}  MC SD={s['mc_sd']:5.1f}  "
                 f"window 95% width={s['window_contrast_width_95']:.1f}  "
-                f"MC mean={s['mc_mean']:6.1f}  95% band=[{s['mc_p2_5']:6.1f}, "
+                f"MC mean={s['mc_mean']:6.1f} bias={s['mc_bias']:+6.1f}  "
+                f"95% band=[{s['mc_p2_5']:6.1f}, "
                 f"{s['mc_p97_5']:6.1f}]  half-width={s['mc_half_width_95']:5.1f}"
             )
         lines.append(

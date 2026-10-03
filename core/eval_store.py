@@ -17,8 +17,13 @@ durable artifacts under ``<run_dir>/eval/``:
     snapshot never races a live writer, and a partial cell is structurally invisible
     to it.
 
+**Schema v2.** Full candidate-form IDs and the required ``cell_seed`` stamp replace
+the legacy schema-v1 cell layout. Older records fail with ``SchemaVersionError``
+before parsing their fields; they must be regenerated in a fresh eval store.
+
 **Cell identity (bijective, filesystem-safe).** A cell is the triple
-``(candidate_version, rung, opponent_id)`` -- the candidate's checkpoint version and
+``(candidate_identity, opponent_identity)`` -- both full form-versioned identities.
+The candidate includes its checkpoint version and
 agent-form rung (5, 6, or 7) crossed with one opponent identity string (a frozen
 network-free rung, or a rung-8 historical ``rung7-v1-<u>``). :func:`build_cell_id` /
 :func:`parse_cell_id` canonicalize this into (and back out of) one filename-safe
@@ -38,12 +43,14 @@ raising the specific, differently-typed error so a caller can tell which one mov
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,6 +63,7 @@ from core.eval_protocol import (
     protocol_fingerprint,
 )
 from core.runner import PairResult
+from core.seeding import derive_seed
 
 _EVAL_DIRNAME = "eval"
 _CELLS_DIRNAME = "cells"
@@ -129,11 +137,25 @@ class CellId:
         opponent_id: The opponent agent's identity string -- one of the game's
             frozen network-free rungs (e.g. ``"random"``) or a historical rung-7
             form (``"rung7-v1-<u>"``, rung 8). Opaque to this module.
+        form_version: Candidate algorithm/form revision, default 1.
+        full_candidate_identity: Explicit identity, including search budget when
+            applicable. Pass the actual built agent identity when scheduling.
     """
 
     candidate_version: int
     rung: int
     opponent_id: str
+    form_version: int = 1
+    full_candidate_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.full_candidate_identity is not None:
+            version, rung, form = _candidate_parts(self.full_candidate_identity)
+            if (version, rung) != (self.candidate_version, self.rung):
+                raise ValueError("candidate identity disagrees with version/rung")
+            object.__setattr__(self, "form_version", form)
+            if self.full_candidate_identity == f"rung{rung}-v{form}-{version}":
+                object.__setattr__(self, "full_candidate_identity", None)
 
     @property
     def candidate_identity(self) -> str:
@@ -144,72 +166,56 @@ class CellId:
         for it (a real caller always has the actual string on hand and should pass
         it explicitly to :func:`build_header` rather than relying on this).
         """
-        return f"rung{self.rung}-v1-{self.candidate_version}"
+        return (
+            self.full_candidate_identity
+            or f"rung{self.rung}-v{self.form_version}-{self.candidate_version}"
+        )
 
     def to_string(self) -> str:
         """Return this cell's canonical id string (see :func:`build_cell_id`)."""
-        return build_cell_id(self.candidate_version, self.rung, self.opponent_id)
+        return build_cell_id(
+            self.candidate_version,
+            self.rung,
+            self.opponent_id,
+            candidate_identity=self.candidate_identity,
+        )
 
 
-def build_cell_id(candidate_version: int, rung: int, opponent_id: str) -> str:
-    """Canonically encode a cell triple as one filename-safe, bijective string.
+def build_cell_id(
+    candidate_version: int, rung: int, opponent_id: str, *, candidate_identity: str | None = None
+) -> str:
+    """Encode both full agent identities into a canonical filename-safe cell ID."""
+    identity = candidate_identity or f"rung{rung}-v1-{candidate_version}"
+    _candidate_parts(identity, candidate_version, rung)
+    return f"{quote(identity, safe='')}|{quote(opponent_id, safe='')}"
 
-    Format: ``"<candidate_version>.<rung>.<percent-encoded opponent_id>"``.
-    ``candidate_version``/``rung`` are formatted via plain ``str(int)`` (a bijection
-    on the integer domain, and never containing ``"."``); ``opponent_id`` is
-    percent-encoded with every unsafe-for-a-filename character escaped
-    (``urllib.parse.quote(opponent_id, safe="")``), most importantly ``"/"`` (so an
-    opponent id can never smuggle a path separator into the cell filename).
 
-    This does *not* escape ``"."``: ``quote`` never percent-encodes it, under any
-    ``safe=`` setting, because ``.`` sits in its permanently-unreserved character
-    set (verify: ``quote("a.b/c", safe="") == "a.b%2Fc"`` -- the dot survives, only
-    ``/`` is escaped). Bijectivity does not depend on it being escaped:
-    :func:`parse_cell_id` splits on ``"."`` with ``maxsplit=2``, so the first two
-    fields consume exactly the integer prefix and everything after the second dot
-    -- however many further literal dots ``opponent_id`` contains -- always
-    reassembles into one opponent field untouched. See :func:`parse_cell_id` for
-    the inverse.
+def _candidate_parts(
+    identity: str, version: int | None = None, rung: int | None = None
+) -> tuple[int, int, int]:
+    import re
 
-    Args:
-        candidate_version: The candidate checkpoint's version ordinal.
-        rung: The candidate's agent-form rung number.
-        opponent_id: The opponent's identity string; any string round-trips.
-
-    Returns:
-        The canonical cell id string (used verbatim as ``<cell_id>.jsonl``'s stem).
-    """
-    return f"{candidate_version}.{rung}.{quote(opponent_id, safe='')}"
+    match = re.fullmatch(r"rung(-?\d+)-v(\d+)(?:-s\d+)?-(-?\d+)", identity)
+    if match is None:
+        raise ValueError(f"malformed candidate identity {identity!r}")
+    parsed_rung, form, parsed_version = map(int, match.groups())
+    if version is not None and (version, rung) != (parsed_version, parsed_rung):
+        raise ValueError("candidate identity disagrees with version/rung")
+    return parsed_version, parsed_rung, form
 
 
 def parse_cell_id(cell_id: str) -> CellId:
-    """Invert :func:`build_cell_id`.
-
-    Args:
-        cell_id: A string previously returned by :func:`build_cell_id`.
-
-    Returns:
-        The original :class:`CellId` triple.
-
-    Raises:
-        ValueError: If ``cell_id`` does not have the ``"<int>.<int>.<encoded>"``
-            shape (fewer than 3 dot-separated fields, or a non-integer first/second
-            field).
-    """
-    parts = cell_id.split(".", 2)
-    if len(parts) != 3:
-        raise ValueError(
-            f"malformed cell id {cell_id!r}: expected 3 dot-separated fields, got {len(parts)}"
-        )
-    version_s, rung_s, opponent_enc = parts
-    try:
-        candidate_version = int(version_s)
-        rung = int(rung_s)
-    except ValueError as exc:
-        raise ValueError(
-            f"malformed cell id {cell_id!r}: non-integer candidate_version/rung field"
-        ) from exc
-    return CellId(candidate_version=candidate_version, rung=rung, opponent_id=unquote(opponent_enc))
+    """Invert the canonical encoding of the full candidate/opponent identities."""
+    parts = cell_id.split("|")
+    if len(parts) != 2:
+        raise ValueError(f"malformed cell id {cell_id!r}")
+    candidate, opponent = map(unquote, parts)
+    version, rung, form = _candidate_parts(candidate)
+    bare = f"rung{rung}-v{form}-{version}"
+    result = CellId(version, rung, opponent, form, candidate if candidate != bare else None)
+    if result.to_string() != cell_id:
+        raise ValueError(f"noncanonical cell id {cell_id!r}")
+    return result
 
 
 def eval_dir(run_dir: Path | str) -> Path:
@@ -309,6 +315,14 @@ class CellHeader:
     opponent_identity: str
     eval_config: Mapping[str, Any]
     candidate_fingerprint: Mapping[str, Any]
+    cell_seed: int
+
+    def __post_init__(self) -> None:
+        _candidate_parts(self.candidate_identity, self.cell_id.candidate_version, self.cell_id.rung)
+        if self.candidate_identity != self.cell_id.candidate_identity:
+            raise ConfigMismatchError("candidate identity disagrees with cell ID")
+        if self.opponent_identity != self.cell_id.opponent_id:
+            raise ConfigMismatchError("opponent identity disagrees with cell ID")
 
     def to_dict(self) -> dict[str, Any]:
         """Return this header as a flat, JSON-serializable dict."""
@@ -324,11 +338,13 @@ class CellHeader:
             "opponent_identity": self.opponent_identity,
             "eval_config": dict(self.eval_config),
             "candidate_fingerprint": dict(self.candidate_fingerprint),
+            "cell_seed": self.cell_seed,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> CellHeader:
         """Reconstruct a header from :meth:`to_dict`'s output (or its JSON round-trip)."""
+        _assert_known_schema_version(payload.get("schema_version"), context="cell header")
         return cls(
             schema_version=int(payload["schema_version"]),
             protocol_version=int(payload["protocol_version"]),
@@ -338,11 +354,18 @@ class CellHeader:
                 candidate_version=int(payload["candidate_version"]),
                 rung=int(payload["rung"]),
                 opponent_id=str(payload["opponent_id"]),
+                form_version=_candidate_parts(str(payload["candidate_identity"]))[2],
+                full_candidate_identity=(
+                    str(payload["candidate_identity"])
+                    if "-s" in str(payload["candidate_identity"])
+                    else None
+                ),
             ),
             candidate_identity=str(payload["candidate_identity"]),
             opponent_identity=str(payload["opponent_identity"]),
             eval_config=dict(payload["eval_config"]),
             candidate_fingerprint=dict(payload["candidate_fingerprint"]),
+            cell_seed=int(payload["cell_seed"]),
         )
 
 
@@ -354,6 +377,7 @@ def build_header(
     opponent_identity: str,
     eval_config: Mapping[str, Any],
     candidate_fingerprint: Mapping[str, Any],
+    cell_seed: int,
 ) -> CellHeader:
     """Build a fresh :class:`CellHeader`, stamping the current protocol registry.
 
@@ -365,6 +389,7 @@ def build_header(
         eval_config: The caller's current pinned-eval-config snapshot (typically
             ``core.eval_protocol.eval_config_snapshot()``).
         candidate_fingerprint: The candidate checkpoint's artifact fingerprint.
+        cell_seed: Seed used by play_pairs; checked against every stored pair seed.
 
     Returns:
         A header with ``schema_version``/``protocol_version``/``protocol_fingerprint``
@@ -380,6 +405,7 @@ def build_header(
         opponent_identity=opponent_identity,
         eval_config=dict(eval_config),
         candidate_fingerprint=dict(candidate_fingerprint),
+        cell_seed=cell_seed,
     )
 
 
@@ -598,28 +624,76 @@ def write_header(path: Path, header: CellHeader) -> None:
         FileExistsError: If ``path`` already exists -- use :func:`open_cell_for_resume`
             (or :func:`open_cell_for_write`) for an existing cell.
     """
-    if path.exists():
-        raise FileExistsError(f"cell file already exists: {path} (use open_cell_for_resume)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(header.to_dict(), sort_keys=True, separators=(",", ":"))
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+    tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with open(tmp, "x", encoding="utf-8") as fh:
+            fh.write(json.dumps(header.to_dict(), sort_keys=True, separators=(",", ":")) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(tmp, path)  # atomic create, never overwrite a concurrent publication
+        _fsync_directory(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def append_pair_record(path: Path, record: PairRecord) -> None:
-    """Append one pair record as a JSON line, durable before returning.
+    """Append the next seeded pair, refusing full or manifest-complete cells."""
+    path = Path(path)
+    with _store_lock(_path_lock(path)):
+        _assert_writable(path)
+        header, records = read_cell(path)
+        _validate_records(header, [*records, record])
+        line = json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
-    Args:
-        path: An existing cell file (its header already written).
-        record: The pair record to append.
-    """
-    line = json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _store_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _path_lock(path: Path) -> Path:
+    root = path.parent.parent if path.parent.name == "cells" else path.parent
+    return root / ".manifest.lock"
+
+
+def _assert_writable(path: Path) -> None:
+    if path.parent.name == "cells" and path.parent.parent.name == "eval":
+        if is_cell_complete(path.parent.parent.parent, path.stem):
+            raise ManifestError(f"cell {path.stem} is complete and immutable")
+
+
+def _validate_records(header: CellHeader, records: Sequence[PairRecord], *, full=False) -> None:
+    count = header.eval_config.get("pairs_per_cell")
+    if type(count) is not int or count <= 0:
+        raise ManifestError("pairs_per_cell must be a positive integer")
+    if len(records) > count or (full and len(records) != count):
+        raise ManifestError(f"cell has {len(records)} records, expected {count}")
+    for index, record in enumerate(records):
+        if record.pair_index != index:
+            raise CorruptedCellError(
+                f"pair indices must be contiguous; got {record.pair_index} at {index}"
+            )
+        if record.pair_seed != derive_seed(header.cell_seed, "pair", index):
+            raise ConfigMismatchError(f"pair {index} seed disagrees with cell seed")
 
 
 def _assert_header_matches(stored: CellHeader, expected: CellHeader, path: Path) -> None:
@@ -655,6 +729,7 @@ def _assert_header_matches(stored: CellHeader, expected: CellHeader, path: Path)
         "opponent_identity",
         "eval_config",
         "candidate_fingerprint",
+        "cell_seed",
     )
     mismatched = [f for f in other_fields if getattr(stored, f) != getattr(expected, f)]
     if mismatched:
@@ -665,7 +740,7 @@ def _assert_header_matches(stored: CellHeader, expected: CellHeader, path: Path)
         )
 
 
-def open_cell_for_resume(path: Path, expected_header: CellHeader) -> int:
+def _open_cell_for_resume(path: Path, expected_header: CellHeader) -> int:
     """Recover and validate an existing cell file, returning its next pair index.
 
     Truncates a crash-torn trailing partial line to whole lines first (so a
@@ -699,17 +774,21 @@ def open_cell_for_resume(path: Path, expected_header: CellHeader) -> int:
     """
     if not path.exists():
         raise FileNotFoundError(f"cell file does not exist: {path}")
+    _assert_writable(path)
     lines = _truncate_torn_tail(path)
     if not lines:
         raise ValueError(f"cell file {path} has no header line")
     stored_header = CellHeader.from_dict(json.loads(lines[0]))
     _assert_known_schema_version(stored_header.schema_version, context=f"cell file {path}")
     _assert_header_matches(stored_header, expected_header, path)
-    pair_indices = [json.loads(line)["pair_index"] for line in lines[1:]]
-    return (max(pair_indices) + 1) if pair_indices else 0
+    records = [PairRecord.from_dict(json.loads(line)) for line in lines[1:]]
+    _validate_records(stored_header, records)
+    if len(records) >= stored_header.eval_config["pairs_per_cell"]:
+        raise ManifestError("cell already contains all pinned pairs")
+    return len(records)
 
 
-def open_cell_for_write(run_dir: Path | str, header: CellHeader) -> int:
+def _open_cell_for_write(run_dir: Path | str, header: CellHeader) -> int:
     """Open ``header.cell_id``'s file for writing, creating or resuming it as needed.
 
     The single entry point a writer should call before appending pair records: a
@@ -743,10 +822,13 @@ def open_cell_for_write(run_dir: Path | str, header: CellHeader) -> int:
             (propagated from :func:`open_cell_for_resume`).
     """
     path = cell_path(run_dir, header.cell_id.to_string())
+    _assert_writable(path)
+    if path.exists() and not _read_valid_lines(path)[0]:
+        path.unlink()  # recover legacy empty/torn unpublished header under the lock
     if not path.exists():
         write_header(path, header)
         return 0
-    return open_cell_for_resume(path, header)
+    return _open_cell_for_resume(path, header)
 
 
 def read_cell(path: Path | str) -> tuple[CellHeader, list[PairRecord]]:
@@ -763,12 +845,15 @@ def read_cell(path: Path | str) -> tuple[CellHeader, list[PairRecord]]:
         SchemaVersionError: If the header's ``schema_version`` is unknown.
     """
     path = Path(path)
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines, consumed = _read_valid_lines(path)
+    if consumed != path.stat().st_size:
+        raise CorruptedCellError(f"cell {path} has a torn tail; resume before reading/appending")
     if not lines:
         raise ValueError(f"cell file {path} is empty (no header line)")
     header = CellHeader.from_dict(json.loads(lines[0]))
     _assert_known_schema_version(header.schema_version, context=f"cell file {path}")
     records = [PairRecord.from_dict(json.loads(line)) for line in lines[1:] if line.strip()]
+    _validate_records(header, records)
     return header, records
 
 
@@ -812,12 +897,13 @@ def _atomic_write_manifest(run_dir: Path | str, payload: dict[str, Any]) -> None
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
 
 
-def register_member(
+def _register_member(
     run_dir: Path | str, member_version: int, required_cell_ids: Sequence[str]
 ) -> None:
     """Register ``member_version``'s full required cell-id set ("scheduled").
@@ -878,7 +964,7 @@ def register_member(
     _atomic_write_manifest(run_dir, manifest)
 
 
-def complete_cell(run_dir: Path | str, cell_id: str) -> None:
+def _complete_cell(run_dir: Path | str, cell_id: str) -> None:
     """Mark ``cell_id`` complete ("scheduled" -> "complete").
 
     Idempotent and one-directional: completing an already-complete cell is a
@@ -899,6 +985,13 @@ def complete_cell(run_dir: Path | str, cell_id: str) -> None:
         raise ManifestError(f"cell {cell_id} was never scheduled; cannot complete")
     if entry["status"] == _STATUS_COMPLETE:
         return  # idempotent no-op: a completed cell is never reopened.
+    path = cell_path(run_dir, cell_id)
+    if not path.exists():
+        raise ManifestError(f"cell {cell_id} file is missing")
+    header, records = read_cell(path)
+    if header.cell_id.to_string() != cell_id:
+        raise ManifestError("header identity disagrees with filename")
+    _validate_records(header, records, full=True)
     entry["status"] = _STATUS_COMPLETE
     entry["completed_at"] = time.time()
     _atomic_write_manifest(run_dir, manifest)
@@ -942,10 +1035,11 @@ class EvalSnapshot:
             time, independent of ``member_prefix`` contiguity (a later member's
             cells may be complete even if an earlier one has a hole; per-checkpoint
             live reporting reads this set directly).
-        snapshot_fingerprint: sha256 over ``(schema_version, sorted in-prefix cell
+        evidence_cell_ids: Cells in the complete contiguous member prefix only.
+        snapshot_fingerprint: sha256 over ``(schema_version, sorted prefix cell
             ids, each cell file's content hash, member_prefix)`` -- byte-stable
             while a writer appends to an incomplete cell (such cells are excluded by
-            construction), changes iff an in-prefix cell's content changes, and is
+            construction), changes when prefix evidence changes, and is
             invariant to every manifest wall-clock field.
     """
 
@@ -953,6 +1047,7 @@ class EvalSnapshot:
     member_prefix: int
     completed_cell_ids: frozenset[str]
     snapshot_fingerprint: str
+    evidence_cell_ids: frozenset[str]
 
 
 def _compute_member_prefix(members: Mapping[str, Any], completed: frozenset[str]) -> int:
@@ -990,8 +1085,6 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
     Raises:
         SchemaVersionError: If the manifest's or a cell file's ``schema_version`` is
             unknown.
-        ProtocolMismatchError: If any completed cell was written under another
-            protocol version or fingerprint.
         ManifestError: If a cell the manifest marks complete is missing on disk, its
             header's triple disagrees with its cell id, or its recorded pair count
             does not equal its own header's pinned ``pairs_per_cell``.
@@ -1046,13 +1139,17 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
 
     completed_frozen = frozenset(completed_ids)
     member_prefix = _compute_member_prefix(members, completed_frozen)
-    analysis_ids = [
-        cid for cid in completed_ids if parse_cell_id(cid).candidate_version <= member_prefix
-    ]
+    evidence_ids = sorted(
+        {
+            cid
+            for version in range(1, member_prefix + 1)
+            for cid in members[str(version)]["required_cells"]
+        }
+    )
     fingerprint_payload = {
         "schema_version": SCHEMA_VERSION,
-        "cell_ids": analysis_ids,
-        "cell_hashes": {cid: cell_hashes[cid] for cid in analysis_ids},
+        "cell_ids": evidence_ids,
+        "cell_hashes": {cid: cell_hashes[cid] for cid in evidence_ids},
         "member_prefix": member_prefix,
     }
     snapshot_fingerprint = hashlib.sha256(
@@ -1063,11 +1160,12 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
         member_prefix=member_prefix,
         completed_cell_ids=completed_frozen,
         snapshot_fingerprint=snapshot_fingerprint,
+        evidence_cell_ids=frozenset(evidence_ids),
     )
 
 
 def iter_cells(snapshot: EvalSnapshot) -> Iterator[Path]:
-    """Yield every completed cell's file path in the snapshot, in sorted cell-id order.
+    """Yield only authoritative prefix cell paths in the snapshot, in sorted cell-id order.
 
     Args:
         snapshot: A snapshot from :func:`load_snapshot`.
@@ -1075,5 +1173,30 @@ def iter_cells(snapshot: EvalSnapshot) -> Iterator[Path]:
     Yields:
         Each completed cell's path (see :func:`read_cell` to parse one).
     """
-    for cid in sorted(snapshot.completed_cell_ids):
+    for cid in sorted(snapshot.evidence_cell_ids):
         yield cell_path(snapshot.run_dir, cid)
+
+
+def open_cell_for_resume(path: Path, expected_header: CellHeader) -> int:
+    """Lock, recover, and validate an unfinished cell; return the next pair index."""
+    with _store_lock(_path_lock(Path(path))):
+        return _open_cell_for_resume(Path(path), expected_header)
+
+
+def open_cell_for_write(run_dir: Path | str, header: CellHeader) -> int:
+    """Lock and create/resume an unfinished cell, recovering a legacy torn header."""
+    with _store_lock(eval_dir(run_dir) / ".manifest.lock"):
+        return _open_cell_for_write(run_dir, header)
+
+
+def register_member(
+    run_dir: Path | str, member_version: int, required_cell_ids: Sequence[str]
+) -> None:
+    with _store_lock(eval_dir(run_dir) / ".manifest.lock"):
+        _register_member(run_dir, member_version, required_cell_ids)
+
+
+def complete_cell(run_dir: Path | str, cell_id: str) -> None:
+    """Atomically freeze a scheduled cell after validating its exact seeded pair set."""
+    with _store_lock(eval_dir(run_dir) / ".manifest.lock"):
+        _complete_cell(run_dir, cell_id)

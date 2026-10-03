@@ -86,7 +86,9 @@ def fit_elo(
             in no matchup; if some agent is not connected to the anchor
             through the matchup graph; or if ``initial_ratings`` contains a
             non-finite or non-numeric value for some *non-anchor* agent in
-            the matchup graph -- a value keyed on ``anchor`` itself is never
+            the matchup graph, or a starting magnitude above 10,000 Elo
+            (bounded so bracket expansion remains numerically safe and fast)
+            -- a value keyed on ``anchor`` itself is never
             validated, since it is always discarded in favor of 0.0.
     """
     # Fold in the virtual draw and collapse duplicate matchups.
@@ -125,6 +127,8 @@ def fit_elo(
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"initial_ratings[{name!r}] must be a finite float, got {value!r}")
+            if abs(value) > 10_000:
+                raise ValueError(f"initial_ratings[{name!r}] magnitude must be at most 10,000 Elo")
             if not math.isfinite(value):
                 raise ValueError(f"initial_ratings[{name!r}] must be finite, got {value!r}")
             ratings[name] = float(value)
