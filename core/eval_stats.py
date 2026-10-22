@@ -128,7 +128,6 @@ from core.eval_store import (
     read_cell,
     records_to_match,
 )
-from core.run_identity import read_stored_config
 from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 #: The M1.6 frozen ladder's rung-1 anchor identity -- ``core.agents.RandomAgent.name``
@@ -760,7 +759,7 @@ def build_verdict(
     *,
     B: int = BOOTSTRAP_B_PRODUCTION,
     eval_seed: int | None = None,
-    production_schedule: bool = True,
+    production_schedule: bool | None = None,
 ) -> dict[str, Any]:
     from core.eval_artifacts import build_verdict as implementation
 
@@ -1095,12 +1094,19 @@ def detect_plateau(
     Raises ValueError for inadmissible B, non-contiguous rung-7 curves, or
     a disconnected fit; FileNotFoundError for missing stored config when a
     complete window needs bootstrap replicates and no ``eval_seed`` is given.
-    ``eval_seed`` is the evaluation seed the bootstrap derives from -- the M4
-    harness passes its own ``EvalConfig.eval_seed`` (§9 pin 7); ``None`` falls
-    back to the watched run's ``evaluation.eval_seed``.
+    ``eval_seed`` is the evaluation seed the bootstrap derives from (§9 pin 7);
+    ``None`` reads the recorded ``eval/config.json`` seed, or, with no eval
+    provenance, the watched run's ``evaluation.eval_seed``. An explicit value
+    that contradicts recorded eval provenance raises ValueError.
     """
+    from core.eval_artifacts import resolve_eval_provenance_defaults
+
     _validate_admissible_B(B)
     run_dir = Path(run_dir)
+    if eval_seed is not None:
+        # Refuse a contradicting explicit seed up front, even when the window
+        # turns out to be insufficient and no bootstrap is drawn.
+        resolve_eval_provenance_defaults(run_dir, eval_seed=eval_seed)
     M = PLATEAU_WINDOW_M
 
     snapshot = load_snapshot(run_dir)
@@ -1138,8 +1144,7 @@ def detect_plateau(
         )
 
     point_curve_by_version = dict(point_curve)
-    if eval_seed is None:
-        eval_seed = read_stored_config(run_dir).run.evaluation.eval_seed
+    eval_seed, _ = resolve_eval_provenance_defaults(run_dir, eval_seed=eval_seed)
     seed = bootstrap_seed(eval_seed)
     replicate_curves = [
         dict(checkpoint_elo(ratings)) for ratings in bootstrap_replicates(snapshot, seed, B)

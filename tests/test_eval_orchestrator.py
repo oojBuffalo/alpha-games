@@ -1613,6 +1613,54 @@ def test_reduced_form_schedule_never_yields_an_authoritative_verdict(
     )
 
 
+def test_public_build_verdict_derives_eligibility_and_seed_from_eval_provenance(tmp_path):
+    """The public API, called without the CLI's arguments, must honor ``eval/config.json``."""
+    from core import eval_stats
+
+    run_dir = tmp_path / "run"
+    _write_run_provenance(run_dir, checkpoint_count=1, eval_seed=999)
+    _write_scored_member(run_dir, 1, [1.0, 0.5] * (eval_protocol.PAIRS_PER_CELL // 2))
+    _write_checkpoint_markers(run_dir, [1])
+    config = _make_config(
+        str(run_dir),
+        forms=(7,),
+        eval_seed=123,
+        pairs_per_cell=eval_protocol.PAIRS_PER_CELL,
+        eval_sims=eval_protocol.EVAL_SIMS,
+        rung8_lag_divisor=eval_protocol.RUNG8_LAG_DIVISOR,
+        rung8_earliest_version=eval_protocol.RUNG8_EARLIEST_VERSION,
+        bootstrap_b=eval_protocol.BOOTSTRAP_B_PRODUCTION,
+    )
+    assert not config.production_schedule
+    eval_run.resolve_eval_launch(run_dir, config)
+
+    verdict = eval_stats.build_verdict(run_dir, B=eval_protocol.BOOTSTRAP_B_PRODUCTION)
+    assert verdict["delta"] is not None
+    assert verdict["authoritative"] is False
+    assert verdict["reason"] is not None
+    assert verdict["bootstrap_seed"] == eval_stats.bootstrap_seed(123)
+
+    # Explicit overrides that contradict the recorded provenance are refused.
+    with pytest.raises(ValueError, match="production_schedule"):
+        eval_stats.build_verdict(
+            run_dir, B=eval_protocol.BOOTSTRAP_B_PRODUCTION, production_schedule=True
+        )
+    with pytest.raises(ValueError, match="eval_seed"):
+        eval_stats.build_verdict(run_dir, B=eval_protocol.BOOTSTRAP_B_PRODUCTION, eval_seed=999)
+    with pytest.raises(ValueError, match="eval_seed"):
+        eval_stats.detect_plateau(run_dir, B=eval_protocol.BOOTSTRAP_B_PRODUCTION, eval_seed=999)
+    # Matching explicit values are accepted.
+    assert (
+        eval_stats.build_verdict(
+            run_dir,
+            B=eval_protocol.BOOTSTRAP_B_PRODUCTION,
+            eval_seed=123,
+            production_schedule=False,
+        )
+        == verdict
+    )
+
+
 def test_cmd_plateau_smoke_reports_insufficient_data_tri_state_rendered_not_coerced(tmp_path):
     run_dir = tmp_path / "run"
     _hand_built_store(run_dir, checkpoint_count=1, scored_versions=[1])

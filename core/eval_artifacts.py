@@ -188,20 +188,74 @@ def _production_identity(identity: str) -> bool:
     return True
 
 
+def resolve_eval_provenance_defaults(
+    run_dir: Path | str,
+    *,
+    eval_seed: int | None = None,
+    production_schedule: bool | None = None,
+) -> tuple[int, bool]:
+    """Resolve a report's eval seed and schedule eligibility from stored provenance.
+
+    When the harness recorded ``eval/config.json``
+    (``core.eval_run.write_eval_provenance``), that record is the source of
+    truth (§9 pins 2/7/8): an omitted value is read from it, and an explicit
+    value must equal it. Without eval provenance (a direct caller over a bare
+    snapshot), the legacy defaults apply: the watched run's
+    ``evaluation.eval_seed`` and a production schedule.
+
+    Args:
+        run_dir: The watched run's root directory.
+        eval_seed: An explicit eval seed, or ``None`` to derive it.
+        production_schedule: An explicit schedule flag, or ``None`` to derive it.
+
+    Returns:
+        ``(eval_seed, production_schedule)`` to build the report with.
+
+    Raises:
+        ValueError: If an explicit value contradicts the stored eval provenance.
+        FileNotFoundError: If no eval provenance exists, ``eval_seed`` is
+            ``None``, and the run has no stored ``config.json``.
+    """
+    run_dir = Path(run_dir)
+    if not (eval_dir(run_dir) / "config.json").exists():
+        if eval_seed is None:
+            eval_seed = read_stored_config(run_dir).run.evaluation.eval_seed
+        return eval_seed, True if production_schedule is None else production_schedule
+
+    # Deferred: core.eval_run imports this module's dependencies (and torch via
+    # core.eval_agents); only a run that has harness provenance pays for it.
+    from core.eval_run import read_eval_provenance
+
+    stored = read_eval_provenance(run_dir).config
+    if eval_seed is not None and eval_seed != stored.eval_seed:
+        raise ValueError(
+            f"eval_seed={eval_seed} contradicts the recorded eval provenance "
+            f"(eval/config.json eval_seed={stored.eval_seed})"
+        )
+    if production_schedule is not None and production_schedule != stored.production_schedule:
+        raise ValueError(
+            f"production_schedule={production_schedule} contradicts the recorded eval "
+            f"provenance (eval/config.json schedules production_schedule="
+            f"{stored.production_schedule})"
+        )
+    return stored.eval_seed, stored.production_schedule
+
+
 def build_verdict(
     run_dir: Path | str,
     *,
     B: int = BOOTSTRAP_B_PRODUCTION,
     eval_seed: int | None = None,
-    production_schedule: bool = True,
+    production_schedule: bool | None = None,
 ) -> dict[str, Any]:
     """Assemble and durably write the §12 M5.5 verdict artifact.
 
     The publishing orchestrator over ``core.eval_stats`` inference. Reads
     the watched run's own stored config
     (``core.run_identity.read_stored_config``) for ``k_target``
-    (``training.checkpoint_count``) and the eval seed
-    (``evaluation.eval_seed``); loads the run's eval-store snapshot
+    (``training.checkpoint_count``), and the harness's recorded eval
+    provenance, when present, for the eval seed and schedule eligibility
+    (:func:`resolve_eval_provenance_defaults`); loads the run's eval-store snapshot
     (``core.eval_store.load_snapshot``); fits the point estimate
     (:func:`fit_snapshot_elo`) and refreshes the §1 plot series
     (:func:`elo_curve`) from that *same* snapshot object, so the verdict's
@@ -239,15 +293,19 @@ def build_verdict(
             ``B ≡ 39 mod 40``; see :func:`order_statistic_ci`). Defaults to
             the pinned production value; the artifact always records the
             value actually used.
-        eval_seed: The evaluation seed ``bootstrap_seed`` derives from. The
-            M4 harness passes its own recorded ``EvalConfig.eval_seed`` (§9
-            pin 7 -- the eval seed is carried by the eval config); ``None``
-            falls back to the watched run's ``evaluation.eval_seed``.
+        eval_seed: The evaluation seed ``bootstrap_seed`` derives from (§9
+            pin 7 -- the eval seed is carried by the eval config). ``None``
+            reads the recorded ``eval/config.json`` seed, or, with no eval
+            provenance, the watched run's ``evaluation.eval_seed``. An explicit
+            value must match the recorded provenance
+            (:func:`resolve_eval_provenance_defaults`).
         production_schedule: Whether the evidence was scheduled under the
             complete production schedule (all of forms 5/6/7 and the pinned
             rung-8 rule, §9 pin 2/5). ``False`` (a reduced schedule) keeps the
             verdict provisional: it may still carry a Delta/CI/gate, never the
-            ``authoritative`` flag.
+            ``authoritative`` flag. ``None`` derives it from the recorded
+            ``eval/config.json`` (``True`` only with no eval provenance); an
+            explicit value must match that record.
 
     The curve is serialized once; ``elo_curve_fingerprint`` is the sha256 of
     exactly those bytes, which are written both to an immutable
@@ -263,7 +321,9 @@ def build_verdict(
         seed always produce bit-identical bytes) to :func:`verdict_path`.
 
     Raises:
-        ValueError: If ``B`` is not admissible, or propagated from
+        ValueError: If ``B`` is not admissible, if ``eval_seed`` or
+            ``production_schedule`` contradicts the recorded eval provenance, or
+            propagated from
             :func:`fit_snapshot_elo`/:func:`elo_curve` (an
             agent disconnected from the anchor, or a scored member with no
             ``checkpoint_published`` marker).
@@ -278,7 +338,9 @@ def build_verdict(
     snapshot = load_snapshot(run_dir)
     stored_config = read_stored_config(run_dir)
     k_target = stored_config.run.training.checkpoint_count
-    eval_seed_value = stored_config.run.evaluation.eval_seed if eval_seed is None else eval_seed
+    eval_seed_value, production_schedule = resolve_eval_provenance_defaults(
+        run_dir, eval_seed=eval_seed, production_schedule=production_schedule
+    )
 
     seed = bootstrap_seed(eval_seed_value)
     point_ratings = fit_snapshot_elo(snapshot) if snapshot.member_prefix else {}
