@@ -1479,3 +1479,73 @@ def test_production_identity_requires_full_bare_v1_network_names(identity, expec
     from core.eval_artifacts import _production_identity
 
     assert _production_identity(identity) is expected
+
+
+def test_complete_prefix_missing_final_rung7_rating_yields_no_delta(tmp_path):
+    """Pin 8: a complete member prefix whose final member carries no rung-7
+    cell is not the complete K-set -- ``delta_hat`` must never silently run
+    over a shorter curve (Codex round 2 repro: K=3, member 3 rung-5 only)."""
+    _write_member(tmp_path, 1, [(7, "random", [0.0] * 24)])
+    _write_member(tmp_path, 2, [(7, "random", [2.0] * 24)])
+    _write_member(tmp_path, 3, [(5, "random", [1.0] * 24)])
+    _write_checkpoint_markers(tmp_path, [1, 2, 3])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=7)
+
+    payload = build_verdict(tmp_path, B=1999)
+
+    assert payload["checkpoints_evaluated"] == payload["k_target"] == 3
+    assert [row["model_version"] for row in payload["per_checkpoint"]] == [1, 2]
+    assert payload["authoritative"] is False
+    assert payload["delta"] is None
+    assert "[3]" in payload["reason"] and "rung-7" in payload["reason"]
+    assert not _find_key(payload, "gate")
+
+
+def test_verdict_curve_hash_survives_an_interleaved_curve_publication(tmp_path, monkeypatch):
+    """Pin 9: another publisher replacing the shared ``elo_curve.json`` between
+    this verdict's curve write and its hash must not rebind the verdict's curve
+    reference to a different snapshot."""
+    import hashlib
+
+    from core import eval_artifacts
+    from core.eval_artifacts import elo_curve_artifact_path
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=11)
+
+    real_write = eval_artifacts._write_blob
+    interleaved = {"done": False}
+
+    def _write_then_interleave(path, blob):
+        real_write(path, blob)
+        if path == elo_curve_path(tmp_path) and not interleaved["done"]:
+            interleaved["done"] = True
+            _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+            elo_curve(tmp_path, load_snapshot(tmp_path))  # a concurrent publisher
+
+    monkeypatch.setattr(eval_artifacts, "_write_blob", _write_then_interleave)
+    verdict = build_verdict(tmp_path, B=39)
+    assert interleaved["done"]
+
+    assert verdict["checkpoints_evaluated"] == 1
+    artifact = elo_curve_artifact_path(tmp_path, verdict["elo_curve_fingerprint"])
+    assert artifact.name == verdict["elo_curve_artifact"]
+    artifact_bytes = artifact.read_bytes()
+    assert hashlib.sha256(artifact_bytes).hexdigest() == verdict["elo_curve_fingerprint"]
+    referenced = json.loads(artifact_bytes)
+    assert referenced["snapshot_fingerprint"] == verdict["evidence_fingerprint"]
+    assert [row["model_version"] for row in referenced["rows"]] == [1]
+
+    # The shared path now holds the newer snapshot's curve, which must not
+    # verify under this verdict's hash.
+    shared = elo_curve_path(tmp_path).read_bytes()
+    assert len(json.loads(shared)["rows"]) == 2
+    assert hashlib.sha256(shared).hexdigest() != verdict["elo_curve_fingerprint"]
+
+
+def test_elo_curve_artifact_path_rejects_non_digest_names(tmp_path):
+    from core.eval_artifacts import elo_curve_artifact_path
+
+    with pytest.raises(ValueError, match="hex digest"):
+        elo_curve_artifact_path(tmp_path, "../verdict")

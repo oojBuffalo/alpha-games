@@ -77,7 +77,8 @@ them:
   core.eval_protocol.BOOTSTRAP_B_PRODUCTION`` exactly. The artifact carries
   its own evidence fingerprint (the snapshot's :attr:`~core.eval_store.
   EvalSnapshot.snapshot_fingerprint`), a content-hash reference to the
-  ``elo_curve.json`` derived artifact it refreshes alongside itself, the
+  immutable, content-addressed copy of the ``elo_curve.json`` derived artifact
+  it publishes alongside itself (``eval/elo_curve-<sha256>.json``), the
   recorded :func:`bootstrap_seed`, and the full protocol-registry block
   (``core.eval_protocol.REGISTRY`` plus its fingerprint) -- everything a
   later reader needs to know exactly what evidence, seed, and protocol
