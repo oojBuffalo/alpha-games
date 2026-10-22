@@ -235,7 +235,7 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
             _production_identity(header.candidate_identity)
             and _production_identity(header.opponent_identity)
             and header.eval_config.get("pairs_per_cell") == PAIRS_PER_CELL
-            and header.eval_config.get("eval_sims", EVAL_SIMS) == EVAL_SIMS
+            and header.eval_config.get("eval_sims") == EVAL_SIMS
         )
         for header, _ in (read_cell(path) for path in iter_cells(snapshot))
     )

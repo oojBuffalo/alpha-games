@@ -96,7 +96,9 @@ def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=f"rung{rung}-v1-{candidate_version}",
         opponent_identity=opponent_id,
-        eval_config={"pairs_per_cell": n_pairs},
+        # Production writers stamp S on every cell (rung 5 included); the
+        # authority gate requires it rather than defaulting a missing key.
+        eval_config={"pairs_per_cell": n_pairs, "eval_sims": eval_protocol.EVAL_SIMS},
         candidate_fingerprint={"orientation_table_hash": "test"},
     )
 
@@ -1325,16 +1327,20 @@ def test_elo_curve_accepts_resolved_alias_of_snapshot_run(tmp_path):
     )
 
 
-@pytest.mark.parametrize("budget", [128, 512])
+@pytest.mark.parametrize("budget", [128, 512, None])
 def test_source_search_settings_control_verdict_authority(tmp_path, budget):
-    identity = "rung7-v1-1" if budget == 512 else f"rung7-v1-s{budget}-1"
+    # ``None`` = a header with no ``eval_sims`` key: it must not read as production S.
+    identity = "rung7-v1-1" if budget in (512, None) else f"rung7-v1-s{budget}-1"
+    eval_config = {"pairs_per_cell": 24}
+    if budget is not None:
+        eval_config["eval_sims"] = budget
     header = build_header(
         run_id="run",
         cell_id=CellId(1, 7, "random", full_candidate_identity=identity),
         candidate_identity=identity,
         opponent_identity="random",
         candidate_fingerprint={"orientation_table_hash": "test"},
-        eval_config={"pairs_per_cell": 24, "eval_sims": budget},
+        eval_config=eval_config,
         cell_seed=0,
     )
     register_member(tmp_path, 1, [header.cell_id.to_string()])
