@@ -786,13 +786,45 @@ def test_changed_seed_and_wrong_pair_seed_are_rejected(tmp_path):
     assert len(read_cell(path)[1]) == 1
 
 
-def test_full_scheduled_cell_cannot_resume_or_append(tmp_path):
+def test_full_scheduled_cell_resumes_at_pair_count_then_completes(tmp_path):
+    # Crash between the final append and complete_cell: the relaunch must see
+    # "nothing left to play" and be able to complete, never wedge the cell.
     header = _make_header()
+    cid = header.cell_id.to_string()
+    register_member(tmp_path, header.cell_id.candidate_version, [cid])
     path = _fill_cell(tmp_path, header, PAIRS_PER_CELL)
-    with pytest.raises(ManifestError):
-        open_cell_for_write(tmp_path, header)
+    assert open_cell_for_write(tmp_path, header) == PAIRS_PER_CELL
+    assert open_cell_for_resume(path, header) == PAIRS_PER_CELL
     with pytest.raises(ManifestError):
         append_pair_record(path, _flat_record(PAIRS_PER_CELL))
+    complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+    with pytest.raises(ManifestError):
+        open_cell_for_write(tmp_path, header)
+
+
+def test_snapshot_refuses_evidence_cells_with_mixed_run_ids(tmp_path):
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1, run_id="run-1"))
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=2, run_id="other-run"))
+    with pytest.raises(ConfigMismatchError, match="run_id"):
+        load_snapshot(tmp_path)
+
+
+def test_snapshot_refuses_evidence_cells_stamped_by_another_protocol(tmp_path, monkeypatch):
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1))
+    monkeypatch.setitem(eval_protocol.REGISTRY, "a_new_convention_constant", 1)
+    with pytest.raises(ProtocolMismatchError):
+        load_snapshot(tmp_path)
+
+
+def test_snapshot_stamp_check_ignores_post_hole_provisional_cells(tmp_path):
+    # Only the evidence prefix must agree; a complete cell after a hole is
+    # provisional and its stamps do not gate the analyzed prefix.
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1))
+    register_member(tmp_path, 2, [build_cell_id(2, 7, "random")])
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=3, run_id="other-run"))
+    snapshot = load_snapshot(tmp_path)
+    assert snapshot.member_prefix == 1
 
 
 def test_future_header_schema_checked_before_renamed_fields(tmp_path):
