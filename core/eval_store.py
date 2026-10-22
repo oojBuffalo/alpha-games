@@ -952,6 +952,21 @@ def _atomic_write_manifest(run_dir: Path | str, payload: dict[str, Any]) -> None
         raise
 
 
+def _persist_existing_manifest(run_dir: Path | str) -> None:
+    """Make the manifest already on disk durable before an idempotent acknowledgement.
+
+    An idempotent no-op reads state that a predecessor may have published with
+    ``os.replace`` but died before fsyncing the directory entry (or that a failed
+    ``_atomic_write_manifest`` left visible). Visibility is not durability: before a
+    retry reports success it must persist the manifest bytes, the manifest's
+    directory entry and every store-owned directory level itself.
+    """
+    path = manifest_path(run_dir)
+    _make_durable_dirs(path.parent)
+    _fsync_file(path)
+    _fsync_directory(path.parent)
+
+
 def _register_member(
     run_dir: Path | str, member_version: int, required_cell_ids: Sequence[str]
 ) -> None:
@@ -995,7 +1010,10 @@ def _register_member(
     existing = manifest["members"].get(key)
     if existing is not None:
         if list(existing["required_cells"]) == normalized:
-            return  # idempotent no-op: identical re-registration.
+            # Idempotent no-op: identical re-registration -- but persist what we
+            # acknowledge (the stored registration may not be durable yet).
+            _persist_existing_manifest(run_dir)
+            return
         raise ManifestError(
             f"member {member_version} is already registered with a different required-cell "
             f"set: stored={existing['required_cells']!r}, requested={normalized!r}"
@@ -1033,7 +1051,11 @@ def _complete_cell(run_dir: Path | str, cell_id: str) -> None:
     if entry is None:
         raise ManifestError(f"cell {cell_id} was never scheduled; cannot complete")
     if entry["status"] == _STATUS_COMPLETE:
-        return  # idempotent no-op: a completed cell is never reopened.
+        # Idempotent no-op (a completed cell is never reopened) -- but persist the
+        # completion we acknowledge; a predecessor may have died before its
+        # directory fsync. The cell bytes were fsynced before that manifest write.
+        _persist_existing_manifest(run_dir)
+        return
     path = cell_path(run_dir, cell_id)
     if not path.exists():
         raise ManifestError(f"cell {cell_id} file is missing")
