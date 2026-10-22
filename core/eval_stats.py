@@ -86,6 +86,7 @@ them:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -1003,17 +1004,20 @@ def _read_elo_curve_gpu_hours(run_dir: Path) -> tuple[dict[int, float], str | No
         GPU-hours lookup then misses, which :func:`_window_condition` already
         turns into the insufficient-data trigger); otherwise every row's
         ``(model_version, gpu_hours)`` pair and the file's sha256
-        (:func:`_file_sha256`) -- the identical fingerprint
-        ``build_verdict``'s own ``elo_curve_fingerprint`` field would record
-        for the same file content.
+        (the same digest :func:`core.eval_artifacts._file_sha256` gives) -- the
+        identical fingerprint ``build_verdict``'s own ``elo_curve_fingerprint``
+        field would record for the same file content. The file is read exactly
+        once and both the hash and the parsed rows come from that one buffer, so
+        a concurrent ``os.replace`` refresh can never pair one version's rows
+        with another version's fingerprint.
     """
-    from core.eval_artifacts import _file_sha256
-
     path = elo_curve_path(run_dir)
-    if not path.exists():
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
         return {}, None
-    fingerprint = _file_sha256(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    payload = json.loads(raw.decode("utf-8"))
     gpu_hours_by_version = {row["model_version"]: row["gpu_hours"] for row in payload["rows"]}
     return gpu_hours_by_version, fingerprint
 

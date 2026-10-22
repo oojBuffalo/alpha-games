@@ -1536,6 +1536,48 @@ def test_stale_elo_curve_missing_the_newest_member_is_insufficient_data(tmp_path
     assert "GPU-hours coordinate" in result.reason
 
 
+def test_elo_curve_rows_and_fingerprint_come_from_the_same_bytes(tmp_path, monkeypatch):
+    """A concurrent ``os.replace`` refresh of ``elo_curve.json`` right after the
+    reader's first read must not pair the old file's fingerprint with the new
+    file's rows: the GPU-hours join and its fingerprint describe one artifact."""
+    import os
+
+    import core.eval_stats as stats
+
+    path = elo_curve_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    old_bytes = json.dumps({"rows": [{"model_version": 1, "gpu_hours": 1.0}]}).encode()
+    new_bytes = json.dumps(
+        {"rows": [{"model_version": v, "gpu_hours": float(v)} for v in (1, 2)]}
+    ).encode()
+    path.write_bytes(old_bytes)
+
+    replaced = []
+    real_read_bytes = Path.read_bytes
+    real_read_text = Path.read_text
+
+    def _refresh_after_first_read(read):
+        def wrapper(self, *args, **kwargs):
+            out = read(self, *args, **kwargs)
+            if self == path and not replaced:
+                staged = path.with_suffix(".tmp")
+                staged.write_bytes(new_bytes)
+                os.replace(staged, path)
+                replaced.append(True)
+            return out
+
+        return wrapper
+
+    monkeypatch.setattr(Path, "read_bytes", _refresh_after_first_read(real_read_bytes))
+    monkeypatch.setattr(Path, "read_text", _refresh_after_first_read(real_read_text))
+
+    gpu_hours, fingerprint = stats._read_elo_curve_gpu_hours(tmp_path)
+
+    assert replaced  # the refresh really landed between/after the reader's read
+    assert fingerprint == hashlib.sha256(old_bytes).hexdigest()
+    assert gpu_hours == {1: 1.0}  # rows from the same (old) bytes, not the replacement
+
+
 def test_an_insufficient_data_windows_mann_kendall_reading_also_blocks(tmp_path, monkeypatch):
     import core.eval_stats as stats
 
