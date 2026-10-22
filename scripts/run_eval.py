@@ -65,6 +65,7 @@ from core.eval_run import (  # noqa: E402
     eval_lag,
     load_eval_config,
     report_is_current,
+    report_lock,
     run_watch_loop,
     validate_eval_provenance,
     watched_k_total,
@@ -120,6 +121,9 @@ def _build_report(config: EvalConfig) -> dict:
     Args:
         config: The harness's resolved :class:`~core.eval_run.EvalConfig`.
 
+    The caller must hold :func:`~core.eval_run.report_lock` for the run, so
+    the snapshot load and both artifact writes form one transaction.
+
     Returns:
         ``{"verdict": <verdict.json payload>, "eval_lag": int}``.
     """
@@ -140,10 +144,15 @@ def cmd_report(config_path: Path | str) -> dict:
     Args:
         config_path: Path to an :class:`~core.eval_run.EvalConfig` JSON file.
 
+    Serialized with the live watch loop's report hook (and any other
+    ``--report``) through :func:`~core.eval_run.report_lock`.
+
     Returns:
         :func:`_build_report`'s payload.
     """
-    return _build_report(load_eval_config(config_path))
+    config = load_eval_config(config_path)
+    with report_lock(config.run_dir):
+        return _build_report(config)
 
 
 def cmd_plateau(config_path: Path | str) -> PlateauResult:
@@ -223,19 +232,20 @@ def cmd_launch(
     game, profile = _resolve_watched_game(config.run_dir)
 
     def _on_member_complete(member_version: int) -> None:
-        if report_is_current(
-            config.run_dir,
-            B=config.bootstrap_b,
-            eval_seed=config.eval_seed,
-            production_schedule=config.production_schedule,
-        ):
-            lag = eval_lag(config.run_dir, watched_k_total(config.run_dir))
-            print(
-                f"[run_eval] checkpoint {member_version} complete -- eval_lag={lag} "
-                "(report already current)"
-            )
-            return
-        report = _build_report(config)
+        with report_lock(config.run_dir):
+            if report_is_current(
+                config.run_dir,
+                B=config.bootstrap_b,
+                eval_seed=config.eval_seed,
+                production_schedule=config.production_schedule,
+            ):
+                lag = eval_lag(config.run_dir, watched_k_total(config.run_dir))
+                print(
+                    f"[run_eval] checkpoint {member_version} complete -- eval_lag={lag} "
+                    "(report already current)"
+                )
+                return
+            report = _build_report(config)
         print(
             f"[run_eval] checkpoint {member_version} complete -- eval_lag="
             f"{report['eval_lag']} authoritative={report['verdict']['authoritative']}"

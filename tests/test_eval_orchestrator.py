@@ -202,6 +202,25 @@ def test_eval_config_rejects_unrecognized_form():
         _make_config("runs/x", forms=(5, 8))
 
 
+@pytest.mark.parametrize("forms", [(5,), (6,), (5, 6)])
+def test_eval_config_rejects_form_sets_without_the_reported_rung7_form(forms):
+    # The §1 report is form 7's curve; without it a completed K-set would
+    # reach build_verdict with an empty curve, so refuse before any play.
+    with pytest.raises(ValueError, match="must include form 7"):
+        _make_config("runs/x", forms=forms)
+
+
+def test_eval_config_file_without_form_7_is_refused_before_launch(tmp_path):
+    _build_watched_run(tmp_path / "run", k_total=1)
+    payload = _eval_config(tmp_path / "run").to_dict()
+    payload["forms"] = [5]
+    cfg_path = tmp_path / "eval_cfg.json"
+    cfg_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="must include form 7"):
+        run_eval.cmd_launch(cfg_path, single_pass=True)
+    assert not cells_dir(tmp_path / "run").exists()
+
+
 def test_eval_config_rejects_duplicate_forms():
     with pytest.raises(ValueError, match="duplicates"):
         _make_config("runs/x", forms=(5, 5, 6))
@@ -270,7 +289,7 @@ def test_resolve_eval_launch_refuses_on_changed_forms(tmp_path):
     original = _make_config(str(run_dir), forms=(5, 6, 7))
     resolve_eval_launch(run_dir, original)
 
-    changed = dataclasses.replace(original, forms=(5, 6))
+    changed = dataclasses.replace(original, forms=(6, 7))
     with pytest.raises(EvalRelaunchRefusedError, match="forms"):
         resolve_eval_launch(run_dir, changed)
 
@@ -1308,6 +1327,63 @@ def test_on_member_complete_fires_once_per_played_member_and_coalesces_relaunch(
     assert calls == [2]
 
 
+def _assert_report_lock_held(run_dir) -> None:
+    import fcntl
+
+    with (eval_run.eval_dir(run_dir) / ".report.lock").open("a+") as probe:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_live_hook_and_manual_report_both_publish_under_the_report_lock(tmp_path, monkeypatch):
+    # Codex round 2: a manual --report interleaved with the live hook could
+    # pair one snapshot's statistics with another's curve fingerprint. Every
+    # build_verdict call (snapshot load -> curve write -> hash -> verdict
+    # write) must run while the shared report lock is held.
+    _build_watched_run(tmp_path, k_total=1)
+    _write_checkpoint_markers(tmp_path, [1])
+    config = _eval_config(tmp_path, forms=(7,), bootstrap_b=39)
+    config_path = _write_eval_config_file(tmp_path / "eval.json", config)
+    real_build = run_eval.build_verdict
+    builds = []
+
+    def checking_build(*args, **kwargs):
+        _assert_report_lock_held(tmp_path)
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(run_eval, "build_verdict", checking_build)
+    run_eval.cmd_launch(config_path, single_pass=True)
+    run_eval.cmd_report(config_path)
+    assert len(builds) == 2
+
+
+def test_manual_report_waits_for_an_in_flight_report_transaction(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    _write_checkpoint_markers(tmp_path, [1])
+    config = _eval_config(tmp_path, forms=(7,), bootstrap_b=39)
+    config_path = _write_eval_config_file(tmp_path / "eval.json", config)
+    run_watch_loop(tmp_path, config, FAST_PROFILE, GAME, single_pass=True)
+    results = []
+    with eval_run.report_lock(tmp_path):
+        worker = threading.Thread(target=lambda: results.append(run_eval.cmd_report(config_path)))
+        worker.start()
+        worker.join(timeout=0.5)
+        assert worker.is_alive()
+        assert not verdict_path(tmp_path).exists()
+    worker.join(timeout=60)
+    assert not worker.is_alive()
+    assert results[0]["verdict"]["checkpoints_evaluated"] == 1
+    assert verdict_path(tmp_path).exists()
+
+
+def test_report_lock_never_creates_a_missing_run_root(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        with eval_run.report_lock(tmp_path / "typo"):
+            pass
+    assert not (tmp_path / "typo").exists()
+
+
 def test_relaunch_over_k_complete_members_builds_no_redundant_verdicts(tmp_path, monkeypatch):
     _build_watched_run(tmp_path, k_total=3)
     _write_checkpoint_markers(tmp_path, [1, 2, 3])
@@ -1637,7 +1713,7 @@ def test_interruption_inside_game_preserves_finished_pairs(tmp_path, monkeypatch
     killed = tmp_path / "killed"
     for directory in (baseline, killed):
         _build_watched_run(directory, k_total=1)
-    config = _eval_config(baseline, pairs_per_cell=4, forms=(5,))
+    config = _eval_config(baseline, pairs_per_cell=4, forms=(7,))
     run_watch_loop(baseline, config, FAST_PROFILE, GAME, single_pass=True)
     real_play = runner.play_game
     calls = 0
@@ -1669,7 +1745,7 @@ def test_failed_report_hook_does_not_stop_scoring_and_relaunch_retries(tmp_path)
         calls.append(version)
         raise ValueError("missing metrics")
 
-    config = _eval_config(tmp_path, forms=(5,))
+    config = _eval_config(tmp_path, forms=(7,))
     result = run_watch_loop(
         tmp_path, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=fail
     )
@@ -1931,7 +2007,9 @@ def test_historical_factory_refuses_identity_for_a_different_budget(tmp_path):
 def test_search_config_rejects_a_single_simulation_before_launch():
     with pytest.raises(ValueError, match="integer >= 2"):
         _make_config("unused", eval_sims=1)
-    assert _make_config("unused", eval_sims=1, forms=(5,)).eval_sims == 1
+    # Form 7 is mandatory, so a search budget is validated for every config.
+    with pytest.raises(ValueError, match="integer >= 2"):
+        _make_config("unused", eval_sims=1, forms=(7,))
 
 
 def test_liveness_on_arm_device_is_the_configured_device_not_a_literal():
