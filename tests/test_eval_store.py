@@ -501,6 +501,74 @@ def test_register_member_is_idempotent_on_the_identical_set(tmp_path):
     assert sorted(payload["members"]["1"]["required_cells"]) == sorted(cids)
 
 
+def _unsynced_manifest_retry_syncs(tmp_path, monkeypatch, first_call, retry):
+    """Fail the manifest's directory fsync after ``os.replace``, then retry.
+
+    Returns the directories the retry fsynced (relative to ``tmp_path``) and
+    whether the manifest file itself was fsynced by the retry.
+    """
+    import core.eval_store as store
+
+    real_fsync_dir = store._fsync_directory
+    real_fsync_file = store._fsync_file
+    state = {"fail": True}
+    events: list[tuple[str, str]] = []
+
+    def flaky_dir(path):
+        if state["fail"] and Path(path).resolve() == manifest_path(tmp_path).parent.resolve():
+            if manifest_path(tmp_path).exists():  # replace already published it
+                state["fail"] = False
+                raise OSError("simulated crash before manifest directory fsync")
+        events.append(("dir", Path(path).resolve().relative_to(tmp_path.resolve()).as_posix()))
+        real_fsync_dir(path)
+
+    def record_file(path):
+        events.append(("file", Path(path).resolve().relative_to(tmp_path.resolve()).as_posix()))
+        real_fsync_file(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", flaky_dir)
+    monkeypatch.setattr(store, "_fsync_file", record_file)
+    with pytest.raises(OSError, match="simulated crash"):
+        first_call()
+    assert not state["fail"]
+    events.clear()
+    retry()
+    return events
+
+
+def test_idempotent_register_persists_a_visible_but_unsynced_manifest(tmp_path, monkeypatch):
+    """A retried registration must not acknowledge a manifest it never made durable."""
+    cids = [build_cell_id(1, 7, "random")]
+    events = _unsynced_manifest_retry_syncs(
+        tmp_path,
+        monkeypatch,
+        lambda: register_member(tmp_path, 1, cids),
+        lambda: register_member(tmp_path, 1, cids),
+    )
+    manifest_rel = manifest_path(tmp_path).resolve().relative_to(tmp_path.resolve()).as_posix()
+    eval_rel = manifest_path(tmp_path).parent.resolve().relative_to(tmp_path.resolve()).as_posix()
+    assert ("file", manifest_rel) in events
+    assert ("dir", eval_rel) in events
+
+
+def test_idempotent_complete_persists_a_visible_but_unsynced_manifest(tmp_path, monkeypatch):
+    """A retried completion must not acknowledge a completion it never made durable."""
+    cid = build_cell_id(1, 7, "random")
+    register_member(tmp_path, 1, [cid])
+    _fill_cell(tmp_path, _make_header(candidate_version=1), PAIRS_PER_CELL)
+    events = _unsynced_manifest_retry_syncs(
+        tmp_path,
+        monkeypatch,
+        lambda: complete_cell(tmp_path, cid),
+        lambda: complete_cell(tmp_path, cid),
+    )
+    assert is_cell_complete(tmp_path, cid)
+    manifest_rel = manifest_path(tmp_path).resolve().relative_to(tmp_path.resolve()).as_posix()
+    eval_rel = manifest_path(tmp_path).parent.resolve().relative_to(tmp_path.resolve()).as_posix()
+    assert ("file", manifest_rel) in events
+    assert ("dir", eval_rel) in events
+
+
 def test_register_member_rejects_a_changed_required_set(tmp_path):
     register_member(tmp_path, 1, [build_cell_id(1, 7, "random"), build_cell_id(1, 7, "mobility")])
     with pytest.raises(ManifestError):
