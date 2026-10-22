@@ -1248,7 +1248,10 @@ class _ReportCoalescer:
 
 
 def compare_liveness_throughput(
-    windows: Mapping[str, Any] | None, *, eval_device: str | None = None
+    windows: Mapping[str, Any] | None,
+    *,
+    eval_device: str | None = None,
+    throughput_counts: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Compare matched single-GPU off/on windows after a fixed game warmup.
 
@@ -1256,6 +1259,22 @@ def compare_liveness_throughput(
     hardware, config and seeds. Boundaries are monotonic seconds with completed
     games and learner-step counters after warmup and after measure_games games.
     This function validates recorded evidence; it does not run the A/B trial.
+
+    Args:
+        windows: The recorded harness_off/harness_on evidence, or ``None``.
+        eval_device: The harness's configured eval device the ON arm must use.
+        throughput_counts: The watched run's configured
+            ``{"warmup_games", "measure_games"}`` (design doc section 9 pin 11:
+            each arm discards ``throughput.warmup_games`` completions and times
+            the next ``throughput.measure_games``); the evidence's counts must
+            equal them exactly, so a shorter, transient window cannot pass.
+
+    Returns:
+        The throughput half of the liveness report.
+
+    Raises:
+        ValueError: If the evidence is unmatched, invalid, or measured with
+            counts other than the watched run's configured ones.
     """
     if windows is None:
         return {
@@ -1268,10 +1287,22 @@ def compare_liveness_throughput(
         warmup = windows["warmup_games"]
         measure = windows["measure_games"]
         if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 1
-            for value in (warmup, measure)
-        ):
-            raise ValueError("warmup_games and measure_games must be positive integers")
+            isinstance(value, bool) or not isinstance(value, int) for value in (warmup, measure)
+        ) or (warmup < 0 or measure < 1):
+            raise ValueError(
+                "warmup_games must be a non-negative and measure_games a positive integer"
+            )
+        if throughput_counts is None:
+            raise ValueError(
+                "the watched run's configured throughput counts are required to judge the A/B"
+            )
+        expected = (throughput_counts["warmup_games"], throughput_counts["measure_games"])
+        if (warmup, measure) != expected:
+            raise ValueError(
+                f"A/B counts warmup_games={warmup}, measure_games={measure} do not match the "
+                f"watched run's throughput.warmup_games={expected[0]}, "
+                f"throughput.measure_games={expected[1]}"
+            )
         off, on = windows["harness_off"], windows["harness_on"]
         for key in ("restored_checkpoint", "config_identity", "hardware_identity", "seeds"):
             if not off[key] or off[key] != on[key]:
@@ -1450,6 +1481,15 @@ class _MetricsTail:
         return rows
 
 
+def _stored_throughput_counts(run_dir) -> dict[str, int] | None:
+    """The watched run's configured A/B counts, or ``None`` with no stored config."""
+    try:
+        throughput = read_stored_config(run_dir).run.throughput
+    except FileNotFoundError:
+        return None
+    return {"warmup_games": throughput.warmup_games, "measure_games": throughput.measure_games}
+
+
 def _stored_eval_device(run_dir) -> str | None:
     try:
         return read_eval_provenance(run_dir).config.device
@@ -1490,7 +1530,11 @@ def build_liveness_report(
     eval_device = eval_device or _stored_eval_device(run_dir)
     if throughput_windows is not None:
         with _writer_lock(run_dir):
-            compare_liveness_throughput(throughput_windows, eval_device=eval_device)
+            compare_liveness_throughput(
+                throughput_windows,
+                eval_device=eval_device,
+                throughput_counts=_stored_throughput_counts(run_dir),
+            )
             _atomic_write_json(
                 eval_dir(run_dir) / "liveness-throughput.json", dict(throughput_windows)
             )
@@ -1515,6 +1559,7 @@ class _LivenessMonitor:
         self.run_dir = Path(run_dir)
         self.k_total = k_total
         self.eval_device = eval_device
+        self.throughput_counts = _stored_throughput_counts(run_dir)
         self.path = eval_dir(run_dir) / "liveness.jsonl"
         self.tail = _MetricsTail(run_dir, k_total)
         self.samples = []
@@ -1577,7 +1622,9 @@ class _LivenessMonitor:
     def report(self, *, write=True):
         throughput_path = eval_dir(self.run_dir) / "liveness-throughput.json"
         windows = json.loads(throughput_path.read_text()) if throughput_path.exists() else None
-        throughput = compare_liveness_throughput(windows, eval_device=self.eval_device)
+        throughput = compare_liveness_throughput(
+            windows, eval_device=self.eval_device, throughput_counts=self.throughput_counts
+        )
         ordered = sorted(self.samples, key=lambda sample: sample["published_version"])
         consecutive = 0
         breached = False
@@ -1594,6 +1641,8 @@ class _LivenessMonitor:
                 "max_lag": LIVENESS_MAX_LAG,
                 "breach_consecutive": LIVENESS_BREACH_CONSECUTIVE,
                 "max_throughput_degradation": LIVENESS_MAX_THROUGHPUT_DEGRADATION,
+                # Pin 11: the config-selected A/B counts, stamped beside the constants.
+                "throughput_counts": self.throughput_counts,
             },
             "observation_rule": LIVENESS_OBSERVATION_RULE,
             "samples": len(self.samples),

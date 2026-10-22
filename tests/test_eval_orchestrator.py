@@ -110,6 +110,7 @@ from core.run_identity import (
     LAUNCH_SCHEMA_VERSION,
     LaunchConfig,
     RunRecord,
+    read_stored_config,
     write_provenance,
 )
 from core.runconfig import MICRO_RUN_CONFIG_PATH
@@ -1836,6 +1837,7 @@ def test_liveness_samples_publishes_while_play_is_blocked(tmp_path, monkeypatch)
         "max_lag": 4,
         "breach_consecutive": 2,
         "max_throughput_degradation": 0.05,
+        "throughput_counts": {"warmup_games": 50, "measure_games": 200},
     }
 
 
@@ -1890,21 +1892,25 @@ def test_liveness_recovers_publish_time_lag_after_downtime(tmp_path):
     assert report["caught_up"] is True
 
 
-def _throughput_windows(on_duration=100):
+#: The counts ``_throughput_windows`` measures by default (unit tests pass them).
+_UNIT_COUNTS = {"warmup_games": 5, "measure_games": 10}
+
+
+def _throughput_windows(on_duration=100, *, warmup_games=5, measure_games=10):
     common = {
         "restored_checkpoint": "sha256:optimizer-replay",
         "config_identity": "sha256:config",
         "hardware_identity": "one-gpu-A100",
         "seeds": {"run": 9},
         "start_monotonic": 1000.0,
-        "start_completed_games": 5,
-        "end_completed_games": 15,
+        "start_completed_games": warmup_games,
+        "end_completed_games": warmup_games + measure_games,
         "start_learner_steps": 100,
         "end_learner_steps": 200,
     }
     return {
-        "warmup_games": 5,
-        "measure_games": 10,
+        "warmup_games": warmup_games,
+        "measure_games": measure_games,
         "harness_off": {**common, "end_monotonic": 1100.0, "eval_active": False},
         "harness_on": {
             **common,
@@ -1919,7 +1925,9 @@ def _throughput_windows(on_duration=100):
 
 @pytest.mark.parametrize("duration, breached", [(100, False), (100 / 0.95, False), (120, True)])
 def test_liveness_throughput_comparison_and_breach(duration, breached):
-    report = eval_run.compare_liveness_throughput(_throughput_windows(duration), eval_device="cpu")
+    report = eval_run.compare_liveness_throughput(
+        _throughput_windows(duration), eval_device="cpu", throughput_counts=_UNIT_COUNTS
+    )
     assert report["throughput_breached"] is breached
     assert report["throughput_degradation"] == pytest.approx(1 - 100 / duration)
     assert report["games_per_gpu_hour"]["harness_off"] == 360
@@ -1942,7 +1950,41 @@ def test_liveness_throughput_rejects_unmatched_or_invalid_evidence(field, value)
     windows = _throughput_windows()
     windows["harness_on"][field] = value
     with pytest.raises(ValueError):
-        eval_run.compare_liveness_throughput(windows, eval_device="cpu")
+        eval_run.compare_liveness_throughput(
+            windows, eval_device="cpu", throughput_counts=_UNIT_COUNTS
+        )
+
+
+@pytest.mark.parametrize("counts", [None, {"warmup_games": 50, "measure_games": 200}])
+def test_liveness_throughput_requires_the_configured_counts(counts):
+    with pytest.raises(ValueError):
+        eval_run.compare_liveness_throughput(
+            _throughput_windows(), eval_device="cpu", throughput_counts=counts
+        )
+
+
+def test_liveness_throughput_accepts_a_zero_configured_warmup():
+    windows = _throughput_windows(warmup_games=0)
+    counts = {"warmup_games": 0, "measure_games": 10}
+    report = eval_run.compare_liveness_throughput(
+        windows, eval_device="cpu", throughput_counts=counts
+    )
+    assert report["throughput_breached"] is False
+
+
+def test_liveness_report_rejects_counts_off_the_watched_run_config(tmp_path):
+    """Codex round 3: a 1/1 window must not pass against a stored 50/200 config."""
+    _build_watched_run(tmp_path, k_total=1)
+    stored = read_stored_config(tmp_path).run.throughput
+    assert (stored.warmup_games, stored.measure_games) == (50, 200)
+    windows = _throughput_windows(warmup_games=1, measure_games=1)
+    with pytest.raises(ValueError, match="throughput.warmup_games=50"):
+        eval_run.build_liveness_report(tmp_path, throughput_windows=windows, eval_device="cpu")
+    assert not (tmp_path / "eval" / "liveness-throughput.json").exists()
+    matched = _throughput_windows(warmup_games=50, measure_games=200)
+    report = eval_run.build_liveness_report(tmp_path, throughput_windows=matched, eval_device="cpu")
+    assert report["throughput_breached"] is False
+    assert report["constants"]["throughput_counts"] == {"warmup_games": 50, "measure_games": 200}
 
 
 def test_liveness_cli_records_and_reuses_counterfactual_evidence(tmp_path):
@@ -1950,7 +1992,14 @@ def test_liveness_cli_records_and_reuses_counterfactual_evidence(tmp_path):
     config = _eval_config(tmp_path)
     config_path = _write_eval_config_file(tmp_path / "eval-input.json", config)
     windows_path = tmp_path / "windows.json"
-    windows_path.write_text(json.dumps(_throughput_windows(120)))
+    stored = read_stored_config(tmp_path).run.throughput
+    windows_path.write_text(
+        json.dumps(
+            _throughput_windows(
+                120, warmup_games=stored.warmup_games, measure_games=stored.measure_games
+            )
+        )
+    )
     report = run_eval.cmd_liveness(config_path, windows_path)
     assert report["throughput_breached"] is True
     assert run_eval.cmd_liveness(config_path)["throughput_windows"] == report["throughput_windows"]
@@ -2016,13 +2065,17 @@ def test_liveness_on_arm_device_is_the_configured_device_not_a_literal():
     windows = _throughput_windows()
     windows["harness_on"]["eval_device"] = "cuda"
     assert (
-        eval_run.compare_liveness_throughput(windows, eval_device="cuda")["throughput_breached"]
+        eval_run.compare_liveness_throughput(
+            windows, eval_device="cuda", throughput_counts=_UNIT_COUNTS
+        )["throughput_breached"]
         is False
     )
     with pytest.raises(ValueError, match="configured eval device"):
-        eval_run.compare_liveness_throughput(windows, eval_device="cpu")
+        eval_run.compare_liveness_throughput(
+            windows, eval_device="cpu", throughput_counts=_UNIT_COUNTS
+        )
     with pytest.raises(ValueError, match="configured eval device"):
-        eval_run.compare_liveness_throughput(windows)
+        eval_run.compare_liveness_throughput(windows, throughput_counts=_UNIT_COUNTS)
 
 
 def test_liveness_report_stamps_observation_rule_and_interval_series(tmp_path):
