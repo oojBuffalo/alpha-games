@@ -39,6 +39,7 @@ from core.eval_stats import (
     PLATEAU_OUTCOME_PLATEAU,
     MannKendallResult,
     PlateauResult,
+    _resample_cell,
     bootstrap_replicate,
     bootstrap_replicate_matches,
     bootstrap_replicates,
@@ -102,7 +103,9 @@ def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=f"rung{rung}-v1-{candidate_version}",
         opponent_identity=opponent_id,
-        eval_config={"pairs_per_cell": n_pairs},
+        # Production writers stamp S on every cell (rung 5 included); the
+        # authority gate requires it rather than defaulting a missing key.
+        eval_config={"pairs_per_cell": n_pairs, "eval_sims": eval_protocol.EVAL_SIMS},
         candidate_fingerprint={"orientation_table_hash": "test"},
     )
 
@@ -607,6 +610,105 @@ def test_different_replicate_indices_give_different_resamples(tmp_path):
     agent_pairs = {(m[0], m[1]) for matches in matches_by_b for m in matches}
     assert len(agent_pairs) == 3  # the fixture's 3 cells: rung5-v1-1, rung7-v1-1, rung7-v1-2
     assert len({tuple(sorted(m[2] for m in matches)) for matches in matches_by_b}) > 1
+
+
+def test_resample_cell_freezes_the_rng_choices_draw_stream():
+    """Pin 7's RNG API golden: one ``rng.choices(records, k=len(records))`` call.
+
+    The literal is ``random.Random(42).choices(range(8), k=8)``; a substituted
+    ``randrange`` loop (forbidden by pin 7) draws ``[1, 0, 4, 3, 3, 2, 1, 1]``
+    from the same seed instead, and the protocol fingerprint cannot see that
+    change (pin 10 (iii)), so only this behavioral golden catches it.
+    """
+    assert _resample_cell(random.Random(42), list(range(8))) == [5, 0, 2, 1, 5, 5, 7, 0]
+    assert _resample_cell(random.Random(42), []) == []
+
+
+def _write_bootstrap_golden_fixture(tmp_path):
+    """Four cells with distinct pair counts and non-sorted stored record order.
+
+    Member 2 registers its rung-7 cell before its rung-6 cell, so the sorted
+    cell-id order (``rung5-v1-1``, ``rung6-v1-2``, ``rung7-v1-1``, ``rung7-v1-2``)
+    differs from write order and a draw stream threaded in any other order gives
+    different per-cell scores.
+    """
+    _write_member(
+        tmp_path,
+        1,
+        [
+            (5, "random", [0.0, 0.5, 1.0, 1.5, 2.0]),
+            (7, "random", [2.0, 0.0, 1.5]),
+        ],
+    )
+    _write_member(
+        tmp_path,
+        2,
+        [
+            (7, "random", [1.0, 2.0, 0.5, 0.0]),
+            (6, "random", [0.5, 1.5]),
+        ],
+    )
+
+
+#: Literal per-replicate resampled matches for ``bootstrap_seed(4242)`` over
+#: :func:`_write_bootstrap_golden_fixture`. Computed independently of
+#: ``core.eval_stats`` with the stdlib alone: ``r = random.Random(seed_b)``, then
+#: for each cell in sorted cell-id order, in stored record order, ``len(cell)``
+#: draws of ``cell[floor(r.random() * len(cell))]`` (``rng.choices``'s documented
+#: unweighted draw), summed; ``seed_b`` is the literal replicate seed below.
+_BOOTSTRAP_GOLDEN_SEED = 1216689030403964738
+_BOOTSTRAP_GOLDEN_REPLICATE_SEEDS = [
+    6987118541137574488,
+    3456750918384432057,
+    17900443320874302275,
+    7921296321871204474,
+]
+_BOOTSTRAP_GOLDEN_MATCHES = [
+    [
+        ("rung5-v1-1", "random", 6.5, 10),
+        ("rung6-v1-2", "random", 3.0, 4),
+        ("rung7-v1-1", "random", 3.5, 6),
+        ("rung7-v1-2", "random", 4.0, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 3.5, 10),
+        ("rung6-v1-2", "random", 1.0, 4),
+        ("rung7-v1-1", "random", 5.0, 6),
+        ("rung7-v1-2", "random", 3.5, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 5.5, 10),
+        ("rung6-v1-2", "random", 2.0, 4),
+        ("rung7-v1-1", "random", 0.0, 6),
+        ("rung7-v1-2", "random", 0.0, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 6.0, 10),
+        ("rung6-v1-2", "random", 3.0, 4),
+        ("rung7-v1-1", "random", 3.5, 6),
+        ("rung7-v1-2", "random", 3.0, 8),
+    ],
+]
+
+
+def test_bootstrap_replicate_matches_freeze_the_pinned_draw_stream(tmp_path):
+    """Pin 7 / pin 10 (iii) behavioral golden for the whole resampling stream.
+
+    Freezes, against literals rather than a second call into the same resampler:
+    the bootstrap and per-replicate seed derivations, the sorted cell-id
+    iteration order, the stored per-cell record order, and the
+    ``rng.choices`` draw stream -- exact scores and game counts per cell.
+    """
+    _write_bootstrap_golden_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(4242)
+    assert seed == _BOOTSTRAP_GOLDEN_SEED
+    assert [
+        derive_seed(seed, eval_protocol.SEED_LABEL_REPLICATE, b) for b in range(4)
+    ] == _BOOTSTRAP_GOLDEN_REPLICATE_SEEDS
+
+    for b, expected in enumerate(_BOOTSTRAP_GOLDEN_MATCHES):
+        assert bootstrap_replicate_matches(snapshot, seed, b) == expected
 
 
 def test_warm_start_replicate_refit_matches_cold_start_within_fit_tolerance(tmp_path):
@@ -1214,7 +1316,7 @@ def test_all_statistical_conventions_are_hashed():
         assert eval_protocol.REGISTRY[key] == value
 
 
-def test_eval_config_serializes_and_checks_protocol_stamps():
+def test_eval_config_serializes_and_records_protocol_stamps():
     from core.runconfig import RunConfig, load_run_config
 
     config = load_run_config()
@@ -1222,9 +1324,53 @@ def test_eval_config_serializes_and_checks_protocol_stamps():
     assert raw["evaluation"]["protocol_version"] == eval_protocol.PROTOCOL_VERSION
     assert raw["evaluation"]["protocol_fingerprint"] == eval_protocol.protocol_fingerprint()
     assert RunConfig.from_dict(raw) == config
+    # A stamp from an older registry is a record: read and re-serialized verbatim,
+    # never rejected and never relabeled with the live fingerprint.
     raw["evaluation"]["protocol_fingerprint"] = "old"
-    with pytest.raises(ValueError, match="stored protocol"):
+    stale = RunConfig.from_dict(raw)
+    assert stale.evaluation.protocol_fingerprint == "old"
+    assert stale.to_dict() == raw
+    raw["evaluation"]["protocol_fingerprint"] = ""
+    with pytest.raises(ValueError, match="protocol_fingerprint"):
         RunConfig.from_dict(raw)
+    raw["evaluation"]["protocol_fingerprint"] = 7
+    with pytest.raises(TypeError, match="protocol_fingerprint"):
+        RunConfig.from_dict(raw)
+
+
+def test_stale_eval_stamp_does_not_block_resume_fork_or_verdict(tmp_path):
+    """An additive REGISTRY change must not make a training run's config unreadable.
+
+    Simulates a run whose ``config.json`` was stamped before a registry addition:
+    ``read_stored_config`` (the entry point of resume, fork, verify and
+    verdict) still loads it, and the stamp difference is classified non-material.
+    """
+    from core.run_identity import CONFIG_FILENAME, read_stored_config, resolve_resume
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    path = tmp_path / CONFIG_FILENAME
+    stored = json.loads(path.read_text())
+    stored["evaluation"]["protocol_fingerprint"] = "pre-registry-addition"
+    path.write_text(json.dumps(stored))
+
+    loaded = read_stored_config(tmp_path)
+    assert loaded.run.evaluation.protocol_fingerprint == "pre-registry-addition"
+    current = LaunchConfig.from_dict(
+        {
+            **stored,
+            "evaluation": {
+                k: v for k, v in stored["evaluation"].items() if not k.startswith("protocol_")
+            },
+        }
+    )
+    resolution = resolve_resume(tmp_path, current)
+    assert resolution.non_material_diff["evaluation.protocol_fingerprint"] == (
+        "pre-registry-addition",
+        eval_protocol.protocol_fingerprint(),
+    )
+    assert build_verdict(tmp_path, B=39)["checkpoints_evaluated"] == 1
 
 
 # =======================================================================
@@ -2118,16 +2264,20 @@ def test_elo_curve_accepts_resolved_alias_of_snapshot_run(tmp_path):
     )
 
 
-@pytest.mark.parametrize("budget", [128, 512])
+@pytest.mark.parametrize("budget", [128, 512, None])
 def test_source_search_settings_control_verdict_authority(tmp_path, budget):
-    identity = "rung7-v1-1" if budget == 512 else f"rung7-v1-s{budget}-1"
+    # ``None`` = a header with no ``eval_sims`` key: it must not read as production S.
+    identity = "rung7-v1-1" if budget in (512, None) else f"rung7-v1-s{budget}-1"
+    eval_config = {"pairs_per_cell": 24}
+    if budget is not None:
+        eval_config["eval_sims"] = budget
     header = build_header(
         run_id="run",
         cell_id=CellId(1, 7, "random", full_candidate_identity=identity),
         candidate_identity=identity,
         opponent_identity="random",
         candidate_fingerprint={"orientation_table_hash": "test"},
-        eval_config={"pairs_per_cell": 24, "eval_sims": budget},
+        eval_config=eval_config,
         cell_seed=0,
     )
     register_member(tmp_path, 1, [header.cell_id.to_string()])
@@ -2193,3 +2343,73 @@ def test_production_identity_requires_full_bare_v1_network_names(identity, expec
     from core.eval_artifacts import _production_identity
 
     assert _production_identity(identity) is expected
+
+
+def test_complete_prefix_missing_final_rung7_rating_yields_no_delta(tmp_path):
+    """Pin 8: a complete member prefix whose final member carries no rung-7
+    cell is not the complete K-set -- ``delta_hat`` must never silently run
+    over a shorter curve (Codex round 2 repro: K=3, member 3 rung-5 only)."""
+    _write_member(tmp_path, 1, [(7, "random", [0.0] * 24)])
+    _write_member(tmp_path, 2, [(7, "random", [2.0] * 24)])
+    _write_member(tmp_path, 3, [(5, "random", [1.0] * 24)])
+    _write_checkpoint_markers(tmp_path, [1, 2, 3])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=7)
+
+    payload = build_verdict(tmp_path, B=1999)
+
+    assert payload["checkpoints_evaluated"] == payload["k_target"] == 3
+    assert [row["model_version"] for row in payload["per_checkpoint"]] == [1, 2]
+    assert payload["authoritative"] is False
+    assert payload["delta"] is None
+    assert "[3]" in payload["reason"] and "rung-7" in payload["reason"]
+    assert not _find_key(payload, "gate")
+
+
+def test_verdict_curve_hash_survives_an_interleaved_curve_publication(tmp_path, monkeypatch):
+    """Pin 9: another publisher replacing the shared ``elo_curve.json`` between
+    this verdict's curve write and its hash must not rebind the verdict's curve
+    reference to a different snapshot."""
+    import hashlib
+
+    from core import eval_artifacts
+    from core.eval_artifacts import elo_curve_artifact_path
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=11)
+
+    real_write = eval_artifacts._write_blob
+    interleaved = {"done": False}
+
+    def _write_then_interleave(path, blob):
+        real_write(path, blob)
+        if path == elo_curve_path(tmp_path) and not interleaved["done"]:
+            interleaved["done"] = True
+            _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+            elo_curve(tmp_path, load_snapshot(tmp_path))  # a concurrent publisher
+
+    monkeypatch.setattr(eval_artifacts, "_write_blob", _write_then_interleave)
+    verdict = build_verdict(tmp_path, B=39)
+    assert interleaved["done"]
+
+    assert verdict["checkpoints_evaluated"] == 1
+    artifact = elo_curve_artifact_path(tmp_path, verdict["elo_curve_fingerprint"])
+    assert artifact.name == verdict["elo_curve_artifact"]
+    artifact_bytes = artifact.read_bytes()
+    assert hashlib.sha256(artifact_bytes).hexdigest() == verdict["elo_curve_fingerprint"]
+    referenced = json.loads(artifact_bytes)
+    assert referenced["snapshot_fingerprint"] == verdict["evidence_fingerprint"]
+    assert [row["model_version"] for row in referenced["rows"]] == [1]
+
+    # The shared path now holds the newer snapshot's curve, which must not
+    # verify under this verdict's hash.
+    shared = elo_curve_path(tmp_path).read_bytes()
+    assert len(json.loads(shared)["rows"]) == 2
+    assert hashlib.sha256(shared).hexdigest() != verdict["elo_curve_fingerprint"]
+
+
+def test_elo_curve_artifact_path_rejects_non_digest_names(tmp_path):
+    from core.eval_artifacts import elo_curve_artifact_path
+
+    with pytest.raises(ValueError, match="hex digest"):
+        elo_curve_artifact_path(tmp_path, "../verdict")
