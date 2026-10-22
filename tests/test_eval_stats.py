@@ -34,6 +34,7 @@ from core.eval_protocol import BOOTSTRAP_B_PRODUCTION
 from core.eval_stats import (
     ANCHOR_AGENT,
     MannKendallResult,
+    _resample_cell,
     bootstrap_replicate,
     bootstrap_replicate_matches,
     bootstrap_replicates,
@@ -603,6 +604,105 @@ def test_different_replicate_indices_give_different_resamples(tmp_path):
     agent_pairs = {(m[0], m[1]) for matches in matches_by_b for m in matches}
     assert len(agent_pairs) == 3  # the fixture's 3 cells: rung5-v1-1, rung7-v1-1, rung7-v1-2
     assert len({tuple(sorted(m[2] for m in matches)) for matches in matches_by_b}) > 1
+
+
+def test_resample_cell_freezes_the_rng_choices_draw_stream():
+    """Pin 7's RNG API golden: one ``rng.choices(records, k=len(records))`` call.
+
+    The literal is ``random.Random(42).choices(range(8), k=8)``; a substituted
+    ``randrange`` loop (forbidden by pin 7) draws ``[1, 0, 4, 3, 3, 2, 1, 1]``
+    from the same seed instead, and the protocol fingerprint cannot see that
+    change (pin 10 (iii)), so only this behavioral golden catches it.
+    """
+    assert _resample_cell(random.Random(42), list(range(8))) == [5, 0, 2, 1, 5, 5, 7, 0]
+    assert _resample_cell(random.Random(42), []) == []
+
+
+def _write_bootstrap_golden_fixture(tmp_path):
+    """Four cells with distinct pair counts and non-sorted stored record order.
+
+    Member 2 registers its rung-7 cell before its rung-6 cell, so the sorted
+    cell-id order (``rung5-v1-1``, ``rung6-v1-2``, ``rung7-v1-1``, ``rung7-v1-2``)
+    differs from write order and a draw stream threaded in any other order gives
+    different per-cell scores.
+    """
+    _write_member(
+        tmp_path,
+        1,
+        [
+            (5, "random", [0.0, 0.5, 1.0, 1.5, 2.0]),
+            (7, "random", [2.0, 0.0, 1.5]),
+        ],
+    )
+    _write_member(
+        tmp_path,
+        2,
+        [
+            (7, "random", [1.0, 2.0, 0.5, 0.0]),
+            (6, "random", [0.5, 1.5]),
+        ],
+    )
+
+
+#: Literal per-replicate resampled matches for ``bootstrap_seed(4242)`` over
+#: :func:`_write_bootstrap_golden_fixture`. Computed independently of
+#: ``core.eval_stats`` with the stdlib alone: ``r = random.Random(seed_b)``, then
+#: for each cell in sorted cell-id order, in stored record order, ``len(cell)``
+#: draws of ``cell[floor(r.random() * len(cell))]`` (``rng.choices``'s documented
+#: unweighted draw), summed; ``seed_b`` is the literal replicate seed below.
+_BOOTSTRAP_GOLDEN_SEED = 1216689030403964738
+_BOOTSTRAP_GOLDEN_REPLICATE_SEEDS = [
+    6987118541137574488,
+    3456750918384432057,
+    17900443320874302275,
+    7921296321871204474,
+]
+_BOOTSTRAP_GOLDEN_MATCHES = [
+    [
+        ("rung5-v1-1", "random", 6.5, 10),
+        ("rung6-v1-2", "random", 3.0, 4),
+        ("rung7-v1-1", "random", 3.5, 6),
+        ("rung7-v1-2", "random", 4.0, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 3.5, 10),
+        ("rung6-v1-2", "random", 1.0, 4),
+        ("rung7-v1-1", "random", 5.0, 6),
+        ("rung7-v1-2", "random", 3.5, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 5.5, 10),
+        ("rung6-v1-2", "random", 2.0, 4),
+        ("rung7-v1-1", "random", 0.0, 6),
+        ("rung7-v1-2", "random", 0.0, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 6.0, 10),
+        ("rung6-v1-2", "random", 3.0, 4),
+        ("rung7-v1-1", "random", 3.5, 6),
+        ("rung7-v1-2", "random", 3.0, 8),
+    ],
+]
+
+
+def test_bootstrap_replicate_matches_freeze_the_pinned_draw_stream(tmp_path):
+    """Pin 7 / pin 10 (iii) behavioral golden for the whole resampling stream.
+
+    Freezes, against literals rather than a second call into the same resampler:
+    the bootstrap and per-replicate seed derivations, the sorted cell-id
+    iteration order, the stored per-cell record order, and the
+    ``rng.choices`` draw stream -- exact scores and game counts per cell.
+    """
+    _write_bootstrap_golden_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(4242)
+    assert seed == _BOOTSTRAP_GOLDEN_SEED
+    assert [
+        derive_seed(seed, eval_protocol.SEED_LABEL_REPLICATE, b) for b in range(4)
+    ] == _BOOTSTRAP_GOLDEN_REPLICATE_SEEDS
+
+    for b, expected in enumerate(_BOOTSTRAP_GOLDEN_MATCHES):
+        assert bootstrap_replicate_matches(snapshot, seed, b) == expected
 
 
 def test_warm_start_replicate_refit_matches_cold_start_within_fit_tolerance(tmp_path):
