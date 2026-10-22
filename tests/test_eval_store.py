@@ -13,6 +13,7 @@ import dataclasses
 import json
 import math
 import random
+from pathlib import Path
 
 import pytest
 
@@ -879,3 +880,45 @@ def test_legacy_schema_rejected_before_missing_seed_parse(tmp_path):
         read_cell(path)
     with pytest.raises(SchemaVersionError):
         open_cell_for_resume(path, header)
+
+
+def test_new_store_directories_are_persisted_in_their_parents_before_use(tmp_path, monkeypatch):
+    """Each directory the store creates is fsynced into its parent before contents.
+
+    ``mkdir`` alone does not survive a power loss until the parent is fsynced, so
+    ``eval/`` must be persisted in ``run_dir`` and ``cells/`` in ``eval/`` before
+    any durable write inside them is acknowledged.
+    """
+    import core.eval_store as store
+
+    events: list[tuple[str, str]] = []
+    real_fsync_dir = store._fsync_directory
+    real_fsync = store.os.fsync
+
+    def record_dir(path):
+        events.append(("dir", Path(path).resolve().relative_to(tmp_path.resolve()).as_posix()))
+        real_fsync_dir(path)
+
+    def record_file(fd):
+        events.append(("file", ""))
+        real_fsync(fd)
+
+    header = _make_header(eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1})
+    cid = header.cell_id.to_string()
+    with monkeypatch.context() as m:
+        m.setattr(store, "_fsync_directory", record_dir)
+        m.setattr(store.os, "fsync", record_file)
+        register_member(tmp_path, header.cell_id.candidate_version, [cid])
+        assert open_cell_for_write(tmp_path, header) == 0
+        append_pair_record(cell_path(tmp_path, cid), _flat_record(0))
+        complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+
+    dir_syncs = [name for kind, name in events if kind == "dir"]
+    # eval/ is created on first registration: run_dir is synced before anything else.
+    assert events[0] == ("dir", ".")
+    # cells/ is created by the first header: eval/ is synced after cells/ exists and
+    # before the header file's own fsync is acknowledged by its directory sync.
+    cells_sync = dir_syncs.index("eval/cells")
+    assert "eval" in dir_syncs[1:cells_sync]
+    assert dir_syncs.count(".") == 1  # existing directories are not re-synced

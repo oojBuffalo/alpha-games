@@ -624,7 +624,7 @@ def write_header(path: Path, header: CellHeader) -> None:
         FileExistsError: If ``path`` already exists -- use :func:`open_cell_for_resume`
             (or :func:`open_cell_for_write`) for an existing cell.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_durable_dirs(path.parent)
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     try:
         with open(tmp, "x", encoding="utf-8") as fh:
@@ -659,9 +659,35 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _make_durable_dirs(path: Path) -> None:
+    """Create ``path`` and any missing ancestors, persisting each new entry.
+
+    ``mkdir`` alone does not make the new directory entry durable: until its
+    *parent* is fsynced, a power loss can drop the directory (and every fsynced
+    file inside it). Each directory created here therefore has its parent fsynced
+    before returning, so later fsynced writes inside ``path`` are reachable after
+    a crash.
+
+    Args:
+        path: The directory that must exist (durably) on return.
+    """
+    path = Path(path)
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists():
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            pass  # a concurrent creator won; still persist the entry below
+        _fsync_directory(directory.parent)
+
+
 @contextmanager
 def _store_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_durable_dirs(path.parent)
     with open(path, "a+b") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -893,7 +919,7 @@ def _atomic_write_manifest(run_dir: Path | str, payload: dict[str, Any]) -> None
     ``core.replay_shard`` use for their own replaceable artifacts).
     """
     path = manifest_path(run_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_durable_dirs(path.parent)
     tmp_path = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
     try:
         with open(tmp_path, "w", encoding="utf-8") as fh:
