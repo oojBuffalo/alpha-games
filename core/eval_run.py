@@ -66,6 +66,7 @@ mirroring exactly how ``games.registry.build_game_factory`` resolves a
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -97,12 +98,13 @@ from core.eval_protocol import (
     LIVENESS_BREACH_CONSECUTIVE,
     LIVENESS_MAX_LAG,
     LIVENESS_MAX_THROUGHPUT_DEGRADATION,
+    LIVENESS_OBSERVATION_RULE_VERSION,
     PROTOCOL_VERSION,
     RUNG8_EARLIEST_VERSION,
     RUNG8_LAG_DIVISOR,
     protocol_fingerprint,
 )
-from core.eval_stats import _validate_admissible_B
+from core.eval_stats import _validate_admissible_B, elo_curve_path, verdict_path
 from core.eval_store import (
     CellId,
     _read_manifest,
@@ -121,8 +123,8 @@ from core.eval_store import (
 )
 from core.game import Game
 from core.mcts import Evaluator
-from core.metrics import iter_epoch_records, list_procs
-from core.observability import CHECKPOINT_PUBLISHED_KIND
+from core.metrics import _EPOCH_PATTERN, list_procs, metrics_dir
+from core.observability import CHECKPOINT_PUBLISHED_KIND, KIND_DELTA, SERIES_GAMES_COMPLETED
 from core.replay_shard import _atomic_write_json
 from core.run_identity import read_run_record, read_stored_config
 from core.runconfig import _check_keys, _int, _non_empty, _positive, _str
@@ -1113,47 +1115,85 @@ class WatchLoopResult:
     stopped_reason: str
 
 
+class EvalWriterBusyError(ValueError):
+    """Raised when another live process already holds the eval namespace's writer lock."""
+
+
+@contextmanager
+def _writer_lock(run_dir):
+    """Hold the eval namespace's process-scoped, non-blocking writer lock.
+
+    Raises:
+        EvalWriterBusyError: If another process already holds it.
+    """
+    # Reject family roots before creating any eval artifacts.
+    read_run_record(run_dir)
+    read_stored_config(run_dir)
+    directory = eval_dir(run_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".writer.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise EvalWriterBusyError(f"eval writer already running for {run_dir}") from None
+        lock.seek(0)
+        lock.truncate()
+        lock.write(str(os.getpid()))
+        lock.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _exclusive_writer(function):
     """Hold a process-scoped, non-blocking lock through provenance and all writes."""
 
     @wraps(function)
     def locked(run_dir, *args, **kwargs):
-        # Reject family roots before creating any eval artifacts.
-        read_run_record(run_dir)
-        read_stored_config(run_dir)
-        directory = eval_dir(run_dir)
-        directory.mkdir(parents=True, exist_ok=True)
-        with (directory / ".writer.lock").open("a+") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise ValueError(f"eval writer already running for {run_dir}") from None
-            lock.seek(0)
-            lock.truncate()
-            lock.write(str(os.getpid()))
-            lock.flush()
-            try:
-                return function(run_dir, *args, **kwargs)
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        with _writer_lock(run_dir):
+            return function(run_dir, *args, **kwargs)
 
     return locked
 
 
-def _try_report(version, callback, reported):
-    if callback is None or version in reported:
-        return
-    try:
-        callback(version)
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "eval report failed for member %s; retrying on next poll/relaunch", version
-        )
-    else:
-        reported.add(version)
+class _ReportCoalescer:
+    """Call the report hook at most once per run of already-complete members.
+
+    A member that becomes (or already is) complete only *marks* the report
+    pending; the hook fires when play is about to start on a later member or
+    at the end of a poll, for the newest pending member only. A relaunch over
+    ``N`` already-complete members, or ``N`` members completed during one
+    downtime, therefore costs one report regeneration rather than ``N``.
+    A failed hook is logged and retried at the next flush.
+    """
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.pending = None
+        self.reported_through = 0
+
+    def mark(self, version):
+        if self.callback is not None and version > self.reported_through:
+            self.pending = version if self.pending is None else max(self.pending, version)
+
+    def flush(self):
+        version, self.pending = self.pending, None
+        if version is None or version <= self.reported_through:
+            return
+        try:
+            self.callback(version)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "eval report failed for member %s; retrying on next poll/relaunch", version
+            )
+        else:
+            self.reported_through = version
 
 
-def compare_liveness_throughput(windows: Mapping[str, Any] | None) -> dict[str, Any]:
+def compare_liveness_throughput(
+    windows: Mapping[str, Any] | None, *, eval_device: str | None = None
+) -> dict[str, Any]:
     """Compare matched single-GPU off/on windows after a fixed game warmup.
 
     Both trials restore the same immutable checkpoint/optimizer/replay state,
@@ -1182,8 +1222,13 @@ def compare_liveness_throughput(windows: Mapping[str, Any] | None) -> dict[str, 
                 raise ValueError(f"off/on {key} must identify the same restored trial conditions")
         if off["eval_active"] is not False or on["eval_active"] is not True:
             raise ValueError("eval must be idle OFF and active throughout ON")
-        if on["eval_sims"] != EVAL_SIMS or on["eval_device"] != "cpu":
-            raise ValueError("ON window must use production eval_sims=512 and device=cpu")
+        if eval_device is None:
+            raise ValueError("the harness's configured eval device is required to judge the ON arm")
+        if on["eval_sims"] != EVAL_SIMS or on["eval_device"] != eval_device:
+            raise ValueError(
+                f"ON window must use production eval_sims={EVAL_SIMS} and the configured "
+                f"eval device {eval_device!r}"
+            )
         if not on["eval_checkpoint"]:
             raise ValueError("ON window must identify its fixed eval checkpoint")
         rates = {}
@@ -1236,41 +1281,214 @@ def compare_liveness_throughput(windows: Mapping[str, Any] | None) -> dict[str, 
     }
 
 
-@_exclusive_writer
+#: The versioned observation rules stamped onto every liveness report (pin 10's
+#: stated exception; pin 11's sampling and window rules, in words).
+LIVENESS_OBSERVATION_RULE = {
+    "version": LIVENESS_OBSERVATION_RULE_VERSION,
+    "lag": (
+        "newest published member minus the snapshot's complete-member prefix as of "
+        "each checkpoint_published marker, one sample per member publish; breach = "
+        "lag > max_lag at breach_consecutive consecutive samples; lag must reach 0 "
+        "after training ends"
+    ),
+    "throughput": (
+        "paired A/B from one restored learner checkpoint: OFF (harness idle) then ON "
+        "(harness playing at production S on its configured device); each arm "
+        "discards warmup_games completed games, then times exactly measure_games; "
+        "degradation = 1 - ON_rate/OFF_rate, breach strictly above "
+        "max_throughput_degradation"
+    ),
+    "in_run_series": (
+        "per-publish-interval games_per_hour and learner_steps_per_sec, for "
+        "monitoring only; the throughput bound is judged on the A/B alone"
+    ),
+}
+
+
+class _MetricsTail:
+    """Incrementally read the watched run's metrics files, one complete line at a time.
+
+    Each epoch file is read from a remembered byte offset, so a tick parses only
+    newly appended bytes. A trailing line without its newline (a live writer's
+    append in flight) is left for the next read rather than parsed torn.
+    """
+
+    def __init__(self, run_dir, k_total):
+        self.run_dir = Path(run_dir)
+        self.k_total = k_total
+        self.offsets: dict[Path, int] = {}
+        self.markers: dict[int, dict[str, Any]] = {}
+        self.game_deltas: list[tuple[float, float]] = []
+
+    def poll(self) -> _MetricsTail:
+        directory = metrics_dir(self.run_dir)
+        if not directory.exists():
+            return self
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or _EPOCH_PATTERN.match(path.name) is None:
+                continue
+            offset = self.offsets.get(path, 0)
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                chunk = stream.read()
+            end = chunk.rfind(b"\n") + 1
+            if end == 0:
+                continue
+            self.offsets[path] = offset + end
+            for line in chunk[:end].splitlines():
+                if line.strip():
+                    try:
+                        self._ingest(json.loads(line))
+                    except (ValueError, KeyError, TypeError):
+                        logging.getLogger(__name__).warning(
+                            "skipping malformed metrics line in %s", path
+                        )
+        return self
+
+    def _ingest(self, record):
+        kind = record.get("kind")
+        if kind == CHECKPOINT_PUBLISHED_KIND:
+            version = record["model_version"]
+            if 1 <= version <= self.k_total:
+                known = self.markers.get(version)
+                if known is None or record["timestamp"] < known["timestamp"]:
+                    self.markers[version] = {
+                        "timestamp": record["timestamp"],
+                        "learner_step": record.get("learner_step"),
+                    }
+        elif kind == KIND_DELTA and record.get("series") == SERIES_GAMES_COMPLETED:
+            self.game_deltas.append((record["timestamp"], record["value"]))
+
+    def publish_timestamps(self) -> dict[int, float]:
+        return {version: marker["timestamp"] for version, marker in self.markers.items()}
+
+    def interval_series(self) -> list[dict[str, Any]]:
+        """Per-publish-interval throughput between consecutive published members."""
+        rows = []
+        versions = sorted(self.markers)
+        for previous, current in zip(versions, versions[1:], strict=False):
+            start, end = self.markers[previous], self.markers[current]
+            seconds = end["timestamp"] - start["timestamp"]
+            games = sum(
+                value
+                for timestamp, value in self.game_deltas
+                if start["timestamp"] < timestamp <= end["timestamp"]
+            )
+            steps = (
+                end["learner_step"] - start["learner_step"]
+                if isinstance(start["learner_step"], int) and isinstance(end["learner_step"], int)
+                else None
+            )
+            defined = math.isfinite(seconds) and seconds > 0
+            rows.append(
+                {
+                    "from_version": previous,
+                    "to_version": current,
+                    "interval_seconds": seconds,
+                    "games_per_hour": 3600 * games / seconds if defined else None,
+                    "learner_steps_per_sec": (
+                        steps / seconds if defined and steps is not None else None
+                    ),
+                }
+            )
+        return rows
+
+
+def _stored_eval_device(run_dir) -> str | None:
+    try:
+        return read_eval_provenance(run_dir).config.device
+    except FileNotFoundError:
+        return None
+
+
 def build_liveness_report(
-    run_dir: Path | str, *, throughput_windows: Mapping[str, Any] | None = None
+    run_dir: Path | str,
+    *,
+    throughput_windows: Mapping[str, Any] | None = None,
+    eval_device: str | None = None,
 ) -> dict[str, Any]:
-    """Refresh the liveness report, optionally recording matched off/on evidence."""
+    """Return the liveness report, refreshing ``liveness.json`` when no harness is live.
+
+    Reading never needs the writer lock: while a harness holds it, the report is
+    computed from the harness's own durable ``liveness.jsonl`` samples (which
+    the live harness also refreshes into ``liveness.json`` at every publish)
+    and nothing is written. Recording matched off/on evidence is a write and
+    takes the lock.
+
+    Args:
+        run_dir: The watched run's root directory.
+        throughput_windows: Optional matched harness_off/harness_on evidence to
+            validate and record (requires that no harness is live).
+        eval_device: The harness's configured device, which the ON arm must
+            match; defaults to the stored eval provenance's device.
+
+    Returns:
+        The liveness payload.
+
+    Raises:
+        EvalWriterBusyError: If ``throughput_windows`` is given while a harness
+            holds the writer lock.
+    """
+    run_dir = Path(run_dir)
+    k_total = watched_k_total(run_dir)
+    eval_device = eval_device or _stored_eval_device(run_dir)
     if throughput_windows is not None:
-        compare_liveness_throughput(throughput_windows)
-        _atomic_write_json(eval_dir(run_dir) / "liveness-throughput.json", dict(throughput_windows))
-    monitor = _LivenessMonitor(Path(run_dir), watched_k_total(run_dir))
-    monitor.sample()
-    return monitor.report()
+        with _writer_lock(run_dir):
+            compare_liveness_throughput(throughput_windows, eval_device=eval_device)
+            _atomic_write_json(
+                eval_dir(run_dir) / "liveness-throughput.json", dict(throughput_windows)
+            )
+            monitor = _LivenessMonitor(run_dir, k_total, eval_device=eval_device)
+            monitor.sample()
+            return monitor.report()
+    try:
+        with _writer_lock(run_dir):
+            monitor = _LivenessMonitor(run_dir, k_total, eval_device=eval_device)
+            monitor.sample()
+            return monitor.report()
+    except EvalWriterBusyError:
+        return _LivenessMonitor(run_dir, k_total, eval_device=eval_device, read_only=True).report(
+            write=False
+        )
 
 
 class _LivenessMonitor:
     """Observe every newly published member while game play blocks the writer."""
 
-    def __init__(self, run_dir, k_total):
-        self.run_dir = run_dir
+    def __init__(self, run_dir, k_total, *, eval_device=None, read_only=False):
+        self.run_dir = Path(run_dir)
         self.k_total = k_total
+        self.eval_device = eval_device
         self.path = eval_dir(run_dir) / "liveness.jsonl"
+        self.tail = _MetricsTail(run_dir, k_total)
         self.samples = []
         if self.path.exists():
-            self.samples = [json.loads(line) for line in self.path.read_text().splitlines()]
+            raw = self.path.read_bytes()
+            complete = raw[: raw.rfind(b"\n") + 1]
+            if not read_only and len(complete) != len(raw):
+                # A crash mid-append left a torn final sample: drop it so the
+                # next append starts on a fresh line; it is re-sampled below.
+                with self.path.open("r+b") as stream:
+                    stream.truncate(len(complete))
+            self.samples = [json.loads(line) for line in complete.splitlines() if line.strip()]
         self.seen = {sample["published_version"] for sample in self.samples}
 
-    def sample(self):
-        markers = _publish_timestamps(self.run_dir, self.k_total)
+    def sample(self) -> int:
+        """Record a sample for each newly published member; return how many."""
+        if len(self.seen) >= self.k_total:
+            return 0
+        unseen = [v for v in schedulable_versions(self.run_dir, self.k_total) if v not in self.seen]
+        if not unseen:
+            return 0
+        markers = self.tail.poll().publish_timestamps()
         manifest = _read_manifest(self.run_dir)
-        for version in schedulable_versions(self.run_dir, self.k_total):
-            if version in self.seen:
-                continue
+        has_metrics = bool(list_procs(self.run_dir))
+        recorded = 0
+        for version in unseen:
             # With real learner metrics, wait for the marker after the atomic
             # checkpoint publish. Completion timestamps reconstruct the prefix
             # at the event itself, even across monitor delay or downtime.
-            if list_procs(self.run_dir) and version not in markers:
+            if has_metrics and version not in markers:
                 continue
             observed_at = time.time()
             published_at = markers.get(version, observed_at)
@@ -1297,14 +1515,17 @@ class _LivenessMonitor:
                 os.fsync(stream.fileno())
             self.samples.append(sample)
             self.seen.add(version)
+            recorded += 1
+        return recorded
 
-    def report(self):
+    def report(self, *, write=True):
         throughput_path = eval_dir(self.run_dir) / "liveness-throughput.json"
         windows = json.loads(throughput_path.read_text()) if throughput_path.exists() else None
-        throughput = compare_liveness_throughput(windows)
+        throughput = compare_liveness_throughput(windows, eval_device=self.eval_device)
+        ordered = sorted(self.samples, key=lambda sample: sample["published_version"])
         consecutive = 0
         breached = False
-        for sample in sorted(self.samples, key=lambda sample: sample["published_version"]):
+        for sample in ordered:
             consecutive = consecutive + 1 if sample["lag"] > LIVENESS_MAX_LAG else 0
             breached |= consecutive >= LIVENESS_BREACH_CONSECUTIVE
         training_complete = self.k_total in schedulable_versions(self.run_dir, self.k_total)
@@ -1318,34 +1539,53 @@ class _LivenessMonitor:
                 "breach_consecutive": LIVENESS_BREACH_CONSECUTIVE,
                 "max_throughput_degradation": LIVENESS_MAX_THROUGHPUT_DEGRADATION,
             },
+            "observation_rule": LIVENESS_OBSERVATION_RULE,
             "samples": len(self.samples),
+            "lag_samples": ordered,
+            "interval_throughput": self.tail.poll().interval_series(),
             "lag_breached": breached if breached or samples_complete else None,
             "lag_samples_complete": samples_complete,
             "lag_bound_met": (not breached and final_lag == 0) if samples_complete else None,
             "training_complete": training_complete,
+            "current_lag": final_lag,
             "final_post_training_lag": final_lag if training_complete else None,
             "caught_up": training_complete and final_lag == 0,
             **throughput,
         }
-        _atomic_write_json(eval_dir(self.run_dir) / "liveness.json", payload)
+        if write:
+            _atomic_write_json(eval_dir(self.run_dir) / "liveness.json", payload)
         return payload
 
 
 @contextmanager
-def _monitor_liveness(run_dir, k_total, poll_interval):
-    monitor = _LivenessMonitor(run_dir, k_total)
-    monitor.sample()
+def _monitor_liveness(run_dir, k_total, poll_interval, *, eval_device=None):
+    """Sample publishes on a background thread, refreshing ``liveness.json`` live.
+
+    A sampling or report failure is logged and retried on the next tick; it
+    never stops the monitor or fails the scoring run it observes.
+    """
+    log = logging.getLogger(__name__)
+    monitor = _LivenessMonitor(run_dir, k_total, eval_device=eval_device)
     stop = threading.Event()
-    errors = []
+    failing = False
+
+    def tick(force_report=False):
+        nonlocal failing
+        try:
+            if monitor.sample() or force_report:
+                monitor.report()
+        except Exception:
+            if not failing:
+                log.exception("liveness sampling failed; retrying on the next tick")
+            failing = True
+        else:
+            failing = False
 
     def watch():
         while not stop.wait(max(0.01, min(poll_interval, 1.0))):
-            try:
-                monitor.sample()
-            except Exception as exc:
-                errors.append(exc)
-                return
+            tick()
 
+    tick(force_report=True)
     thread = threading.Thread(target=watch, name="eval-publish-monitor", daemon=True)
     thread.start()
     try:
@@ -1353,10 +1593,7 @@ def _monitor_liveness(run_dir, k_total, poll_interval):
     finally:
         stop.set()
         thread.join()
-        monitor.sample()
-        monitor.report()
-    if errors:
-        raise errors[0]
+        tick(force_report=True)
 
 
 @_exclusive_writer
@@ -1413,9 +1650,16 @@ def run_watch_loop(
             mode to model a kill/relaunch or a downtime/catch-up scenario.
         sleep: Injected sleep function (tests pass a no-op or a call-recording
             stub; production leaves this at the default, :func:`time.sleep`).
-        on_member_complete: Optional report callback, called once per complete
-            member in this invocation. Exceptions are logged and retried on
-            subsequent polls or a relaunch, without interrupting scoring.
+        on_member_complete: Optional report callback, called with the newest
+            complete member, coalesced: at most once before each member's play
+            starts and once at the end of each poll, and only when that member
+            is newer than the last one successfully reported in this
+            invocation -- a relaunch over ``N`` already-complete members (or
+            ``N`` members finished in one downtime) costs one call, not ``N``.
+            Exceptions are logged and retried at the next flush or a
+            relaunch, without interrupting scoring. A caller that can tell its
+            artifacts are already current (``scripts/run_eval.py`` compares the
+            stored verdict's evidence fingerprint) skips the regeneration.
 
     Returns:
         A :class:`WatchLoopResult` summarizing the call.
@@ -1450,8 +1694,8 @@ def run_watch_loop(
     completed_members: set[int] = set()
     stopped_reason = "single_pass"
 
-    reported: set[int] = set()
-    with _monitor_liveness(run_dir, k_total, poll_interval):
+    reports = _ReportCoalescer(on_member_complete)
+    with _monitor_liveness(run_dir, k_total, poll_interval, eval_device=config.device):
         while True:
             polls += 1
             available = schedulable_versions(run_dir, k_total)
@@ -1472,8 +1716,11 @@ def run_watch_loop(
                 pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
                 if not pending:
                     completed_members.add(version)
-                    _try_report(version, on_member_complete, reported)
+                    reports.mark(version)
                     continue
+                # Report the members completed so far before this one's play
+                # starts -- once, however many were already complete.
+                reports.flush()
                 for cid in pending:
                     parsed = parse_cell_id(cid)
                     candidate_factory = cache.candidate_factory(version, parsed.rung)
@@ -1492,8 +1739,9 @@ def run_watch_loop(
                         candidate_fingerprint,
                     )
                 completed_members.add(version)
-                _try_report(version, on_member_complete, reported)
+                reports.mark(version)
 
+            reports.flush()
             total_pairs_played += pairs_this_poll
 
             if single_pass:
@@ -1514,6 +1762,37 @@ def run_watch_loop(
         pairs_played=total_pairs_played,
         completed_members=tuple(sorted(completed_members)),
         stopped_reason=stopped_reason,
+    )
+
+
+def report_is_current(run_dir: Path | str, *, B: int) -> bool:
+    """Return whether the stored §1 report already reflects the current snapshot.
+
+    True only when ``verdict.json`` was built at this ``B`` under the current
+    protocol fingerprint from evidence whose fingerprint equals the current
+    snapshot's, and ``elo_curve.json`` is byte-for-byte the curve that verdict
+    names -- so regenerating would rewrite identical artifacts. The watch
+    loop's report hook uses it to skip redundant regenerations on a relaunch.
+
+    Args:
+        run_dir: The watched run's root directory.
+        B: The bootstrap replicate count the report must have been built at.
+
+    Returns:
+        Whether both artifacts are current; ``False`` if either is missing or
+        unreadable.
+    """
+    try:
+        verdict = json.loads(verdict_path(run_dir).read_text())
+        curve = elo_curve_path(run_dir).read_bytes()
+    except (FileNotFoundError, ValueError):
+        return False
+    return (
+        isinstance(verdict, dict)
+        and verdict.get("bootstrap_b") == B
+        and verdict.get("protocol_fingerprint") == protocol_fingerprint()
+        and verdict.get("evidence_fingerprint") == load_snapshot(run_dir).snapshot_fingerprint
+        and verdict.get("elo_curve_fingerprint") == hashlib.sha256(curve).hexdigest()
     )
 
 
@@ -1631,15 +1910,8 @@ class BenchResult:
 
 
 def _publish_timestamps(run_dir: Path, k_total: int) -> dict[int, float]:
-    """Join each member to its first durable publish event across epochs."""
-    markers = {}
-    for proc in list_procs(run_dir):
-        for record in iter_epoch_records(run_dir, proc):
-            if record.get("kind") == CHECKPOINT_PUBLISHED_KIND:
-                version = record["model_version"]
-                if 1 <= version <= k_total:
-                    markers.setdefault(version, record["timestamp"])
-    return markers
+    """Join each member to its earliest durable publish event across epochs."""
+    return _MetricsTail(run_dir, k_total).poll().publish_timestamps()
 
 
 def _publish_cadence_hours(run_dir: Path, k_total: int) -> float | None:

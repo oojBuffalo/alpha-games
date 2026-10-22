@@ -79,6 +79,12 @@ EVAL_SIMS = 512
 LIVENESS_MAX_LAG = 4
 LIVENESS_BREACH_CONSECUTIVE = 2
 LIVENESS_MAX_THROUGHPUT_DEGRADATION = 0.05
+#: Version of pin 11's operational observation rules (per-publish lag sampling,
+#: the consecutive-breach rule, and the paired A/B window rule), stamped onto the
+#: liveness report beside the thresholds -- pin 10's stated exception, never
+#: part of the hashed registry. Bump on any change to how lag or throughput is
+#: observed.
+LIVENESS_OBSERVATION_RULE_VERSION = 1
 
 #: Rung-8 historical-opponent selection rule (tasks/m4/001 pin 5): a candidate's
 #: opponents are ``{v - 1, v - ceil(K / RUNG8_LAG_DIVISOR), RUNG8_EARLIEST_VERSION}``,

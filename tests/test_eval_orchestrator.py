@@ -1287,24 +1287,47 @@ def _write_eval_config_file(path, config: EvalConfig):
 # --- run_watch_loop's report-hook seam -------------------------------------------
 
 
-def test_on_member_complete_fires_exactly_once_per_newly_completed_member(tmp_path):
+def test_on_member_complete_fires_once_per_played_member_and_coalesces_relaunch(tmp_path):
     run_dir = tmp_path / "run"
     _build_watched_run(run_dir, k_total=2)
     config = _eval_config(run_dir)
     calls: list[int] = []
 
+    # Member 1 is reported before member 2's play starts, member 2 at poll end.
     run_watch_loop(
         run_dir, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
     )
     assert calls == [1, 2]
 
-    # Relaunch refreshes reports for complete members, covering a failed hook
-    # immediately before the previous process stopped.
+    # A relaunch over already-complete members regenerates once, for the
+    # newest one, not once per member (re-review N1).
     calls.clear()
     run_watch_loop(
         run_dir, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
     )
-    assert calls == [1, 2]
+    assert calls == [2]
+
+
+def test_relaunch_over_k_complete_members_builds_no_redundant_verdicts(tmp_path, monkeypatch):
+    _build_watched_run(tmp_path, k_total=3)
+    _write_checkpoint_markers(tmp_path, [1, 2, 3])
+    config = _eval_config(tmp_path, forms=(7,), bootstrap_b=39)
+    config_path = _write_eval_config_file(tmp_path / "eval.json", config)
+    builds = []
+    real_build = run_eval.build_verdict
+
+    def counting_build(*args, **kwargs):
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(run_eval, "build_verdict", counting_build)
+    run_eval.cmd_launch(config_path, single_pass=True)
+    assert len(builds) == 3  # one per member actually played
+    builds.clear()
+    run_eval.cmd_launch(config_path, single_pass=True)
+    assert builds == []  # nothing new to report: the stored verdict is current
+    assert eval_run.report_is_current(tmp_path, B=39)
+    assert not eval_run.report_is_current(tmp_path, B=79)
 
 
 def test_run_watch_loop_defaults_to_no_hook_at_all(tmp_path):
@@ -1587,7 +1610,7 @@ def test_failed_report_hook_does_not_stop_scoring_and_relaunch_retries(tmp_path)
     run_watch_loop(
         tmp_path, config, FAST_PROFILE, GAME, single_pass=True, on_member_complete=calls.append
     )
-    assert calls == [1, 2]
+    assert calls == [2]  # retried, coalesced to the newest complete member
 
 
 @pytest.mark.parametrize("mode", ["--report", "--plateau"])
@@ -1635,7 +1658,17 @@ def test_liveness_constants_golden():
         eval_protocol.LIVENESS_MAX_LAG,
         eval_protocol.LIVENESS_BREACH_CONSECUTIVE,
         eval_protocol.LIVENESS_MAX_THROUGHPUT_DEGRADATION,
-    ) == (4, 2, 0.05)
+        eval_protocol.LIVENESS_OBSERVATION_RULE_VERSION,
+    ) == (4, 2, 0.05, 1)
+    assert eval_run.LIVENESS_OBSERVATION_RULE["version"] == 1
+    assert set(eval_run.LIVENESS_OBSERVATION_RULE) == {
+        "version",
+        "lag",
+        "throughput",
+        "in_run_series",
+    }
+    # Operational, never fingerprinted (pin 10's stated exception).
+    assert not any(key.startswith("LIVENESS") for key in eval_protocol.REGISTRY)
 
 
 def test_liveness_samples_publishes_while_play_is_blocked(tmp_path, monkeypatch):
@@ -1741,7 +1774,7 @@ def _throughput_windows(on_duration=100):
 
 @pytest.mark.parametrize("duration, breached", [(100, False), (100 / 0.95, False), (120, True)])
 def test_liveness_throughput_comparison_and_breach(duration, breached):
-    report = eval_run.compare_liveness_throughput(_throughput_windows(duration))
+    report = eval_run.compare_liveness_throughput(_throughput_windows(duration), eval_device="cpu")
     assert report["throughput_breached"] is breached
     assert report["throughput_degradation"] == pytest.approx(1 - 100 / duration)
     assert report["games_per_gpu_hour"]["harness_off"] == 360
@@ -1756,6 +1789,7 @@ def test_liveness_throughput_comparison_and_breach(duration, breached):
         ("end_completed_games", 14),
         ("end_learner_steps", 100),
         ("eval_sims", 4),
+        ("eval_device", "cuda"),
         ("end_monotonic", float("nan")),
     ],
 )
@@ -1763,7 +1797,7 @@ def test_liveness_throughput_rejects_unmatched_or_invalid_evidence(field, value)
     windows = _throughput_windows()
     windows["harness_on"][field] = value
     with pytest.raises(ValueError):
-        eval_run.compare_liveness_throughput(windows)
+        eval_run.compare_liveness_throughput(windows, eval_device="cpu")
 
 
 def test_liveness_cli_records_and_reuses_counterfactual_evidence(tmp_path):
@@ -1829,3 +1863,143 @@ def test_search_config_rejects_a_single_simulation_before_launch():
     with pytest.raises(ValueError, match="integer >= 2"):
         _make_config("unused", eval_sims=1)
     assert _make_config("unused", eval_sims=1, forms=(5,)).eval_sims == 1
+
+
+def test_liveness_on_arm_device_is_the_configured_device_not_a_literal():
+    windows = _throughput_windows()
+    windows["harness_on"]["eval_device"] = "cuda"
+    assert (
+        eval_run.compare_liveness_throughput(windows, eval_device="cuda")["throughput_breached"]
+        is False
+    )
+    with pytest.raises(ValueError, match="configured eval device"):
+        eval_run.compare_liveness_throughput(windows, eval_device="cpu")
+    with pytest.raises(ValueError, match="configured eval device"):
+        eval_run.compare_liveness_throughput(windows)
+
+
+def test_liveness_report_stamps_observation_rule_and_interval_series(tmp_path):
+    _build_watched_run(tmp_path, k_total=2)
+    actor = EpochMetricsWriter(tmp_path, "actor0")
+    learner = EpochMetricsWriter(tmp_path, "learner")
+    learner.append(
+        {
+            "kind": CHECKPOINT_PUBLISHED_KIND,
+            "model_version": 1,
+            "learner_step": 10,
+            "timestamp": 100.0,
+        }
+    )
+    for timestamp in (150.0, 200.0, 250.0):
+        actor.append(
+            {"kind": "delta", "series": "games_completed", "value": 2, "timestamp": timestamp}
+        )
+    learner.append(
+        {
+            "kind": CHECKPOINT_PUBLISHED_KIND,
+            "model_version": 2,
+            "learner_step": 40,
+            "timestamp": 400.0,
+        }
+    )
+    report = eval_run.build_liveness_report(tmp_path)
+    assert report["observation_rule"] == eval_run.LIVENESS_OBSERVATION_RULE
+    assert [s["published_version"] for s in report["lag_samples"]] == [1, 2]
+    (row,) = report["interval_throughput"]
+    assert (row["from_version"], row["to_version"], row["interval_seconds"]) == (1, 2, 300.0)
+    assert row["games_per_hour"] == pytest.approx(3600 * 6 / 300)
+    assert row["learner_steps_per_sec"] == pytest.approx(30 / 300)
+
+
+def test_liveness_is_readable_and_refreshed_while_the_harness_is_live(tmp_path):
+    import time
+
+    _build_watched_run(tmp_path, k_total=3, versions=[1, 2])
+    (tmp_path / "eval").mkdir()
+    with eval_run._writer_lock(tmp_path):  # a live harness holds the lock
+        with eval_run._monitor_liveness(tmp_path, 3, 0.01, eval_device="cpu") as monitor:
+            path = tmp_path / "eval" / "liveness.json"
+            assert json.loads(path.read_text())["samples"] == 2  # written at start
+            _write_checkpoint(checkpoint_dir(tmp_path), GAME, version=3, seed=3)
+            deadline = time.monotonic() + 5
+            while json.loads(path.read_text())["samples"] < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert json.loads(path.read_text())["samples"] == 3  # refreshed mid-run
+            assert len(monitor.samples) == 3
+            before = path.read_bytes()
+            report = eval_run.build_liveness_report(tmp_path)  # lock-free read
+            assert report["samples"] == 3 and report["current_lag"] == 3
+            assert path.read_bytes() == before  # the read path wrote nothing
+            with pytest.raises(eval_run.EvalWriterBusyError):
+                eval_run.build_liveness_report(
+                    tmp_path, throughput_windows=_throughput_windows(), eval_device="cpu"
+                )
+
+
+def test_metrics_tail_skips_torn_lines_and_reads_incrementally(tmp_path):
+    _build_watched_run(tmp_path, k_total=2)
+    learner = EpochMetricsWriter(tmp_path, "learner")
+    learner.append({"kind": CHECKPOINT_PUBLISHED_KIND, "model_version": 1, "timestamp": 5.0})
+    (path,) = (tmp_path / "metrics").glob("learner-*.jsonl")
+    with path.open("a") as stream:
+        stream.write('{"kind":"checkpoint_published","model_ver')  # append in flight
+    tail = eval_run._MetricsTail(tmp_path, 2)
+    assert tail.poll().publish_timestamps() == {1: 5.0}
+    assert eval_run._publish_timestamps(tmp_path, 2) == {1: 5.0}
+    with path.open("a") as stream:
+        stream.write('sion":2,"timestamp":9.0}\n')
+    assert tail.poll().publish_timestamps() == {1: 5.0, 2: 9.0}
+    assert tail.offsets[path] == path.stat().st_size
+
+
+def test_monitor_survives_a_sampling_error_and_never_fails_the_run(tmp_path, monkeypatch):
+    import time
+
+    _build_watched_run(tmp_path, k_total=2, versions=[1])
+    (tmp_path / "eval").mkdir()
+    real_sample = eval_run._LivenessMonitor.sample
+    failures = []
+
+    def flaky(self):
+        if len(failures) < 3:
+            failures.append(1)
+            raise ValueError("torn metrics line")
+        return real_sample(self)
+
+    monkeypatch.setattr(eval_run._LivenessMonitor, "sample", flaky)
+    with eval_run._monitor_liveness(tmp_path, 2, 0.01, eval_device="cpu") as monitor:
+        deadline = time.monotonic() + 5
+        while not monitor.samples and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert [s["published_version"] for s in monitor.samples] == [1]  # kept sampling
+    assert len(failures) == 3
+
+
+def test_monitor_stops_reading_metrics_once_every_member_is_sampled(tmp_path, monkeypatch):
+    _build_watched_run(tmp_path, k_total=1)
+    EpochMetricsWriter(tmp_path, "learner").append(
+        {"kind": CHECKPOINT_PUBLISHED_KIND, "model_version": 1, "timestamp": 1.0}
+    )
+    (tmp_path / "eval").mkdir()
+    monitor = eval_run._LivenessMonitor(tmp_path, 1)
+    assert monitor.sample() == 1
+    polls = []
+    monkeypatch.setattr(monitor.tail, "poll", lambda: polls.append(1) or monitor.tail)
+    assert monitor.sample() == 0
+    assert polls == []
+
+
+def test_monitor_drops_a_torn_final_sample_on_restart(tmp_path):
+    _build_watched_run(tmp_path, k_total=2)
+    (tmp_path / "eval").mkdir()
+    path = tmp_path / "eval" / "liveness.jsonl"
+    path.write_text(
+        json.dumps({"published_version": 1, "lag": 1, "timestamp": 1.0, "source": "x"})
+        + "\n"
+        + '{"published_version": 2, "la'
+    )
+    monitor = eval_run._LivenessMonitor(tmp_path, 2)
+    assert monitor.seen == {1}
+    monitor.sample()
+    lines = path.read_text().splitlines()
+    assert [json.loads(line)["published_version"] for line in lines] == [1, 2]

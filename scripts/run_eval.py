@@ -64,6 +64,7 @@ from core.eval_run import (  # noqa: E402
     build_liveness_report,
     eval_lag,
     load_eval_config,
+    report_is_current,
     run_watch_loop,
     validate_eval_provenance,
     watched_k_total,
@@ -155,11 +156,18 @@ def cmd_plateau(config_path: Path | str) -> PlateauResult:
 
 
 def cmd_liveness(config_path: Path | str, throughput_windows: Path | str | None = None) -> dict:
-    """Report publish-time lag and optional matched off/on learner throughput."""
+    """Report publish-time lag and optional matched off/on learner throughput.
+
+    Readable while the harness is live (computed from its durable samples,
+    writing nothing); recording ``throughput_windows`` evidence is a write and
+    is refused while a harness holds the writer lock.
+    """
     config = load_eval_config(config_path)
     validate_eval_provenance(config.run_dir, config)
     windows = json.loads(Path(throughput_windows).read_text()) if throughput_windows else None
-    return build_liveness_report(config.run_dir, throughput_windows=windows)
+    return build_liveness_report(
+        config.run_dir, throughput_windows=windows, eval_device=config.device
+    )
 
 
 def cmd_bench(config_path: Path | str, *, n_pairs: int = DEFAULT_BENCH_PAIRS) -> BenchResult:
@@ -210,6 +218,13 @@ def cmd_launch(
     game, profile = _resolve_watched_game(config.run_dir)
 
     def _on_member_complete(member_version: int) -> None:
+        if report_is_current(config.run_dir, B=config.bootstrap_b):
+            lag = eval_lag(config.run_dir, watched_k_total(config.run_dir))
+            print(
+                f"[run_eval] checkpoint {member_version} complete -- eval_lag={lag} "
+                "(report already current)"
+            )
+            return
         report = _build_report(config)
         print(
             f"[run_eval] checkpoint {member_version} complete -- eval_lag="
