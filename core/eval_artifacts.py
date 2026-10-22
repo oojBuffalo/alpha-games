@@ -158,7 +158,13 @@ def _production_identity(identity: str) -> bool:
     return True
 
 
-def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> dict[str, Any]:
+def build_verdict(
+    run_dir: Path | str,
+    *,
+    B: int = BOOTSTRAP_B_PRODUCTION,
+    eval_seed: int | None = None,
+    production_schedule: bool = True,
+) -> dict[str, Any]:
     """Assemble and durably write the §12 M5.5 verdict artifact.
 
     The publishing orchestrator over ``core.eval_stats`` inference. Reads
@@ -202,6 +208,15 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
             ``B ≡ 39 mod 40``; see :func:`order_statistic_ci`). Defaults to
             the pinned production value; the artifact always records the
             value actually used.
+        eval_seed: The evaluation seed ``bootstrap_seed`` derives from. The
+            M4 harness passes its own recorded ``EvalConfig.eval_seed`` (§9
+            pin 7 -- the eval seed is carried by the eval config); ``None``
+            falls back to the watched run's ``evaluation.eval_seed``.
+        production_schedule: Whether the evidence was scheduled under the
+            complete production schedule (all of forms 5/6/7 and the pinned
+            rung-8 rule, §9 pin 2/5). ``False`` (a reduced schedule) keeps the
+            verdict provisional: it may still carry a Delta/CI/gate, never the
+            ``authoritative`` flag.
 
     Returns:
         The verdict payload -- the identical JSON-safe dict durably written
@@ -224,7 +239,7 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
     snapshot = load_snapshot(run_dir)
     stored_config = read_stored_config(run_dir)
     k_target = stored_config.run.training.checkpoint_count
-    eval_seed_value = stored_config.run.evaluation.eval_seed
+    eval_seed_value = stored_config.run.evaluation.eval_seed if eval_seed is None else eval_seed
 
     seed = bootstrap_seed(eval_seed_value)
     point_ratings = fit_snapshot_elo(snapshot) if snapshot.member_prefix else {}
@@ -269,9 +284,12 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
             "ci": [delta_ci[0], delta_ci[1]],
             "gate": delta_gate(delta_ci),
         }
-        reason = (
-            None if production_cells else "non-production evaluation cell settings or identities"
-        )
+        if not production_cells:
+            reason = "non-production evaluation cell settings or identities"
+        elif not production_schedule:
+            reason = "reduced evaluation schedule (forms or rung-8 rule) -- provisional"
+        else:
+            reason = None
     else:
         delta_payload = None
         reason = (
@@ -290,7 +308,12 @@ def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> di
     elo_curve_fingerprint = _file_sha256(elo_curve_path(run_dir))
 
     payload: dict[str, Any] = {
-        "authoritative": (is_complete_k_set and B == BOOTSTRAP_B_PRODUCTION and production_cells),
+        "authoritative": (
+            is_complete_k_set
+            and B == BOOTSTRAP_B_PRODUCTION
+            and production_cells
+            and production_schedule
+        ),
         "checkpoints_evaluated": checkpoints_evaluated,
         "k_target": k_target,
         "bootstrap_b": B,

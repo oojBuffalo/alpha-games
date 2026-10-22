@@ -753,10 +753,18 @@ def verdict_path(run_dir: Path | str) -> Path:
     return implementation(run_dir)
 
 
-def build_verdict(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> dict[str, Any]:
+def build_verdict(
+    run_dir: Path | str,
+    *,
+    B: int = BOOTSTRAP_B_PRODUCTION,
+    eval_seed: int | None = None,
+    production_schedule: bool = True,
+) -> dict[str, Any]:
     from core.eval_artifacts import build_verdict as implementation
 
-    return implementation(run_dir, B=B)
+    return implementation(
+        run_dir, B=B, eval_seed=eval_seed, production_schedule=production_schedule
+    )
 
 
 PLATEAU_OUTCOME_PLATEAU = "plateau"
@@ -1061,7 +1069,9 @@ def _fit_checkpoint_curves(
     return point_curve_by_version, replicate_curves_by_version
 
 
-def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> PlateauResult:
+def detect_plateau(
+    run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION, eval_seed: int | None = None
+) -> PlateauResult:
     """Read the §12 M4 plateau predicate without writing or triggering actions.
 
     Uses the immutable completed-cell snapshot and the existing elo_curve.json
@@ -1077,7 +1087,10 @@ def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> P
 
     Raises ValueError for inadmissible B, non-contiguous rung-7 curves, or
     a disconnected fit; FileNotFoundError for missing stored config when a
-    complete window needs bootstrap replicates.
+    complete window needs bootstrap replicates and no ``eval_seed`` is given.
+    ``eval_seed`` is the evaluation seed the bootstrap derives from -- the M4
+    harness passes its own ``EvalConfig.eval_seed`` (§9 pin 7); ``None`` falls
+    back to the watched run's ``evaluation.eval_seed``.
     """
     _validate_admissible_B(B)
     run_dir = Path(run_dir)
@@ -1118,8 +1131,9 @@ def detect_plateau(run_dir: Path | str, *, B: int = BOOTSTRAP_B_PRODUCTION) -> P
         )
 
     point_curve_by_version = dict(point_curve)
-    stored_config = read_stored_config(run_dir)
-    seed = bootstrap_seed(stored_config.run.evaluation.eval_seed)
+    if eval_seed is None:
+        eval_seed = read_stored_config(run_dir).run.evaluation.eval_seed
+    seed = bootstrap_seed(eval_seed)
     replicate_curves = [
         dict(checkpoint_elo(ratings)) for ratings in bootstrap_replicates(snapshot, seed, B)
     ]

@@ -99,12 +99,13 @@ from core.eval_protocol import (
     LIVENESS_MAX_LAG,
     LIVENESS_MAX_THROUGHPUT_DEGRADATION,
     LIVENESS_OBSERVATION_RULE_VERSION,
+    PAIRS_PER_CELL,
     PROTOCOL_VERSION,
     RUNG8_EARLIEST_VERSION,
     RUNG8_LAG_DIVISOR,
     protocol_fingerprint,
 )
-from core.eval_stats import _validate_admissible_B, elo_curve_path, verdict_path
+from core.eval_stats import _validate_admissible_B, bootstrap_seed, elo_curve_path, verdict_path
 from core.eval_store import (
     CellId,
     _read_manifest,
@@ -343,6 +344,24 @@ class EvalConfig:
             device=_str(raw, "device", where),
             bootstrap_b=_int(raw, "bootstrap_b", where),
             schema_version=_int(raw, "schema_version", where),
+        )
+
+    @property
+    def production_schedule(self) -> bool:
+        """Whether this config schedules the complete production evidence set.
+
+        All three forms (§9 pin 2), the pinned rung-8 rule (pin 5), and the
+        pinned pairs-per-cell / ``S`` (pins 1/4). Only such a schedule may
+        back an authoritative verdict; a reduced one (e.g. ``forms=(7,)``)
+        registers a smaller required set per member, so its "complete K-set"
+        is not the production one and its verdict stays provisional.
+        """
+        return (
+            self.forms == VALID_FORMS
+            and self.rung8_lag_divisor == RUNG8_LAG_DIVISOR
+            and self.rung8_earliest_version == RUNG8_EARLIEST_VERSION
+            and self.pairs_per_cell == PAIRS_PER_CELL
+            and self.eval_sims == EVAL_SIMS
         )
 
     def as_eval_config_snapshot(self) -> dict[str, int]:
@@ -1568,12 +1587,19 @@ def _monitor_liveness(run_dir, k_total, poll_interval, *, eval_device=None):
     monitor = _LivenessMonitor(run_dir, k_total, eval_device=eval_device)
     stop = threading.Event()
     failing = False
+    # Set by a new sample (or a forced report) and cleared only once report()
+    # succeeds, so a failed liveness.json write is retried on every later tick
+    # rather than waiting for the next publish.
+    report_pending = False
 
     def tick(force_report=False):
-        nonlocal failing
+        nonlocal failing, report_pending
         try:
             if monitor.sample() or force_report:
+                report_pending = True
+            if report_pending:
                 monitor.report()
+                report_pending = False
         except Exception:
             if not failing:
                 log.exception("liveness sampling failed; retrying on the next tick")
@@ -1765,7 +1791,13 @@ def run_watch_loop(
     )
 
 
-def report_is_current(run_dir: Path | str, *, B: int) -> bool:
+def report_is_current(
+    run_dir: Path | str,
+    *,
+    B: int,
+    eval_seed: int | None = None,
+    production_schedule: bool = True,
+) -> bool:
     """Return whether the stored §1 report already reflects the current snapshot.
 
     True only when ``verdict.json`` was built at this ``B`` under the current
@@ -1777,6 +1809,12 @@ def report_is_current(run_dir: Path | str, *, B: int) -> bool:
     Args:
         run_dir: The watched run's root directory.
         B: The bootstrap replicate count the report must have been built at.
+        eval_seed: If given, the stored verdict's ``bootstrap_seed`` must be
+            ``bootstrap_seed(eval_seed)`` (a verdict seeded from any other
+            eval seed is stale).
+        production_schedule: If ``False``, a stored verdict flagged
+            ``authoritative`` is stale (a reduced schedule is never
+            authoritative).
 
     Returns:
         Whether both artifacts are current; ``False`` if either is missing or
@@ -1793,6 +1831,8 @@ def report_is_current(run_dir: Path | str, *, B: int) -> bool:
         and verdict.get("protocol_fingerprint") == protocol_fingerprint()
         and verdict.get("evidence_fingerprint") == load_snapshot(run_dir).snapshot_fingerprint
         and verdict.get("elo_curve_fingerprint") == hashlib.sha256(curve).hexdigest()
+        and (eval_seed is None or verdict.get("bootstrap_seed") == bootstrap_seed(eval_seed))
+        and (production_schedule or verdict.get("authoritative") is False)
     )
 
 

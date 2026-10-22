@@ -1468,6 +1468,72 @@ def test_cmd_report_shows_delta_and_the_authoritative_distinction_once_complete(
     assert "authoritative: False" in rendered
 
 
+def test_report_and_plateau_bootstrap_seed_derives_from_the_harness_eval_seed(
+    tmp_path, monkeypatch
+):
+    from core.eval_stats import bootstrap_seed
+
+    run_dir = tmp_path / "run"
+    # Watched run's own (unrelated M2.5) eval_seed=999; harness eval_seed=123.
+    _hand_built_store(run_dir, checkpoint_count=1, scored_versions=[1], eval_seed=999)
+    config = _make_config(str(run_dir), eval_seed=123)
+    cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
+
+    payload = run_eval.cmd_report(cfg_path)
+    assert payload["verdict"]["bootstrap_seed"] == bootstrap_seed(123)
+    assert payload["verdict"]["bootstrap_seed"] != bootstrap_seed(999)
+    assert eval_run.report_is_current(run_dir, B=39, eval_seed=123)
+    # A verdict seeded from any other eval seed is stale, never reused.
+    assert not eval_run.report_is_current(run_dir, B=39, eval_seed=999)
+
+    seen = {}
+
+    def capture(run_dir_arg, **kwargs):
+        seen.update(kwargs)
+        return "sentinel"
+
+    monkeypatch.setattr(run_eval, "detect_plateau", capture)
+    assert run_eval.cmd_plateau(cfg_path) == "sentinel"
+    assert seen == {"B": 39, "eval_seed": 123}
+
+
+@pytest.mark.parametrize(("forms", "authoritative"), [((7,), False), ((5, 6, 7), True)])
+def test_reduced_form_schedule_never_yields_an_authoritative_verdict(
+    tmp_path, forms, authoritative
+):
+    run_dir = tmp_path / "run"
+    _write_run_provenance(run_dir, checkpoint_count=1, eval_seed=999)
+    # Production pair count / S on the cell, production B on the report.
+    _write_scored_member(run_dir, 1, [1.0, 0.5] * (eval_protocol.PAIRS_PER_CELL // 2))
+    _write_checkpoint_markers(run_dir, [1])
+    config = _make_config(
+        str(run_dir),
+        forms=forms,
+        pairs_per_cell=eval_protocol.PAIRS_PER_CELL,
+        eval_sims=eval_protocol.EVAL_SIMS,
+        rung8_lag_divisor=eval_protocol.RUNG8_LAG_DIVISOR,
+        rung8_earliest_version=eval_protocol.RUNG8_EARLIEST_VERSION,
+        bootstrap_b=eval_protocol.BOOTSTRAP_B_PRODUCTION,
+    )
+    assert config.production_schedule is authoritative
+    cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
+
+    verdict = run_eval.cmd_report(cfg_path)["verdict"]
+    assert verdict["delta"] is not None  # complete K-set: Delta/CI/gate still reported
+    assert verdict["authoritative"] is authoritative
+    assert (verdict["reason"] is None) is authoritative
+    # A stale authoritative verdict is never "current" for a reduced schedule.
+    assert eval_run.report_is_current(
+        run_dir,
+        B=config.bootstrap_b,
+        eval_seed=config.eval_seed,
+        production_schedule=config.production_schedule,
+    )
+    assert eval_run.report_is_current(run_dir, B=config.bootstrap_b, production_schedule=False) is (
+        not authoritative
+    )
+
+
 def test_cmd_plateau_smoke_reports_insufficient_data_tri_state_rendered_not_coerced(tmp_path):
     run_dir = tmp_path / "run"
     _hand_built_store(run_dir, checkpoint_count=1, scored_versions=[1])
@@ -1509,8 +1575,12 @@ def test_report_with_a_cell_mid_write_never_opens_it_and_matches_last_complete_p
     run_dir = tmp_path / "run"
     _hand_built_store(run_dir, checkpoint_count=2, scored_versions=[1])
     b = 39
+    # The harness's own eval seed backs the bootstrap (§9 pin 7), so the
+    # direct calls pass it exactly as the script's --report does.
+    config = _make_config(str(run_dir), bootstrap_b=b)
+    seed = config.eval_seed
 
-    report_before = build_verdict(run_dir, B=b)
+    report_before = build_verdict(run_dir, B=b, eval_seed=seed)
     verdict_bytes_before = verdict_path(run_dir).read_bytes()
     elo_curve_bytes_before = elo_curve_path(run_dir).read_bytes()
 
@@ -1533,14 +1603,13 @@ def test_report_with_a_cell_mid_write_never_opens_it_and_matches_last_complete_p
     # Deliberately never complete_cell()'d: this cell stays "scheduled" --
     # a real, on-disk, mid-write cell -- for the rest of this test.
 
-    report_after = build_verdict(run_dir, B=b)
+    report_after = build_verdict(run_dir, B=b, eval_seed=seed)
 
     assert report_after == report_before
     assert verdict_path(run_dir).read_bytes() == verdict_bytes_before
     assert elo_curve_path(run_dir).read_bytes() == elo_curve_bytes_before
 
     # And via the script's own --report entrypoint too.
-    config = _make_config(str(run_dir), bootstrap_b=b)
     cfg_path = _write_eval_config_file(tmp_path / "eval_cfg.json", config)
     payload = run_eval.cmd_report(cfg_path)
     assert payload["verdict"] == report_after == report_before
@@ -1973,6 +2042,36 @@ def test_monitor_survives_a_sampling_error_and_never_fails_the_run(tmp_path, mon
             time.sleep(0.01)
         assert [s["published_version"] for s in monitor.samples] == [1]  # kept sampling
     assert len(failures) == 3
+
+
+def test_monitor_retries_a_failed_liveness_report_without_a_new_publish(tmp_path, monkeypatch):
+    import time
+
+    _build_watched_run(tmp_path, k_total=2, versions=[1])
+    (tmp_path / "eval").mkdir()
+    samples = iter([1])
+    reports = []
+
+    def one_sample_then_none(self):
+        return next(samples, 0)
+
+    def flaky_report(self, *, write=True):
+        reports.append(1)
+        if len(reports) == 1:  # the report right after the (only) new sample
+            raise OSError("transient write failure")
+
+    monkeypatch.setattr(eval_run._LivenessMonitor, "sample", one_sample_then_none)
+    monkeypatch.setattr(eval_run._LivenessMonitor, "report", flaky_report)
+    with eval_run._monitor_liveness(tmp_path, 2, 0.01, eval_device="cpu"):
+        deadline = time.monotonic() + 5
+        while len(reports) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # The failed report after the new sample is retried on a later tick
+        # with no new publish -- not deferred to context exit.
+        assert len(reports) == 2
+        time.sleep(0.1)
+        assert len(reports) == 2  # retried once, then idle (nothing pending)
+    assert len(reports) == 3  # the forced final report at exit
 
 
 def test_monitor_stops_reading_metrics_once_every_member_is_sampled(tmp_path, monkeypatch):

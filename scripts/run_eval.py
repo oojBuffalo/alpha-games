@@ -124,7 +124,12 @@ def _build_report(config: EvalConfig) -> dict:
         ``{"verdict": <verdict.json payload>, "eval_lag": int}``.
     """
     validate_eval_provenance(config.run_dir, config)
-    verdict = build_verdict(config.run_dir, B=config.bootstrap_b)
+    verdict = build_verdict(
+        config.run_dir,
+        B=config.bootstrap_b,
+        eval_seed=config.eval_seed,
+        production_schedule=config.production_schedule,
+    )
     lag = eval_lag(config.run_dir, watched_k_total(config.run_dir))
     return {"verdict": verdict, "eval_lag": lag}
 
@@ -152,7 +157,7 @@ def cmd_plateau(config_path: Path | str) -> PlateauResult:
     """
     config = load_eval_config(config_path)
     validate_eval_provenance(config.run_dir, config)
-    return detect_plateau(config.run_dir, B=config.bootstrap_b)
+    return detect_plateau(config.run_dir, B=config.bootstrap_b, eval_seed=config.eval_seed)
 
 
 def cmd_liveness(config_path: Path | str, throughput_windows: Path | str | None = None) -> dict:
@@ -218,7 +223,12 @@ def cmd_launch(
     game, profile = _resolve_watched_game(config.run_dir)
 
     def _on_member_complete(member_version: int) -> None:
-        if report_is_current(config.run_dir, B=config.bootstrap_b):
+        if report_is_current(
+            config.run_dir,
+            B=config.bootstrap_b,
+            eval_seed=config.eval_seed,
+            production_schedule=config.production_schedule,
+        ):
             lag = eval_lag(config.run_dir, watched_k_total(config.run_dir))
             print(
                 f"[run_eval] checkpoint {member_version} complete -- eval_lag={lag} "
