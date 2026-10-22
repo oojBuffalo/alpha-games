@@ -849,6 +849,8 @@ class WindowCondition:
         contrast_ci_width: ``contrast_ci[1] - contrast_ci[0]``.
         ci_narrow: ``True`` iff ``contrast_ci_width <
             core.eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO`` (strictly below).
+            At the pinned values this is implied by ``ci_equivalent`` (the
+            threshold equals twice the equivalence margin).
         ci_equivalent: Both CI endpoints lie strictly inside the pinned equivalence margin.
         gpu_hours_span: This window's GPU-hour span -- the newest member's
             cumulative single-counted GPU-hours minus the oldest member's (the
