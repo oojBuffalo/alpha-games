@@ -1016,3 +1016,61 @@ def test_concurrent_initializer_cannot_ack_before_eval_dir_is_durable(tmp_path, 
         gate.set()
         thread_a.join(timeout=10)
     assert not errors
+
+
+def test_complete_cell_syncs_recovered_cell_before_committing_manifest(tmp_path, monkeypatch):
+    """A final append that died before its fsync is made durable before completion.
+
+    The writer flushes the last record and dies before ``os.fsync`` returns, so the
+    complete record sits only in the page cache: recovery sees no torn tail and
+    never syncs. ``complete_cell`` must fsync the cell file and its directory
+    before the manifest marks the cell complete.
+    """
+    import os
+
+    import core.eval_store as store
+
+    header = _make_header(eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1})
+    cid = header.cell_id.to_string()
+    path = cell_path(tmp_path, cid)
+    register_member(tmp_path, header.cell_id.candidate_version, [cid])
+    assert open_cell_for_write(tmp_path, header) == 0
+    cell_ino = path.stat().st_ino
+    real_fsync = store.os.fsync
+
+    def dying_fsync(fd):
+        if os.fstat(fd).st_ino == cell_ino:
+            raise OSError("simulated crash before the final append's fsync")
+        real_fsync(fd)
+
+    with monkeypatch.context() as m:
+        m.setattr(store.os, "fsync", dying_fsync)
+        with pytest.raises(OSError, match="simulated crash"):
+            append_pair_record(path, _flat_record(0))
+
+    events: list[str] = []
+    cells_ino = path.parent.stat().st_ino
+    real_write_manifest = store._atomic_write_manifest
+
+    def tracking_fsync(fd):
+        ino = os.fstat(fd).st_ino
+        if ino == cell_ino:
+            events.append("cell")
+        elif ino == cells_ino:
+            events.append("cells_dir")
+        real_fsync(fd)
+
+    def tracking_manifest(run_dir, payload):
+        if any(e["status"] == "complete" for e in payload["cells"].values()):
+            events.append("manifest_complete")
+        real_write_manifest(run_dir, payload)
+
+    monkeypatch.setattr(store.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(store, "_atomic_write_manifest", tracking_manifest)
+    assert open_cell_for_write(tmp_path, header) == 1  # full record survived in cache
+    events.clear()
+    complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+    commit = events.index("manifest_complete")
+    assert "cell" in events[:commit]
+    assert "cells_dir" in events[:commit]

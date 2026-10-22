@@ -651,6 +651,14 @@ def append_pair_record(path: Path, record: PairRecord) -> None:
             os.fsync(fh.fileno())
 
 
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -1033,6 +1041,12 @@ def _complete_cell(run_dir: Path | str, cell_id: str) -> None:
     if header.cell_id.to_string() != cell_id:
         raise ManifestError("header identity disagrees with filename")
     _validate_records(header, records, full=True)
+    # Durability barrier: the records just validated may only be in the page cache
+    # (a writer can die after flushing its final append but before that append's
+    # fsync; recovery then sees no torn tail and never syncs). Persist the cell's
+    # bytes and its directory entry before the manifest can call it complete.
+    _fsync_file(path)
+    _fsync_directory(path.parent)
     entry["status"] = _STATUS_COMPLETE
     entry["completed_at"] = time.time()
     _atomic_write_manifest(run_dir, manifest)
