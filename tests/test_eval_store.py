@@ -13,6 +13,8 @@ import dataclasses
 import json
 import math
 import random
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -921,4 +923,96 @@ def test_new_store_directories_are_persisted_in_their_parents_before_use(tmp_pat
     # before the header file's own fsync is acknowledged by its directory sync.
     cells_sync = dir_syncs.index("eval/cells")
     assert "eval" in dir_syncs[1:cells_sync]
-    assert dir_syncs.count(".") == 1  # existing directories are not re-synced
+    # Store-owned levels are re-persisted on every use (existence is not durability),
+    # but directories outside the store (run_dir's own parent) are never synced.
+    assert ".." not in dir_syncs and all(not name.startswith("..") for name in dir_syncs)
+
+
+def _record_dir_syncs(monkeypatch, root, events, *, block_first_root_sync=None):
+    import core.eval_store as store
+
+    real_fsync_dir = store._fsync_directory
+    blocked = {"done": False}
+
+    def record_dir(path):
+        name = Path(path).resolve().relative_to(root.resolve()).as_posix()
+        if block_first_root_sync is not None and name == "." and not blocked["done"]:
+            blocked["done"] = True
+            block_first_root_sync.wait(timeout=10)
+        events.append((threading.get_ident(), name))
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", record_dir)
+
+
+def test_preexisting_unsynced_store_dirs_are_persisted_before_acknowledgement(
+    tmp_path, monkeypatch
+):
+    """A visible ``eval/``/``cells/`` left by a dead predecessor is still persisted.
+
+    Simulates a writer that died between ``mkdir`` and its parent fsync: both
+    store directories exist but were never synced. The next writer must fsync
+    ``run_dir`` (for ``eval/``) and ``eval/`` (for ``cells/``) itself before its
+    evidence is acknowledged.
+    """
+    (tmp_path / "eval" / "cells").mkdir(parents=True)
+    events: list[tuple[int, str]] = []
+    header = _make_header(eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1})
+    cid = header.cell_id.to_string()
+    _record_dir_syncs(monkeypatch, tmp_path, events)
+    register_member(tmp_path, header.cell_id.candidate_version, [cid])
+    assert (threading.get_ident(), ".") in events  # eval/ persisted in run_dir
+    events.clear()
+    assert open_cell_for_write(tmp_path, header) == 0
+    names = [name for _, name in events]
+    assert "." in names and "eval" in names  # cells/ persisted in eval/ too
+    append_pair_record(cell_path(tmp_path, cid), _flat_record(0))
+    complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+
+
+def test_concurrent_initializer_cannot_ack_before_eval_dir_is_durable(tmp_path, monkeypatch):
+    """Writer B must not rely on writer A's still-pending fsync of ``run_dir``.
+
+    A creates ``eval/`` during ``register_member`` and stalls before fsyncing
+    ``run_dir``. B then registers, writes, appends and completes a cell; B must
+    have fsynced ``run_dir`` itself before ``complete_cell`` returns.
+    """
+    gate = threading.Event()
+    events: list[tuple[int, str]] = []
+    _record_dir_syncs(monkeypatch, tmp_path, events, block_first_root_sync=gate)
+    header_a = _make_header()
+    header_b = _make_header(
+        candidate_version=header_a.cell_id.candidate_version + 1,
+        eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1},
+    )
+    errors: list[BaseException] = []
+
+    def writer_a():
+        try:
+            register_member(
+                tmp_path, header_a.cell_id.candidate_version, [header_a.cell_id.to_string()]
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=writer_a)
+    thread_a.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "eval").exists():
+            assert time.monotonic() < deadline, "writer A never created eval/"
+            time.sleep(0.001)
+        me = threading.get_ident()
+        cid = header_b.cell_id.to_string()
+        register_member(tmp_path, header_b.cell_id.candidate_version, [cid])
+        assert open_cell_for_write(tmp_path, header_b) == 0
+        append_pair_record(cell_path(tmp_path, cid), _flat_record(0))
+        complete_cell(tmp_path, cid)
+        assert is_cell_complete(tmp_path, cid)
+        assert not gate.is_set()  # A is still stalled before its run_dir sync
+        assert (me, ".") in events, "B acknowledged evidence without persisting eval/"
+    finally:
+        gate.set()
+        thread_a.join(timeout=10)
+    assert not errors

@@ -660,29 +660,39 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _make_durable_dirs(path: Path) -> None:
-    """Create ``path`` and any missing ancestors, persisting each new entry.
+    """Ensure ``path`` exists and every store-owned directory entry on it is durable.
 
     ``mkdir`` alone does not make the new directory entry durable: until its
     *parent* is fsynced, a power loss can drop the directory (and every fsynced
-    file inside it). Each directory created here therefore has its parent fsynced
-    before returning, so later fsynced writes inside ``path`` are reachable after
-    a crash.
+    file inside it). Seeing a directory already exist is no proof it is durable --
+    a concurrent initializer (or a predecessor that died) may have created it and
+    not yet fsynced its parent. So every store-owned level (``eval/`` and
+    ``eval/cells/``) has its parent fsynced on *every* call, existing or not, as
+    does any other directory created here; only pre-existing directories outside
+    the store (the run directory and above) are trusted as already durable.
 
     Args:
         path: The directory that must exist (durably) on return.
     """
     path = Path(path)
-    missing: list[Path] = []
+    chain: list[Path] = []
     probe = path
-    while not probe.exists():
-        missing.append(probe)
+    while probe != probe.parent and (not probe.exists() or _is_store_owned_dir(probe)):
+        chain.append(probe)
         probe = probe.parent
-    for directory in reversed(missing):
+    for directory in reversed(chain):
         try:
             directory.mkdir()
         except FileExistsError:
-            pass  # a concurrent creator won; still persist the entry below
+            pass  # created earlier or by a concurrent writer; still persist the entry
         _fsync_directory(directory.parent)
+
+
+def _is_store_owned_dir(path: Path) -> bool:
+    """Return whether ``path`` is an ``eval/`` or ``eval/cells/`` store directory."""
+    return path.name == _EVAL_DIRNAME or (
+        path.name == _CELLS_DIRNAME and path.parent.name == _EVAL_DIRNAME
+    )
 
 
 @contextmanager
