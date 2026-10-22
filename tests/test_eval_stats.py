@@ -1208,7 +1208,7 @@ def test_all_statistical_conventions_are_hashed():
         assert eval_protocol.REGISTRY[key] == value
 
 
-def test_eval_config_serializes_and_checks_protocol_stamps():
+def test_eval_config_serializes_and_records_protocol_stamps():
     from core.runconfig import RunConfig, load_run_config
 
     config = load_run_config()
@@ -1216,9 +1216,53 @@ def test_eval_config_serializes_and_checks_protocol_stamps():
     assert raw["evaluation"]["protocol_version"] == eval_protocol.PROTOCOL_VERSION
     assert raw["evaluation"]["protocol_fingerprint"] == eval_protocol.protocol_fingerprint()
     assert RunConfig.from_dict(raw) == config
+    # A stamp from an older registry is a record: read and re-serialized verbatim,
+    # never rejected and never relabeled with the live fingerprint.
     raw["evaluation"]["protocol_fingerprint"] = "old"
-    with pytest.raises(ValueError, match="stored protocol"):
+    stale = RunConfig.from_dict(raw)
+    assert stale.evaluation.protocol_fingerprint == "old"
+    assert stale.to_dict() == raw
+    raw["evaluation"]["protocol_fingerprint"] = ""
+    with pytest.raises(ValueError, match="protocol_fingerprint"):
         RunConfig.from_dict(raw)
+    raw["evaluation"]["protocol_fingerprint"] = 7
+    with pytest.raises(TypeError, match="protocol_fingerprint"):
+        RunConfig.from_dict(raw)
+
+
+def test_stale_eval_stamp_does_not_block_resume_fork_or_verdict(tmp_path):
+    """An additive REGISTRY change must not make a training run's config unreadable.
+
+    Simulates a run whose ``config.json`` was stamped before a registry addition:
+    ``read_stored_config`` (the entry point of resume, fork, verify and
+    verdict) still loads it, and the stamp difference is classified non-material.
+    """
+    from core.run_identity import CONFIG_FILENAME, read_stored_config, resolve_resume
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    path = tmp_path / CONFIG_FILENAME
+    stored = json.loads(path.read_text())
+    stored["evaluation"]["protocol_fingerprint"] = "pre-registry-addition"
+    path.write_text(json.dumps(stored))
+
+    loaded = read_stored_config(tmp_path)
+    assert loaded.run.evaluation.protocol_fingerprint == "pre-registry-addition"
+    current = LaunchConfig.from_dict(
+        {
+            **stored,
+            "evaluation": {
+                k: v for k, v in stored["evaluation"].items() if not k.startswith("protocol_")
+            },
+        }
+    )
+    resolution = resolve_resume(tmp_path, current)
+    assert resolution.non_material_diff["evaluation.protocol_fingerprint"] == (
+        "pre-registry-addition",
+        eval_protocol.protocol_fingerprint(),
+    )
+    assert build_verdict(tmp_path, B=39)["checkpoints_evaluated"] == 1
 
 
 @pytest.mark.parametrize(
