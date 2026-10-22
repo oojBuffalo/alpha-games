@@ -409,6 +409,18 @@ def test_search_rejects_invalid_budgets_before_loading(sims, monkeypatch):
         rung_search_agent_factory("unused.pt", TTT, 7, sims=sims)
 
 
+@pytest.mark.parametrize("model_version", [-1, True, False, "x", 3.0, None])
+def test_search_agent_rejects_invalid_model_versions(model_version):
+    # The third identity component is validated like form and sims, so a
+    # stray bool/str/float can never mint e.g. "rung7-v1-True" in the store.
+    with pytest.raises(ValueError, match="model_version"):
+        SearchAgent(_zero_evaluator, model_version, form=7)
+
+
+def test_search_agent_accepts_the_seeded_init_model_version():
+    assert SearchAgent(_zero_evaluator, 0, form=6).name == "rung6-v1-0"
+
+
 @pytest.mark.parametrize("form", [6.0, 7.0, "6", True, 8])
 def test_search_factory_rejects_invalid_forms_before_loading(form):
     with pytest.raises(ValueError, match="form"):

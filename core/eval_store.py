@@ -624,7 +624,7 @@ def write_header(path: Path, header: CellHeader) -> None:
         FileExistsError: If ``path`` already exists -- use :func:`open_cell_for_resume`
             (or :func:`open_cell_for_write`) for an existing cell.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_durable_dirs(path.parent)
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     try:
         with open(tmp, "x", encoding="utf-8") as fh:
@@ -651,6 +651,14 @@ def append_pair_record(path: Path, record: PairRecord) -> None:
             os.fsync(fh.fileno())
 
 
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -659,9 +667,45 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _make_durable_dirs(path: Path) -> None:
+    """Ensure ``path`` exists and every store-owned directory entry on it is durable.
+
+    ``mkdir`` alone does not make the new directory entry durable: until its
+    *parent* is fsynced, a power loss can drop the directory (and every fsynced
+    file inside it). Seeing a directory already exist is no proof it is durable --
+    a concurrent initializer (or a predecessor that died) may have created it and
+    not yet fsynced its parent. So every store-owned level (``eval/`` and
+    ``eval/cells/``) has its parent fsynced on *every* call, existing or not, as
+    does any other directory created here; only pre-existing directories outside
+    the store (the run directory and above) are trusted as already durable.
+
+    Args:
+        path: The directory that must exist (durably) on return.
+    """
+    path = Path(path)
+    chain: list[Path] = []
+    probe = path
+    while probe != probe.parent and (not probe.exists() or _is_store_owned_dir(probe)):
+        chain.append(probe)
+        probe = probe.parent
+    for directory in reversed(chain):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            pass  # created earlier or by a concurrent writer; still persist the entry
+        _fsync_directory(directory.parent)
+
+
+def _is_store_owned_dir(path: Path) -> bool:
+    """Return whether ``path`` is an ``eval/`` or ``eval/cells/`` store directory."""
+    return path.name == _EVAL_DIRNAME or (
+        path.name == _CELLS_DIRNAME and path.parent.name == _EVAL_DIRNAME
+    )
+
+
 @contextmanager
 def _store_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_durable_dirs(path.parent)
     with open(path, "a+b") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -758,7 +802,10 @@ def _open_cell_for_resume(path: Path, expected_header: CellHeader) -> int:
     Returns:
         The next ``pair_index`` to write (``play_pairs(..., start_pair_index=...)``):
         one past the highest ``pair_index`` recorded, or ``0`` if only the header is
-        present.
+        present. A cell that already holds every pinned pair but is not yet marked
+        complete in the manifest (a crash between the last append and
+        :func:`complete_cell`) returns ``pairs_per_cell``: nothing is left to play,
+        and the caller's next step is :func:`complete_cell`.
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
@@ -783,8 +830,10 @@ def _open_cell_for_resume(path: Path, expected_header: CellHeader) -> int:
     _assert_header_matches(stored_header, expected_header, path)
     records = [PairRecord.from_dict(json.loads(line)) for line in lines[1:]]
     _validate_records(stored_header, records)
-    if len(records) >= stored_header.eval_config["pairs_per_cell"]:
-        raise ManifestError("cell already contains all pinned pairs")
+    # A full-but-not-yet-complete cell (crash between the final append and
+    # complete_cell) returns pairs_per_cell so the caller plays nothing and goes
+    # straight to complete_cell; appends past the count still fail in
+    # _validate_records, and manifest-complete cells were refused above.
     return len(records)
 
 
@@ -888,7 +937,7 @@ def _atomic_write_manifest(run_dir: Path | str, payload: dict[str, Any]) -> None
     ``core.replay_shard`` use for their own replaceable artifacts).
     """
     path = manifest_path(run_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_durable_dirs(path.parent)
     tmp_path = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
     try:
         with open(tmp_path, "w", encoding="utf-8") as fh:
@@ -992,6 +1041,12 @@ def _complete_cell(run_dir: Path | str, cell_id: str) -> None:
     if header.cell_id.to_string() != cell_id:
         raise ManifestError("header identity disagrees with filename")
     _validate_records(header, records, full=True)
+    # Durability barrier: the records just validated may only be in the page cache
+    # (a writer can die after flushing its final append but before that append's
+    # fsync; recovery then sees no torn tail and never syncs). Persist the cell's
+    # bytes and its directory entry before the manifest can call it complete.
+    _fsync_file(path)
+    _fsync_directory(path.parent)
     entry["status"] = _STATUS_COMPLETE
     entry["completed_at"] = time.time()
     _atomic_write_manifest(run_dir, manifest)
@@ -1066,6 +1121,41 @@ def _compute_member_prefix(members: Mapping[str, Any], completed: frozenset[str]
     return prefix
 
 
+def _assert_evidence_stamps_agree(headers: Sequence[CellHeader]) -> None:
+    """Refuse a snapshot whose evidence cells mix protocol, run, or config stamps.
+
+    Pin 10: evidence produced under different protocol fingerprints is never
+    mixed. Every evidence-prefix cell must carry the *current* protocol registry
+    stamp, and all of them must share one ``run_id``. The per-cell resume guard
+    only compares a cell against its own writer; this is the cross-cell check on
+    the single analysis read path.
+
+    ``eval_config`` is deliberately *not* required to be uniform here: the store
+    is count-agnostic (each cell is validated against its own header's
+    ``pairs_per_cell``), and whether a cell's config is the production pin is an
+    authority decision made by the verdict layer, not a storage invariant.
+
+    Args:
+        headers: The headers of the snapshot's evidence-prefix cells.
+
+    Raises:
+        ProtocolMismatchError: If any evidence cell's ``protocol_version`` or
+            ``protocol_fingerprint`` differs from the current registry.
+        ConfigMismatchError: If the evidence cells disagree on ``run_id``.
+    """
+    current = (PROTOCOL_VERSION, protocol_fingerprint())
+    for header in headers:
+        stamp = (header.protocol_version, header.protocol_fingerprint)
+        if stamp != current:
+            raise ProtocolMismatchError(
+                f"evidence cell {header.cell_id.to_string()}: protocol stamp {stamp!r} "
+                f"disagrees with the current registry {current!r}"
+            )
+    run_ids = sorted({header.run_id for header in headers})
+    if len(run_ids) > 1:
+        raise ConfigMismatchError(f"evidence cells disagree on run_id: {run_ids!r}")
+
+
 def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
     """Read the manifest once and freeze it into an immutable :class:`EvalSnapshot`.
 
@@ -1088,6 +1178,9 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
         ManifestError: If a cell the manifest marks complete is missing on disk, its
             header's triple disagrees with its cell id, or its recorded pair count
             does not equal its own header's pinned ``pairs_per_cell``.
+        ProtocolMismatchError: If an evidence-prefix cell carries a protocol stamp
+            other than the current registry's.
+        ConfigMismatchError: If evidence-prefix cells disagree on ``run_id``.
     """
     run_dir = Path(run_dir)
     manifest = _read_manifest(run_dir)
@@ -1098,6 +1191,7 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
         cid for cid, entry in cells.items() if entry["status"] == _STATUS_COMPLETE
     )
     cell_hashes: dict[str, str] = {}
+    cell_headers: dict[str, CellHeader] = {}
     for cid in completed_ids:
         path = cell_path(run_dir, cid)
         if not path.exists():
@@ -1129,6 +1223,7 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
                 f"not the pinned {expected_pairs}"
             )
         cell_hashes[cid] = hashlib.sha256(path.read_bytes()).hexdigest()
+        cell_headers[cid] = header
 
     completed_frozen = frozenset(completed_ids)
     member_prefix = _compute_member_prefix(members, completed_frozen)
@@ -1139,6 +1234,7 @@ def load_snapshot(run_dir: Path | str) -> EvalSnapshot:
             for cid in members[str(version)]["required_cells"]
         }
     )
+    _assert_evidence_stamps_agree([cell_headers[cid] for cid in evidence_ids])
     fingerprint_payload = {
         "schema_version": SCHEMA_VERSION,
         "cell_ids": evidence_ids,

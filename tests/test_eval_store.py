@@ -13,6 +13,9 @@ import dataclasses
 import json
 import math
 import random
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -786,13 +789,45 @@ def test_changed_seed_and_wrong_pair_seed_are_rejected(tmp_path):
     assert len(read_cell(path)[1]) == 1
 
 
-def test_full_scheduled_cell_cannot_resume_or_append(tmp_path):
+def test_full_scheduled_cell_resumes_at_pair_count_then_completes(tmp_path):
+    # Crash between the final append and complete_cell: the relaunch must see
+    # "nothing left to play" and be able to complete, never wedge the cell.
     header = _make_header()
+    cid = header.cell_id.to_string()
+    register_member(tmp_path, header.cell_id.candidate_version, [cid])
     path = _fill_cell(tmp_path, header, PAIRS_PER_CELL)
-    with pytest.raises(ManifestError):
-        open_cell_for_write(tmp_path, header)
+    assert open_cell_for_write(tmp_path, header) == PAIRS_PER_CELL
+    assert open_cell_for_resume(path, header) == PAIRS_PER_CELL
     with pytest.raises(ManifestError):
         append_pair_record(path, _flat_record(PAIRS_PER_CELL))
+    complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+    with pytest.raises(ManifestError):
+        open_cell_for_write(tmp_path, header)
+
+
+def test_snapshot_refuses_evidence_cells_with_mixed_run_ids(tmp_path):
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1, run_id="run-1"))
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=2, run_id="other-run"))
+    with pytest.raises(ConfigMismatchError, match="run_id"):
+        load_snapshot(tmp_path)
+
+
+def test_snapshot_refuses_evidence_cells_stamped_by_another_protocol(tmp_path, monkeypatch):
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1))
+    monkeypatch.setitem(eval_protocol.REGISTRY, "a_new_convention_constant", 1)
+    with pytest.raises(ProtocolMismatchError):
+        load_snapshot(tmp_path)
+
+
+def test_snapshot_stamp_check_ignores_post_hole_provisional_cells(tmp_path):
+    # Only the evidence prefix must agree; a complete cell after a hole is
+    # provisional and its stamps do not gate the analyzed prefix.
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=1))
+    register_member(tmp_path, 2, [build_cell_id(2, 7, "random")])
+    _write_and_complete_cell(tmp_path, _make_header(candidate_version=3, run_id="other-run"))
+    snapshot = load_snapshot(tmp_path)
+    assert snapshot.member_prefix == 1
 
 
 def test_future_header_schema_checked_before_renamed_fields(tmp_path):
@@ -847,3 +882,195 @@ def test_legacy_schema_rejected_before_missing_seed_parse(tmp_path):
         read_cell(path)
     with pytest.raises(SchemaVersionError):
         open_cell_for_resume(path, header)
+
+
+def test_new_store_directories_are_persisted_in_their_parents_before_use(tmp_path, monkeypatch):
+    """Each directory the store creates is fsynced into its parent before contents.
+
+    ``mkdir`` alone does not survive a power loss until the parent is fsynced, so
+    ``eval/`` must be persisted in ``run_dir`` and ``cells/`` in ``eval/`` before
+    any durable write inside them is acknowledged.
+    """
+    import core.eval_store as store
+
+    events: list[tuple[str, str]] = []
+    real_fsync_dir = store._fsync_directory
+    real_fsync = store.os.fsync
+
+    def record_dir(path):
+        events.append(("dir", Path(path).resolve().relative_to(tmp_path.resolve()).as_posix()))
+        real_fsync_dir(path)
+
+    def record_file(fd):
+        events.append(("file", ""))
+        real_fsync(fd)
+
+    header = _make_header(eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1})
+    cid = header.cell_id.to_string()
+    with monkeypatch.context() as m:
+        m.setattr(store, "_fsync_directory", record_dir)
+        m.setattr(store.os, "fsync", record_file)
+        register_member(tmp_path, header.cell_id.candidate_version, [cid])
+        assert open_cell_for_write(tmp_path, header) == 0
+        append_pair_record(cell_path(tmp_path, cid), _flat_record(0))
+        complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+
+    dir_syncs = [name for kind, name in events if kind == "dir"]
+    # eval/ is created on first registration: run_dir is synced before anything else.
+    assert events[0] == ("dir", ".")
+    # cells/ is created by the first header: eval/ is synced after cells/ exists and
+    # before the header file's own fsync is acknowledged by its directory sync.
+    cells_sync = dir_syncs.index("eval/cells")
+    assert "eval" in dir_syncs[1:cells_sync]
+    # Store-owned levels are re-persisted on every use (existence is not durability),
+    # but directories outside the store (run_dir's own parent) are never synced.
+    assert ".." not in dir_syncs and all(not name.startswith("..") for name in dir_syncs)
+
+
+def _record_dir_syncs(monkeypatch, root, events, *, block_first_root_sync=None):
+    import core.eval_store as store
+
+    real_fsync_dir = store._fsync_directory
+    blocked = {"done": False}
+
+    def record_dir(path):
+        name = Path(path).resolve().relative_to(root.resolve()).as_posix()
+        if block_first_root_sync is not None and name == "." and not blocked["done"]:
+            blocked["done"] = True
+            block_first_root_sync.wait(timeout=10)
+        events.append((threading.get_ident(), name))
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", record_dir)
+
+
+def test_preexisting_unsynced_store_dirs_are_persisted_before_acknowledgement(
+    tmp_path, monkeypatch
+):
+    """A visible ``eval/``/``cells/`` left by a dead predecessor is still persisted.
+
+    Simulates a writer that died between ``mkdir`` and its parent fsync: both
+    store directories exist but were never synced. The next writer must fsync
+    ``run_dir`` (for ``eval/``) and ``eval/`` (for ``cells/``) itself before its
+    evidence is acknowledged.
+    """
+    (tmp_path / "eval" / "cells").mkdir(parents=True)
+    events: list[tuple[int, str]] = []
+    header = _make_header(eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1})
+    cid = header.cell_id.to_string()
+    _record_dir_syncs(monkeypatch, tmp_path, events)
+    register_member(tmp_path, header.cell_id.candidate_version, [cid])
+    assert (threading.get_ident(), ".") in events  # eval/ persisted in run_dir
+    events.clear()
+    assert open_cell_for_write(tmp_path, header) == 0
+    names = [name for _, name in events]
+    assert "." in names and "eval" in names  # cells/ persisted in eval/ too
+    append_pair_record(cell_path(tmp_path, cid), _flat_record(0))
+    complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+
+
+def test_concurrent_initializer_cannot_ack_before_eval_dir_is_durable(tmp_path, monkeypatch):
+    """Writer B must not rely on writer A's still-pending fsync of ``run_dir``.
+
+    A creates ``eval/`` during ``register_member`` and stalls before fsyncing
+    ``run_dir``. B then registers, writes, appends and completes a cell; B must
+    have fsynced ``run_dir`` itself before ``complete_cell`` returns.
+    """
+    gate = threading.Event()
+    events: list[tuple[int, str]] = []
+    _record_dir_syncs(monkeypatch, tmp_path, events, block_first_root_sync=gate)
+    header_a = _make_header()
+    header_b = _make_header(
+        candidate_version=header_a.cell_id.candidate_version + 1,
+        eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1},
+    )
+    errors: list[BaseException] = []
+
+    def writer_a():
+        try:
+            register_member(
+                tmp_path, header_a.cell_id.candidate_version, [header_a.cell_id.to_string()]
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=writer_a)
+    thread_a.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "eval").exists():
+            assert time.monotonic() < deadline, "writer A never created eval/"
+            time.sleep(0.001)
+        me = threading.get_ident()
+        cid = header_b.cell_id.to_string()
+        register_member(tmp_path, header_b.cell_id.candidate_version, [cid])
+        assert open_cell_for_write(tmp_path, header_b) == 0
+        append_pair_record(cell_path(tmp_path, cid), _flat_record(0))
+        complete_cell(tmp_path, cid)
+        assert is_cell_complete(tmp_path, cid)
+        assert not gate.is_set()  # A is still stalled before its run_dir sync
+        assert (me, ".") in events, "B acknowledged evidence without persisting eval/"
+    finally:
+        gate.set()
+        thread_a.join(timeout=10)
+    assert not errors
+
+
+def test_complete_cell_syncs_recovered_cell_before_committing_manifest(tmp_path, monkeypatch):
+    """A final append that died before its fsync is made durable before completion.
+
+    The writer flushes the last record and dies before ``os.fsync`` returns, so the
+    complete record sits only in the page cache: recovery sees no torn tail and
+    never syncs. ``complete_cell`` must fsync the cell file and its directory
+    before the manifest marks the cell complete.
+    """
+    import os
+
+    import core.eval_store as store
+
+    header = _make_header(eval_config={**eval_protocol.eval_config_snapshot(), "pairs_per_cell": 1})
+    cid = header.cell_id.to_string()
+    path = cell_path(tmp_path, cid)
+    register_member(tmp_path, header.cell_id.candidate_version, [cid])
+    assert open_cell_for_write(tmp_path, header) == 0
+    cell_ino = path.stat().st_ino
+    real_fsync = store.os.fsync
+
+    def dying_fsync(fd):
+        if os.fstat(fd).st_ino == cell_ino:
+            raise OSError("simulated crash before the final append's fsync")
+        real_fsync(fd)
+
+    with monkeypatch.context() as m:
+        m.setattr(store.os, "fsync", dying_fsync)
+        with pytest.raises(OSError, match="simulated crash"):
+            append_pair_record(path, _flat_record(0))
+
+    events: list[str] = []
+    cells_ino = path.parent.stat().st_ino
+    real_write_manifest = store._atomic_write_manifest
+
+    def tracking_fsync(fd):
+        ino = os.fstat(fd).st_ino
+        if ino == cell_ino:
+            events.append("cell")
+        elif ino == cells_ino:
+            events.append("cells_dir")
+        real_fsync(fd)
+
+    def tracking_manifest(run_dir, payload):
+        if any(e["status"] == "complete" for e in payload["cells"].values()):
+            events.append("manifest_complete")
+        real_write_manifest(run_dir, payload)
+
+    monkeypatch.setattr(store.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(store, "_atomic_write_manifest", tracking_manifest)
+    assert open_cell_for_write(tmp_path, header) == 1  # full record survived in cache
+    events.clear()
+    complete_cell(tmp_path, cid)
+    assert is_cell_complete(tmp_path, cid)
+    commit = events.index("manifest_complete")
+    assert "cell" in events[:commit]
+    assert "cells_dir" in events[:commit]
