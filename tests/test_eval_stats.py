@@ -1359,6 +1359,19 @@ def test_plateau_registry_constants_match_the_literal_pinned_values():
         )
 
 
+def test_pinned_width_bound_is_implied_by_the_equivalence_gate():
+    """Doc §12: at the pinned values the width clause is the 2ε consequence of ε.
+
+    Any interval strictly inside (−ε, +ε) is narrower than 2ε, so a width
+    threshold of 2ε never decides an outcome alone. A pin below 2ε would make
+    it a binding gate and must be a doc amendment; this golden fails on that.
+    """
+    assert (
+        eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO
+        == 2 * eval_protocol.PLATEAU_EQUIVALENCE_MARGIN_ELO
+    )
+
+
 @pytest.mark.parametrize("key", [k for k in eval_protocol.REGISTRY if k.startswith("plateau_")])
 def test_plateau_registry_constants_are_covered_by_the_protocol_fingerprint(monkeypatch, key):
     before = eval_protocol.protocol_fingerprint()
@@ -1518,7 +1531,7 @@ def test_stale_elo_curve_missing_the_newest_member_is_insufficient_data(tmp_path
 
     assert result.outcome == PLATEAU_OUTCOME_INSUFFICIENT_DATA
     assert result.current.versions == tuple(range(1, 17))
-    assert result.current.gpu_hours_span is None  # version 8 has no row in the stale file
+    assert result.current.gpu_hours_span is None  # version 16 has no row in the stale file
     assert result.elo_curve_fingerprint == hashlib.sha256(stale_fingerprint).hexdigest()
     assert "GPU-hours coordinate" in result.reason
 
@@ -1578,7 +1591,7 @@ def test_a_window_shorter_than_m_and_an_all_tied_window_are_both_never_plateau(t
     """Both P2.5 triggers side by side, over the same two candidate window
     lengths one below and one at ``M``: neither ever reaches PLATEAU or
     NO_PLATEAU, only the explicit tri-state INSUFFICIENT-DATA."""
-    short_scores = {v: [1.0, 0.0] for v in range(1, 16)}  # 7 < M -- too short outright
+    short_scores = {v: [1.0, 0.0] for v in range(1, 16)}  # 15 < M -- too short outright
     tied_scores = {v: [1.0, 1.0] for v in range(1, 17)}  # exactly M, but all-tied
 
     for scores in (short_scores, tied_scores):
@@ -1609,7 +1622,8 @@ def test_mann_kendall_significant_trend_blocks_plateau_alone(tmp_path):
     assert result.confirmation_count == 0
 
 
-def test_wide_ci_blocks_plateau_alone(tmp_path):
+def test_wide_ci_blocks_plateau(tmp_path):
+    """A wide interval fails both the width bound and the equivalence gate it implies."""
     rng = random.Random(1)
     scores = {v: _win_rate_pair_scores(rng, 0.5, 8) for v in range(1, 17)}
     _build_plateau_fixture(tmp_path, scores)
@@ -1618,7 +1632,9 @@ def test_wide_ci_blocks_plateau_alone(tmp_path):
 
     c = result.current
     assert c.mk_non_significant is True
-    assert c.ci_narrow is False  # the one blocking sub-condition
+    assert c.ci_narrow is False
+    # Width >= 2 * margin forces an endpoint outside (-margin, +margin).
+    assert c.ci_equivalent is False
     assert c.contrast_ci_width >= eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO
     assert c.gpu_span_sufficient is True
     assert c.satisfied is False
@@ -1907,7 +1923,8 @@ def test_plateau_at_pinned_24_pairs_per_cell(tmp_path, seed):
     # Four independent, unsaturated rung cells: 96 pairs of rung-7 evidence.
     for v in range(1, 19):
         cells = [(7, "random", _win_rate_pair_scores(rng, 0.5, 24))]
-        # Additional opponents have fixed anchor ties through their own cells.
+        # fixed-a..c have no cells of their own: they reach the anchor only
+        # through the members, so their ratings are estimated, not fixed.
         for opponent in ("fixed-a", "fixed-b", "fixed-c"):
             cells.append((7, opponent, _win_rate_pair_scores(rng, 0.5, 24)))
         _write_member(tmp_path, v, cells)
@@ -1919,6 +1936,51 @@ def test_plateau_at_pinned_24_pairs_per_cell(tmp_path, seed):
     result = detect_plateau(tmp_path, B=399)
     assert result.current.ci_narrow is True
     assert result.current.ci_equivalent is True
+    assert result.outcome == PLATEAU_OUTCOME_PLATEAU
+
+
+def _elo_expected_score(rating_a: float, rating_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** (-(rating_a - rating_b) / 400.0))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("flat_elo", [900.0, 1200.0])
+def test_plateau_at_pinned_24_pairs_against_a_saturated_ladder_with_rung8_cells(tmp_path, flat_elo):
+    """Late-run reachability: saturated frozen rungs plus the pin-5 rung-8 graph.
+
+    Members climb 100 -> 500 -> ``flat_elo`` and then stay flat, so both
+    confirmation windows (members 3..18 and 4..19) are flat. Each member plays
+    four frozen rungs at true 0/120/250/380 -- nearly saturated at 900+ -- and
+    its rung-8 historical cells ``{v-1, v-8, 1}``, all at 24 pairs/cell.
+    """
+    rungs = (("random", 0.0), ("frozen-120", 120.0), ("frozen-250", 250.0), ("frozen-380", 380.0))
+
+    def true_elo(v: int) -> float:
+        return min(flat_elo, 100.0 + 400.0 * (v - 1))
+
+    rng = random.Random(0)
+    n_members = 19
+    for v in range(1, n_members + 1):
+        cells = [
+            (7, opp, _win_rate_pair_scores(rng, _elo_expected_score(true_elo(v), r), 24))
+            for opp, r in rungs
+        ]
+        for u in sorted({u for u in (v - 1, v - 8, 1) if 1 <= u < v}):
+            p = _elo_expected_score(true_elo(v), true_elo(u))
+            cells.append((7, f"rung7-v1-{u}", _win_rate_pair_scores(rng, p, 24)))
+        _write_member(tmp_path, v, cells)
+    _write_gpu_segmented_checkpoint_markers(
+        tmp_path, list(range(1, n_members + 1)), seconds_per_version=4200.0
+    )
+    _write_run_config(tmp_path, checkpoint_count=30, eval_seed=4242)
+    elo_curve(tmp_path, load_snapshot(tmp_path))
+
+    result = detect_plateau(tmp_path, B=39)
+
+    for window in (result.current, result.previous):
+        assert window.contrast_ci_width < eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO
+        assert window.ci_equivalent is True
+        assert window.satisfied is True
     assert result.outcome == PLATEAU_OUTCOME_PLATEAU
 
 
