@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ from core.eval_stats import (
 )
 from core.eval_store import EvalSnapshot, eval_dir, iter_cells, load_snapshot, read_cell
 from core.observability import reduce_run
-from core.replay_shard import _atomic_write_json
+from core.replay_shard import _atomic_write, _atomic_write_json
 from core.run_identity import read_stored_config
 
 _ELO_CURVE_NAME = "elo_curve.json"
@@ -92,6 +93,13 @@ def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
             ``checkpoint_published`` marker for it) this function refuses to
             paper over.
     """
+    payload = _curve_payload(run_dir, snapshot)
+    _write_blob(elo_curve_path(run_dir), _json_blob(payload))
+    return payload
+
+
+def _curve_payload(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
+    """Fit and join the §1 plot series without writing it (see :func:`elo_curve`)."""
     if Path(run_dir).resolve() != Path(snapshot.run_dir).resolve():
         raise ValueError("run_dir must identify the same run as snapshot.run_dir")
     ratings = fit_snapshot_elo(snapshot)
@@ -117,9 +125,43 @@ def elo_curve(run_dir: Path | str, snapshot: EvalSnapshot) -> dict[str, Any]:
             }
         )
 
-    payload = {"snapshot_fingerprint": snapshot.snapshot_fingerprint, "rows": rows}
-    _atomic_write_json(elo_curve_path(run_dir), payload)
-    return payload
+    return {"snapshot_fingerprint": snapshot.snapshot_fingerprint, "rows": rows}
+
+
+def elo_curve_artifact_path(run_dir: Path | str, fingerprint: str) -> Path:
+    """Return the immutable, content-addressed copy of one published curve.
+
+    :func:`build_verdict` references the curve it fitted by this name rather
+    than by the shared, replaceable :func:`elo_curve_path`, so a later
+    publisher refreshing ``elo_curve.json`` can never substitute a different
+    snapshot's curve under an already-written verdict's hash. One file exists
+    per distinct published snapshot (at most one per member-prefix length
+    plus the empty prefix), so the set stays bounded by ``K + 1``.
+
+    Args:
+        run_dir: The run's root directory.
+        fingerprint: The sha256 hex digest of the curve file's exact bytes.
+
+    Returns:
+        ``<run_dir>/eval/elo_curve-<fingerprint>.json``.
+
+    Raises:
+        ValueError: If ``fingerprint`` is not a 64-character lowercase hex
+            digest (it becomes a path component).
+    """
+    if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+        raise ValueError("elo curve fingerprint must be a 64-character lowercase hex digest")
+    return eval_dir(run_dir) / f"elo_curve-{fingerprint}.json"
+
+
+def _json_blob(payload: dict[str, Any]) -> bytes:
+    """Serialize ``payload`` with the same convention as :func:`_atomic_write_json`."""
+    return json.dumps(payload, sort_keys=True, indent=2).encode("utf-8")
+
+
+def _write_blob(path: Path, blob: bytes) -> None:
+    """Atomically write already-serialized bytes (temp name, then ``os.replace``)."""
+    _atomic_write(path, lambda fh: fh.write(blob))
 
 
 # Verdict publication (design doc §9/§12).
@@ -137,18 +179,6 @@ def verdict_path(run_dir: Path | str) -> Path:
         ``<run_dir>/eval/verdict.json``.
     """
     return eval_dir(run_dir) / _VERDICT_NAME
-
-
-def _file_sha256(path: Path) -> str:
-    """Return the sha256 hex digest of a file's raw on-disk bytes.
-
-    Args:
-        path: The file to hash.
-
-    Returns:
-        A 64-character lowercase hex digest.
-    """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _production_identity(identity: str) -> bool:
@@ -180,7 +210,8 @@ def build_verdict(
     (:func:`bootstrap_replicates`) exactly once, reused for both
     per-checkpoint CIs (:func:`per_checkpoint_ci`) and -- **iff** the
     snapshot's contiguous member prefix equals the complete ``k_target``
-    -member set (task 1 pin 8) -- the Delta contrast (:func:`delta_hat`,
+    -member set **and** the extracted rung-7 curve covers exactly versions
+    ``1..k_target`` (task 1 pin 8) -- the Delta contrast (:func:`delta_hat`,
     :func:`replicate_deltas`, :func:`order_statistic_ci`,
     :func:`delta_gate`); and runs Mann-Kendall (:func:`mann_kendall`) over the
     evaluated prefix's point-estimate curve unconditionally (reported, never
@@ -218,6 +249,14 @@ def build_verdict(
             verdict provisional: it may still carry a Delta/CI/gate, never the
             ``authoritative`` flag.
 
+    The curve is serialized once; ``elo_curve_fingerprint`` is the sha256 of
+    exactly those bytes, which are written both to an immutable
+    content-addressed copy (:func:`elo_curve_artifact_path`, named by
+    ``elo_curve_artifact``) and to the shared, replaceable
+    :func:`elo_curve_path`. A reader verifies the verdict against the
+    content-addressed copy; a later publisher refreshing the shared path can
+    never make a different snapshot's curve verify under this verdict's hash.
+
     Returns:
         The verdict payload -- the identical JSON-safe dict durably written
         (temp-name-then-``os.replace``, sorted keys, so the same records and
@@ -250,12 +289,19 @@ def build_verdict(
             _production_identity(header.candidate_identity)
             and _production_identity(header.opponent_identity)
             and header.eval_config.get("pairs_per_cell") == PAIRS_PER_CELL
-            and header.eval_config.get("eval_sims", EVAL_SIMS) == EVAL_SIMS
+            and header.eval_config.get("eval_sims") == EVAL_SIMS
         )
         for header, _ in (read_cell(path) for path in iter_cells(snapshot))
     )
     checkpoints_evaluated = snapshot.member_prefix
-    is_complete_k_set = checkpoints_evaluated == k_target
+    # The member prefix alone does not prove a rung-7 rating exists for every
+    # member (a member's registered cell set need not include a rung-7 cell),
+    # and ``delta_hat`` takes K from ``len(curve)``. Pin 8's complete K-set
+    # therefore also requires the extracted curve to be exactly 1..k_target.
+    curve_versions = [version for version, _ in point_curve]
+    expected_versions = list(range(1, k_target + 1))
+    missing_rung7 = sorted(set(range(1, checkpoints_evaluated + 1)) - set(curve_versions))
+    is_complete_k_set = checkpoints_evaluated == k_target and curve_versions == expected_versions
 
     replicate_ratings = (
         list(bootstrap_replicates(snapshot, seed, B)) if snapshot.member_prefix else []
@@ -290,6 +336,14 @@ def build_verdict(
             reason = "reduced evaluation schedule (forms or rung-8 rule) -- provisional"
         else:
             reason = None
+    elif checkpoints_evaluated == k_target:
+        delta_payload = None
+        reason = (
+            f"snapshot prefix covers all {k_target} required checkpoint(s) but the rung-7 "
+            f"curve has versions {curve_versions}, not 1..{k_target} (no rung-7 rating for "
+            f"member(s) {missing_rung7}) -- the Delta contrast is only ever computed over "
+            "the complete K-set (task 1 pin 8)"
+        )
     else:
         delta_payload = None
         reason = (
@@ -298,14 +352,20 @@ def build_verdict(
             "complete K-set (task 1 pin 8); no prefix Delta exists, advisory or otherwise"
         )
 
-    if snapshot.member_prefix:
-        elo_curve(run_dir, snapshot)
-    else:
-        _atomic_write_json(
-            elo_curve_path(run_dir),
-            {"snapshot_fingerprint": snapshot.snapshot_fingerprint, "rows": []},
-        )
-    elo_curve_fingerprint = _file_sha256(elo_curve_path(run_dir))
+    curve_payload = (
+        _curve_payload(run_dir, snapshot)
+        if snapshot.member_prefix
+        else {"snapshot_fingerprint": snapshot.snapshot_fingerprint, "rows": []}
+    )
+    # Hash the bytes this invocation serializes -- never a re-read of the shared
+    # path, which another publisher may replace in between -- and reference an
+    # immutable content-addressed copy, so the verdict's curve hash always
+    # describes this verdict's own snapshot (pin 9).
+    curve_blob = _json_blob(curve_payload)
+    elo_curve_fingerprint = hashlib.sha256(curve_blob).hexdigest()
+    curve_artifact = elo_curve_artifact_path(run_dir, elo_curve_fingerprint)
+    _write_blob(curve_artifact, curve_blob)
+    _write_blob(elo_curve_path(run_dir), curve_blob)
 
     payload: dict[str, Any] = {
         "authoritative": (
@@ -320,6 +380,7 @@ def build_verdict(
         "bootstrap_seed": seed,
         "evidence_fingerprint": snapshot.snapshot_fingerprint,
         "elo_curve_fingerprint": elo_curve_fingerprint,
+        "elo_curve_artifact": curve_artifact.name,
         "protocol_version": PROTOCOL_VERSION,
         "protocol_fingerprint": protocol_fingerprint(),
         "protocol_constants": dict(REGISTRY),

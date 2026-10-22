@@ -509,9 +509,17 @@ class EvaluationConfig:
             ``RunConfig.run_seed`` so the paired set is not coupled to training.
         min_score_rate: Score-rate floor the trained side must reach, where a
             draw scores 0.5.
-        protocol_version: Version of the registered evaluation conventions.
-        protocol_fingerprint: Hash of those conventions, serialized with config
-            and checked when reading a stamped config.
+        protocol_version: Version of the registered evaluation conventions
+            this config was stamped with (the current ``PROTOCOL_VERSION`` for
+            a fresh config).
+        protocol_fingerprint: Hash of those conventions as stamped (the current
+            ``protocol_fingerprint()`` for a fresh config). A stored stamp is a
+            provenance *record*, preserved verbatim on read and never compared
+            against the live registry here: an eval-protocol change does not
+            alter training (``core.run_identity`` classifies both stamps
+            non-material), so it must not make a training run's own
+            ``config.json`` unreadable. Evidence mixing is refused where
+            evidence lives -- at the cell headers (``core.eval_store``).
     """
 
     agent_form: str
@@ -522,8 +530,8 @@ class EvaluationConfig:
     n_pairs: int
     eval_seed: int
     min_score_rate: float
-    protocol_version: int = field(default=PROTOCOL_VERSION, init=False)
-    protocol_fingerprint: str = field(default_factory=protocol_fingerprint, init=False)
+    protocol_version: int = PROTOCOL_VERSION
+    protocol_fingerprint: str = field(default_factory=protocol_fingerprint)
 
     def __post_init__(self) -> None:
         """Validate the evaluation protocol.
@@ -531,8 +539,9 @@ class EvaluationConfig:
         Raises:
             ValueError: If ``agent_form``/``opponent`` are blank, ``sims`` or
                 ``n_pairs`` is not positive, ``eval_seed`` is negative,
-                ``move_selection`` is unknown, or ``min_score_rate`` is outside
-                ``[0, 1]``.
+                ``move_selection`` is unknown, ``min_score_rate`` is outside
+                ``[0, 1]``, ``protocol_version`` is not positive, or
+                ``protocol_fingerprint`` is blank.
         """
         _non_empty(self.agent_form, "evaluation.agent_form")
         _non_empty(self.opponent, "evaluation.opponent")
@@ -541,6 +550,8 @@ class EvaluationConfig:
         _non_negative(self.eval_seed, "evaluation.eval_seed")
         _one_of(self.move_selection, MOVE_SELECTIONS, "evaluation.move_selection")
         _unit_interval(self.min_score_rate, "evaluation.min_score_rate")
+        _positive(self.protocol_version, "evaluation.protocol_version")
+        _non_empty(self.protocol_fingerprint, "evaluation.protocol_fingerprint")
 
 
 @dataclass(frozen=True)
@@ -696,8 +707,9 @@ class RunConfig:
         """Return the config as nested plain dicts.
 
         The result round-trips: ``RunConfig.from_dict(cfg.to_dict()) == cfg``,
-        and reproduces the source JSON with documentation keys removed and
-        the current evaluation protocol stamps added. JSON integers in float
+        and reproduces the source JSON with documentation keys removed and,
+        for a source without them, the current evaluation protocol stamps
+        added (stored stamps are reproduced verbatim). JSON integers in float
         fields compare equal to their widened values.
 
         Returns:
@@ -845,16 +857,18 @@ def _evaluation_from_dict(raw: Mapping[str, Any]) -> EvaluationConfig:
         ValueError: On unknown/missing keys or out-of-range values.
         TypeError: On a wrong value type.
     """
-    # Legacy source configs acquire stamps on load; serialized configs must carry
-    # current stamps, so a registry change cannot silently relabel stored configs.
+    # Source configs without stamps acquire the current ones; a stored stamp is
+    # preserved verbatim as a record (never rejected, never relabeled) -- the
+    # fingerprint guard on evidence lives at the eval-store cell headers.
     raw = dict(raw)
-    for key, current in (
-        ("protocol_version", PROTOCOL_VERSION),
-        ("protocol_fingerprint", protocol_fingerprint()),
-    ):
-        if key in raw and raw.pop(key) != current:
-            raise ValueError(f"evaluation.{key}: stored protocol does not match current registry")
     where = "evaluation"
+    stamps: dict[str, Any] = {}
+    if "protocol_version" in raw:
+        stamps["protocol_version"] = _int(raw, "protocol_version", where)
+        del raw["protocol_version"]
+    if "protocol_fingerprint" in raw:
+        stamps["protocol_fingerprint"] = _str(raw, "protocol_fingerprint", where)
+        del raw["protocol_fingerprint"]
     _check_keys(
         raw,
         (
@@ -878,6 +892,7 @@ def _evaluation_from_dict(raw: Mapping[str, Any]) -> EvaluationConfig:
         n_pairs=_int(raw, "n_pairs", where),
         eval_seed=_int(raw, "eval_seed", where),
         min_score_rate=_float(raw, "min_score_rate", where),
+        **stamps,
     )
 
 

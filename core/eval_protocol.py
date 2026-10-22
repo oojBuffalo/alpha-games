@@ -125,7 +125,9 @@ BOOTSTRAP_CI_UPPER_QUANTILE = 0.975
 PLATEAU_WINDOW_M = 16
 PLATEAU_MK_ALPHA = 0.05
 PLATEAU_HALF_WINDOW_RULE = "ceil(M/2)"
-#: Precision gate: CI width must be strictly below this threshold.
+#: Precision bound: CI width must be strictly below this threshold. At the pinned
+#: values it is implied by the equivalence gate (150 == 2 * margin), so it never
+#: decides an outcome alone; it stays pinned so a margin change cannot drop it.
 PLATEAU_CI_WIDTH_THRESHOLD_ELO = 150.0
 #: Location gate: both endpoints must lie strictly inside (-margin, +margin).
 PLATEAU_EQUIVALENCE_MARGIN_ELO = 75.0

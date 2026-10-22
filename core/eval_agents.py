@@ -220,6 +220,11 @@ def _validate_search_budget(sims: int) -> None:
         raise ValueError(f"sims must be an integer >= 2, got {sims!r}")
 
 
+def _validate_model_version(model_version: int) -> None:
+    if type(model_version) is not int or model_version < 0:
+        raise ValueError(f"model_version must be an integer >= 0, got {model_version!r}")
+
+
 class SearchAgent(Agent):
     """Ladder rungs 6 and 7: fresh deterministic MCTS search, argmax-N (§9).
 
@@ -278,8 +283,8 @@ class SearchAgent(Agent):
             supplying the leaf value for both forms and, for rung 7, the
             policy priors; rung 6 calls the identical evaluator and simply
             discards its priors (the ``uniform_prior`` flag).
-        model_version: The checkpoint's model-version ordinal, for
-            :attr:`name`.
+        model_version: The checkpoint's model-version ordinal (an integer
+            >= 0, 0 being the seeded init), for :attr:`name`.
         form: ``6`` for uniform-prior MCTS with network value, ``7`` for
             full policy-and-value MCTS.
         sims: Simulations per move (default :data:`EVAL_SIMS`, the pinned
@@ -289,7 +294,8 @@ class SearchAgent(Agent):
             the first expands the root, the second visits a root edge.
 
     Raises:
-        ValueError: If the form is invalid or sims is not an integer >= 2.
+        ValueError: If the form is invalid, sims is not an integer >= 2, or
+            model_version is not an integer >= 0.
     """
 
     def __init__(
@@ -302,6 +308,7 @@ class SearchAgent(Agent):
     ):
         form = SearchForm.parse(form)
         _validate_search_budget(sims)
+        _validate_model_version(model_version)
         self._evaluator = evaluator
         self._uniform_prior = form.uniform_prior
         self._sims = sims

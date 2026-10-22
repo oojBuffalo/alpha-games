@@ -369,6 +369,33 @@ def test_scripted_two_actor_learner_orchestrator_golden_with_interleaved_publish
     assert reduce_run(tmp_path) == result
 
 
+def test_a_crashed_segment_superseded_by_a_resume_is_credited_only_through_its_last_record(
+    tmp_path,
+):
+    """Crash then resume: launch A (t=0h) publishes v0 at 1h and dies with no
+    ``segment_end``; launch B starts at 3h, publishes v1 at 4h, and ends at 5h.
+    A is credited only through its last record (1h), never the 2h downtime, so
+    v1 sits at 1h + 1h = 2h (not 5h) and the run total is 1h + 2h = 3h.
+    """
+    hour = 3600.0
+    orch = EpochMetricsWriter(tmp_path, "orchestrator")
+    learner = EpochMetricsWriter(tmp_path, "learner")
+    orch.append(segment_start_record(device="cpu", timestamp=0.0))
+    _append_checkpoint_published(learner, version=0, learner_step=0, timestamp=1 * hour)
+    orch_resumed = EpochMetricsWriter(tmp_path, "orchestrator")  # A crashed: no segment_end
+    orch_resumed.append(segment_start_record(device="cpu", timestamp=3 * hour))
+    _append_checkpoint_published(learner, version=1, learner_step=10, timestamp=4 * hour)
+    orch_resumed.append(segment_end_record(timestamp=5 * hour))
+
+    result = reduce_run(tmp_path)
+
+    gpu_axis = [result.checkpoints[v][2] for v in sorted(result.checkpoints)]
+    assert gpu_axis == [pytest.approx(1.0), pytest.approx(2.0)]
+    assert result.gpu_hours == pytest.approx(3.0)
+    assert gpu_axis == sorted(gpu_axis)  # non-decreasing across the crash
+    assert all(x <= result.gpu_hours for x in gpu_axis)
+
+
 # ==============================================================================
 # 3. Driver wiring: ActorDriver's opt-in metrics flush
 # ==============================================================================
