@@ -820,7 +820,9 @@ def _lag_header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs:
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=agent_identity(rung, candidate_version),
         opponent_identity=opponent_id,
-        eval_config={"pairs_per_cell": n_pairs},
+        # Production writers stamp S on every cell; the verdict authority gate
+        # requires the key rather than defaulting a missing one.
+        eval_config={"pairs_per_cell": n_pairs, "eval_sims": eval_protocol.EVAL_SIMS},
         candidate_fingerprint={"orientation_table_hash": "test"},
         cell_seed=0,
     )
