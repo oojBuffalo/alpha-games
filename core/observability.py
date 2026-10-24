@@ -339,8 +339,8 @@ class ReducedRun:
             field); ``positions_evaluated`` is the cumulative actor-delta sum
             at or before the marker (exact **up to one actor flush period** --
             a stated bound, never interpolated); ``gpu_hours`` is the
-            single-counted segment time elapsed by the marker, under the same
-            completed-segments-only rule as the top-level ``gpu_hours``.
+            single-counted completed-segment time plus elapsed active-segment
+            time at the marker timestamp, even if that segment never closes.
     """
 
     totals: dict[str, float]
@@ -447,15 +447,28 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
     Single forward pass, in the pinned time order (:func:`_ordered_records`):
     delta values accumulate into per-series running sums; ``total`` records
     overwrite (never add to) their series' last-known value; ``gauge``
-    records do the same; ``segment_start``/``segment_end`` pairs (a LIFO
-    stack of open starts -- the orchestrator is a single writer that never
-    legitimately opens two segments at once, so this only matters for
-    hand-built fixtures) accumulate completed-segment seconds; and each
-    ``checkpoint_published`` marker snapshots the running
-    positions-evaluated sum and completed-GPU-seconds *as of that point in
-    the scan* -- which, by construction of the single forward pass, is
-    exactly "summed over every record at or before the marker's position in
-    run time order".
+    records do the same; ``segment_start``/``segment_end`` pairs
+    accumulate completed-segment seconds; and each ``checkpoint_published``
+    marker snapshots the running positions-evaluated sum and GPU seconds
+    (completed segments plus active-segment time through the marker
+    timestamp) *as of that point in the scan* -- which, by construction of
+    the single forward pass, is exactly "summed over every record at or
+    before the marker's position in run time order".
+
+    At most one segment is open at a time: the orchestrator is a single
+    writer that never legitimately opens two at once, and it appends
+    ``segment_end`` only on a clean shutdown (``core.ipc``). A
+    ``segment_start`` that arrives while a segment is still open therefore
+    means the earlier launch crashed: that segment is *abandoned*, credited
+    only up to the last record observed before the new start (a lower bound
+    on how long the crashed launch was alive -- never the downtime between
+    the crash and the resume), and replaced by the new one. Abandoned
+    credit counts toward both the top-level ``gpu_hours`` and every later
+    checkpoint coordinate, so checkpoint coordinates stay non-decreasing
+    across a crash/resume and a checkpoint published inside a closed
+    segment never exceeds the final total. A segment still open at the end
+    of the scan contributes to the checkpoint coordinates inside it but not
+    to the top-level total (conservative: never estimated).
 
     Args:
         run_dir: The run's root directory (``core.metrics.metrics_dir``).
@@ -473,7 +486,8 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
 
     running_positions = 0.0
     gpu_seconds = 0.0
-    open_segment_starts: list[float] = []
+    open_segment_start: float | None = None
+    last_ts: float | None = None
     checkpoints: dict[int, tuple[int, float, float]] = {}
 
     for ts, _proc, _seq, rec in ordered:
@@ -499,17 +513,23 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
         elif kind == KIND_GAUGE:
             gauge_last[rec["series"]] = float(rec["value"])
         elif kind == KIND_SEGMENT_START:
-            open_segment_starts.append(ts)
+            if open_segment_start is not None and last_ts is not None:
+                # The previous launch crashed without a segment_end: credit it
+                # only through its last observed record, never the downtime.
+                gpu_seconds += max(0.0, last_ts - open_segment_start)
+            open_segment_start = ts
         elif kind == KIND_SEGMENT_END:
-            if open_segment_starts:  # an unmatched end (no open start) is ignored
-                start_ts = open_segment_starts.pop()
-                gpu_seconds += max(0.0, ts - start_ts)
+            if open_segment_start is not None:  # an unmatched end (no open start) is ignored
+                gpu_seconds += max(0.0, ts - open_segment_start)
+                open_segment_start = None
         elif kind == CHECKPOINT_PUBLISHED_KIND:
+            active = 0.0 if open_segment_start is None else max(0.0, ts - open_segment_start)
             checkpoints[rec["model_version"]] = (
                 rec["learner_step"],
                 running_positions,
-                gpu_seconds / _SECONDS_PER_HOUR,
+                (gpu_seconds + active) / _SECONDS_PER_HOUR,
             )
+        last_ts = ts
 
     totals = {
         name: 0.0 for name in (SERIES_GAMES_COMPLETED, SERIES_POSITIONS_EVALUATED, SERIES_SIMS_RUN)
