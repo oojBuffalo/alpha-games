@@ -6,7 +6,9 @@ stdlib-pure. This module is deliberately not exported from ``core/__init__`` so
 that ``import core`` never pulls torch.
 
 **What a checkpoint bundles** (:class:`CheckpointBundle`, issue #56): the net's
-``state_dict``, the optimizer's ``state_dict`` (momentum buffers included), the
+``state_dict``, its authoritative ``NetworkConfig`` (primitive metadata on disk),
+the published/resume artifact kind, the optimizer's ``state_dict`` (momentum
+buffers included), the
 AMP ``GradScaler``'s ``state_dict``, the learner-step counter, the full run
 config, a learner-owned metrics high-water snapshot (opaque — issue #62 owns
 its contents), and the canonical artifact fingerprint
@@ -88,7 +90,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,7 @@ from core.artifact_fingerprint import (
     compare_fingerprints,
 )
 from core.game import Game
+from core.network import Network, NetworkConfig
 from core.replay_shard import _atomic_write, _atomic_write_json
 
 # This module's own bundle-shape version -- bumped only when a field is added,
@@ -107,7 +110,7 @@ from core.replay_shard import _atomic_write, _atomic_write_json
 # config values merely change -- those are core.artifact_fingerprint.SCHEMA_VERSION's
 # and ordinary content's job respectively). Every reader compares against this
 # exact value, mirroring core.replay_window.MANIFEST_SCHEMA_VERSION's pattern.
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 
 # The seeded-init model version: recorded (a caller may publish it), but never
 # a K-member of the evaluation candidate set. Documentation only -- this
@@ -159,6 +162,8 @@ class CheckpointBundle:
             (``core.artifact_fingerprint.build_fingerprint``) of the adapter
             this checkpoint's net was trained against, orientation hash
             included.
+        network_config: The authoritative architecture, serialized as primitive fields.
+        artifact_kind: Published checkpoint or rolling resume snapshot provenance.
         model_state_dict: The network's ``state_dict``, CPU tensors.
         optimizer_state_dict: The optimizer's ``state_dict`` (momentum
             buffers and the live LR/weight-decay/etc. param-group scalars),
@@ -181,10 +186,12 @@ class CheckpointBundle:
     learner_step: int
     run_config: dict[str, Any]
     fingerprint: dict[str, Any]
+    network_config: NetworkConfig
     model_state_dict: dict[str, Any]
     optimizer_state_dict: dict[str, Any]
     scaler_state_dict: dict[str, Any]
     metrics: dict[str, Any]
+    artifact_kind: str = "unpublished"
 
 
 _BUNDLE_FIELDS = (
@@ -193,6 +200,8 @@ _BUNDLE_FIELDS = (
     "learner_step",
     "run_config",
     "fingerprint",
+    "network_config",
+    "artifact_kind",
     "model_state_dict",
     "optimizer_state_dict",
     "scaler_state_dict",
@@ -239,7 +248,7 @@ def build_bundle(
     learner_step: int,
     game: Game,
     run_config: Mapping[str, Any],
-    net: torch.nn.Module,
+    net: Network,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     metrics: Mapping[str, Any],
@@ -255,7 +264,7 @@ def build_bundle(
             fingerprint (``core.artifact_fingerprint.build_fingerprint``).
         run_config: The full run config as nested plain dicts
             (``core.runconfig.RunConfig.to_dict()``).
-        net: The network to snapshot (``state_dict()``); not mutated.
+        net: The network to snapshot (``config`` and ``state_dict()``); not mutated.
         optimizer: The optimizer to snapshot (``state_dict()``); not mutated.
         scaler: The AMP scaler to snapshot (``state_dict()``); not mutated.
         metrics: The learner-owned metrics high-water snapshot, verbatim.
@@ -277,6 +286,7 @@ def build_bundle(
         learner_step=learner_step,
         run_config=dict(run_config),
         fingerprint=build_fingerprint(game),
+        network_config=net.config,
         model_state_dict=_to_cpu(net.state_dict()),
         optimizer_state_dict=_to_cpu(optimizer.state_dict()),
         scaler_state_dict=_to_cpu(scaler.state_dict()),
@@ -293,7 +303,9 @@ def _bundle_to_payload(bundle: CheckpointBundle) -> dict[str, Any]:
     Returns:
         A plain ``dict`` over exactly :data:`_BUNDLE_FIELDS`.
     """
-    return {name: getattr(bundle, name) for name in _BUNDLE_FIELDS}
+    payload = {name: getattr(bundle, name) for name in _BUNDLE_FIELDS}
+    payload["network_config"] = asdict(bundle.network_config)
+    return payload
 
 
 def _payload_to_bundle(payload: Mapping[str, Any], path: Path) -> CheckpointBundle:
@@ -319,7 +331,28 @@ def _payload_to_bundle(payload: Mapping[str, Any], path: Path) -> CheckpointBund
             f"checkpoint at {path} has an unsupported schema_version: "
             f"stored={stored_schema!r} live={CHECKPOINT_SCHEMA_VERSION!r}"
         )
-    return CheckpointBundle(**{name: payload[name] for name in _BUNDLE_FIELDS})
+    fields = {name: payload[name] for name in _BUNDLE_FIELDS}
+    raw_config = fields["network_config"]
+    try:
+        if not isinstance(raw_config, Mapping):
+            raise ValueError("network_config must be a mapping")
+        config = dict(raw_config)
+        for key in ("input_shape", "policy_shape"):
+            config[key] = tuple(config[key])
+        scalar_keys = ("input_planes", "trunk_blocks", "trunk_channels", "num_aux")
+        dimensions = [config[key] for key in scalar_keys]
+        dimensions.extend(config["input_shape"])
+        dimensions.extend(config["policy_shape"])
+        if any(type(value) is not int for value in dimensions):
+            raise ValueError("network_config dimensions must be integers")
+        fields["network_config"] = NetworkConfig(**config)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CheckpointFormatError(
+            f"checkpoint at {path} has invalid network_config: {exc}"
+        ) from exc
+    if fields["artifact_kind"] not in ("published", "resume"):
+        raise CheckpointFormatError(f"checkpoint at {path} has invalid artifact_kind")
+    return CheckpointBundle(**fields)
 
 
 def _write_bundle(path: Path, bundle: CheckpointBundle) -> None:
@@ -501,7 +534,7 @@ def write_published_checkpoint(ckpt_dir: Path | str, bundle: CheckpointBundle) -
             f"published checkpoint version {bundle.version} already exists at {path} "
             "-- published checkpoints are immutable; publish a new version instead"
         )
-    _write_bundle(path, bundle)
+    _write_bundle(path, replace(bundle, artifact_kind="published"))
     return path
 
 
@@ -589,7 +622,7 @@ def write_resume_snapshot(ckpt_dir: Path | str, bundle: CheckpointBundle) -> Pat
     directory = Path(ckpt_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = resume_path(directory)
-    _write_bundle(path, bundle)
+    _write_bundle(path, replace(bundle, artifact_kind="resume"))
     return path
 
 
