@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Sequence
 
+from core.eval_protocol import VIRTUAL_DRAW_GAMES, VIRTUAL_DRAW_SCORE
 from core.runner import PairResult
 
 # One matchup's aggregate: (agent_a, agent_b, score_a, n_games) with score_a
@@ -103,7 +104,7 @@ def fit_elo(
         )
         prev_score, prev_n = totals.get(key, (0.0, 0))
         totals[key] = (prev_score + score, prev_n + n)
-    totals = {k: (s + 0.5, n + 1) for k, (s, n) in totals.items()}
+    totals = {k: (s + VIRTUAL_DRAW_SCORE, n + VIRTUAL_DRAW_GAMES) for k, (s, n) in totals.items()}
 
     agents = sorted({name for pair in totals for name in pair})
     if anchor not in agents:

@@ -18,20 +18,41 @@ Four layers:
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
+import random
+import re
+from pathlib import Path
 
 import pytest
 
+from core import eval_protocol
 from core.agents import RandomAgent
 from core.elo import fit_elo
+from core.eval_protocol import BOOTSTRAP_B_PRODUCTION
 from core.eval_stats import (
     ANCHOR_AGENT,
+    MannKendallResult,
+    _resample_cell,
+    bootstrap_replicate,
+    bootstrap_replicate_matches,
+    bootstrap_replicates,
+    bootstrap_seed,
+    build_verdict,
     checkpoint_elo,
+    delta_gate,
+    delta_hat,
+    delta_windows,
     elo_curve,
     elo_curve_path,
     fit_snapshot_elo,
+    mann_kendall,
+    order_statistic_ci,
+    per_checkpoint_ci,
+    replicate_deltas,
     snapshot_matches,
+    verdict_path,
 )
 from core.eval_store import (
     CellId,
@@ -52,7 +73,15 @@ from core.observability import (
     segment_end_record,
     segment_start_record,
 )
-from core.seeding import derive_seed
+from core.run_identity import (
+    ENTRY_CONDITION,
+    LAUNCH_SCHEMA_VERSION,
+    LaunchConfig,
+    RunRecord,
+    write_provenance,
+)
+from core.runconfig import MICRO_RUN_CONFIG_PATH
+from core.seeding import PURPOSE_BOOTSTRAP, derive_seed
 
 # ---------------------------------------------------------------------------------
 # Fixture helpers -- a minimal, self-contained eval-store builder (mirrors
@@ -68,7 +97,9 @@ def _header(*, candidate_version: int, rung: int, opponent_id: str, n_pairs: int
         cell_id=CellId(candidate_version, rung, opponent_id),
         candidate_identity=f"rung{rung}-v1-{candidate_version}",
         opponent_identity=opponent_id,
-        eval_config={"pairs_per_cell": n_pairs},
+        # Production writers stamp S on every cell (rung 5 included); the
+        # authority gate requires it rather than defaulting a missing key.
+        eval_config={"pairs_per_cell": n_pairs, "eval_sims": eval_protocol.EVAL_SIMS},
         candidate_fingerprint={"orientation_table_hash": "test"},
     )
 
@@ -112,6 +143,66 @@ def _write_member(run_dir, member_version, cells):
 def _closed_form(p: float) -> float:
     """Elo difference whose expected score is exactly ``p`` (mirrors tests/test_elo.py)."""
     return 400.0 * math.log10(p / (1.0 - p))
+
+
+def _write_run_config(run_dir, *, checkpoint_count: int, eval_seed: int, run_id: str = "test-run"):
+    """Write a valid ``config.json`` a ``build_verdict`` call can read K/eval_seed from.
+
+    Starts from the real pinned micro-Blokus config (already game/schema-valid)
+    and overrides only ``training.checkpoint_count`` and ``evaluation.eval_seed``
+    -- the two scalars ``build_verdict`` itself reads -- plus the launcher-only
+    fields ``LaunchConfig`` requires. Never touches ``core/run_identity.py``;
+    only exercises its already-public ``write_provenance``/``LaunchConfig`` API.
+    """
+    raw = json.loads(MICRO_RUN_CONFIG_PATH.read_text())
+    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+    raw["training"] = dict(raw["training"])
+    raw["training"]["checkpoint_count"] = checkpoint_count
+    raw["evaluation"] = dict(raw["evaluation"])
+    raw["evaluation"]["eval_seed"] = eval_seed
+    raw["num_actors"] = 1
+    raw["device"] = "cpu"
+    raw["schema_version"] = LAUNCH_SCHEMA_VERSION
+    raw["runtime"] = {
+        "refresh_poll_interval": 1.0,
+        "pacing_poll_interval": 1.0,
+        "ceiling_poll_interval": 1.0,
+    }
+    launch_config = LaunchConfig.from_dict(raw)
+    record = RunRecord(
+        run_id=run_id, created_at="2026-01-01T00:00:00Z", entry_condition=ENTRY_CONDITION
+    )
+    write_provenance(run_dir, launch_config, record)
+
+
+def _write_checkpoint_markers(run_dir, versions):
+    """Write one ``checkpoint_published`` marker per member version.
+
+    The minimal metrics fixture ``elo_curve``/``build_verdict`` need:
+    ``core.observability.reduce_run`` requires no GPU segments or actor deltas
+    to compute ``net_evals``/``gpu_hours`` -- both default to ``0.0`` with none
+    on disk -- only a marker per scored member version.
+    """
+    learner = EpochMetricsWriter(run_dir, "learner")
+    for i, version in enumerate(sorted(versions), start=1):
+        _append_checkpoint_published(
+            learner, version=version, learner_step=10 * i, timestamp=float(i)
+        )
+
+
+def _find_key(obj, key: str) -> bool:
+    """Recursively search a JSON-shaped ``dict``/``list`` tree for ``key``.
+
+    A plain key search, never a substring search over serialized text (which
+    would false-positive on an unrelated word like "aggregate").
+    """
+    if isinstance(obj, dict):
+        if key in obj:
+            return True
+        return any(_find_key(value, key) for value in obj.values())
+    if isinstance(obj, list):
+        return any(_find_key(item, key) for item in obj)
+    return False
 
 
 # ==============================================================================
@@ -450,6 +541,861 @@ def test_elo_curve_orders_by_model_version_regardless_of_build_order(tmp_path):
     assert [row["model_version"] for row in result["rows"]] == [1, 2]
 
 
+# ==============================================================================
+# 5. The within-cell paired-bootstrap resampler (tasks/m4/007, subtask 7.1)
+# ==============================================================================
+
+
+def _write_bootstrap_fixture(tmp_path):
+    """A small multi-cell, non-uniform-pair-count eval-store fixture.
+
+    Deliberately gives cells different original pair counts (4, 3, 4) so
+    "resample with replacement to the cell's own count" is exercised
+    meaningfully rather than vacuously with a single shared count everywhere.
+    """
+    _write_member(
+        tmp_path,
+        1,
+        [
+            (5, "random", [2.0, 1.0, 0.0, 2.0]),
+            (7, "random", [1.5, 1.0, 2.0]),
+        ],
+    )
+    _write_member(
+        tmp_path,
+        2,
+        [
+            (7, "random", [1.0, 0.5, 2.0, 1.5]),
+        ],
+    )
+
+
+def test_bootstrap_seed_matches_the_pinned_derivation():
+    assert bootstrap_seed(4242) == derive_seed(4242, PURPOSE_BOOTSTRAP)
+    assert bootstrap_seed(4242) != bootstrap_seed(4243)
+
+
+def test_replicate_reproduced_in_isolation_matches_the_full_run_exactly(tmp_path):
+    """Task 7.1's headline reproducibility guarantee: replicate b is recoverable
+    from (bootstrap_seed, b) alone, with no other replicate having ever run, and
+    is bit-for-bit identical to that same index inside a full B-replicate batch.
+    """
+    _write_bootstrap_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(4242)
+
+    full_run = list(bootstrap_replicates(snapshot, seed, 5))
+
+    for b in range(5):
+        isolated = bootstrap_replicate(snapshot, seed, b)
+        assert isolated == full_run[b]  # exact, not approximate
+
+
+def test_different_replicate_indices_give_different_resamples(tmp_path):
+    _write_bootstrap_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(11)
+
+    matches_by_b = [bootstrap_replicate_matches(snapshot, seed, b) for b in range(8)]
+    # Each replicate names the identical set of matchups (resampling never
+    # changes which candidate/opponent pairs appear -- only their scores) --
+    # but at least one replicate's aggregate scores must differ from another's,
+    # or the resampler is silently ignoring the seed.
+    agent_pairs = {(m[0], m[1]) for matches in matches_by_b for m in matches}
+    assert len(agent_pairs) == 3  # the fixture's 3 cells: rung5-v1-1, rung7-v1-1, rung7-v1-2
+    assert len({tuple(sorted(m[2] for m in matches)) for matches in matches_by_b}) > 1
+
+
+def test_resample_cell_freezes_the_rng_choices_draw_stream():
+    """Pin 7's RNG API golden: one ``rng.choices(records, k=len(records))`` call.
+
+    The literal is ``random.Random(42).choices(range(8), k=8)``; a substituted
+    ``randrange`` loop (forbidden by pin 7) draws ``[1, 0, 4, 3, 3, 2, 1, 1]``
+    from the same seed instead, and the protocol fingerprint cannot see that
+    change (pin 10 (iii)), so only this behavioral golden catches it.
+    """
+    assert _resample_cell(random.Random(42), list(range(8))) == [5, 0, 2, 1, 5, 5, 7, 0]
+    assert _resample_cell(random.Random(42), []) == []
+
+
+def _write_bootstrap_golden_fixture(tmp_path):
+    """Four cells with distinct pair counts and non-sorted stored record order.
+
+    Member 2 registers its rung-7 cell before its rung-6 cell, so the sorted
+    cell-id order (``rung5-v1-1``, ``rung6-v1-2``, ``rung7-v1-1``, ``rung7-v1-2``)
+    differs from write order and a draw stream threaded in any other order gives
+    different per-cell scores.
+    """
+    _write_member(
+        tmp_path,
+        1,
+        [
+            (5, "random", [0.0, 0.5, 1.0, 1.5, 2.0]),
+            (7, "random", [2.0, 0.0, 1.5]),
+        ],
+    )
+    _write_member(
+        tmp_path,
+        2,
+        [
+            (7, "random", [1.0, 2.0, 0.5, 0.0]),
+            (6, "random", [0.5, 1.5]),
+        ],
+    )
+
+
+#: Literal per-replicate resampled matches for ``bootstrap_seed(4242)`` over
+#: :func:`_write_bootstrap_golden_fixture`. Computed independently of
+#: ``core.eval_stats`` with the stdlib alone: ``r = random.Random(seed_b)``, then
+#: for each cell in sorted cell-id order, in stored record order, ``len(cell)``
+#: draws of ``cell[floor(r.random() * len(cell))]`` (``rng.choices``'s documented
+#: unweighted draw), summed; ``seed_b`` is the literal replicate seed below.
+_BOOTSTRAP_GOLDEN_SEED = 1216689030403964738
+_BOOTSTRAP_GOLDEN_REPLICATE_SEEDS = [
+    6987118541137574488,
+    3456750918384432057,
+    17900443320874302275,
+    7921296321871204474,
+]
+_BOOTSTRAP_GOLDEN_MATCHES = [
+    [
+        ("rung5-v1-1", "random", 6.5, 10),
+        ("rung6-v1-2", "random", 3.0, 4),
+        ("rung7-v1-1", "random", 3.5, 6),
+        ("rung7-v1-2", "random", 4.0, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 3.5, 10),
+        ("rung6-v1-2", "random", 1.0, 4),
+        ("rung7-v1-1", "random", 5.0, 6),
+        ("rung7-v1-2", "random", 3.5, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 5.5, 10),
+        ("rung6-v1-2", "random", 2.0, 4),
+        ("rung7-v1-1", "random", 0.0, 6),
+        ("rung7-v1-2", "random", 0.0, 8),
+    ],
+    [
+        ("rung5-v1-1", "random", 6.0, 10),
+        ("rung6-v1-2", "random", 3.0, 4),
+        ("rung7-v1-1", "random", 3.5, 6),
+        ("rung7-v1-2", "random", 3.0, 8),
+    ],
+]
+
+
+def test_bootstrap_replicate_matches_freeze_the_pinned_draw_stream(tmp_path):
+    """Pin 7 / pin 10 (iii) behavioral golden for the whole resampling stream.
+
+    Freezes, against literals rather than a second call into the same resampler:
+    the bootstrap and per-replicate seed derivations, the sorted cell-id
+    iteration order, the stored per-cell record order, and the
+    ``rng.choices`` draw stream -- exact scores and game counts per cell.
+    """
+    _write_bootstrap_golden_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(4242)
+    assert seed == _BOOTSTRAP_GOLDEN_SEED
+    assert [
+        derive_seed(seed, eval_protocol.SEED_LABEL_REPLICATE, b) for b in range(4)
+    ] == _BOOTSTRAP_GOLDEN_REPLICATE_SEEDS
+
+    for b, expected in enumerate(_BOOTSTRAP_GOLDEN_MATCHES):
+        assert bootstrap_replicate_matches(snapshot, seed, b) == expected
+
+
+def test_warm_start_replicate_refit_matches_cold_start_within_fit_tolerance(tmp_path):
+    """Warm-starting from the point estimate (task 6's `initial_ratings`) must be a
+    pure speedup to the same anchored fixed point, never a different answer
+    (`core.elo.fit_elo`'s own docstring; verified directly for `fit_elo` in
+    `tests/test_eval_stats.py`'s own `initial_ratings` suite). Exact bit-for-bit
+    equality is deliberately not asserted here: cold and warm starts drive
+    `fit_elo`'s bisection from different initial `(lo, hi)` brackets, so each
+    per-agent search takes a different sequence of floating-point midpoints
+    before its per-sweep move drops below `fit_elo`'s own convergence tolerance
+    (`tol=1e-9`) -- the two fits converge on the same value to within roughly
+    that tolerance, not through the identical arithmetic path that would be
+    needed for bit-identical output.
+    """
+    _write_bootstrap_fixture(tmp_path)
+    snapshot = load_snapshot(tmp_path)
+    seed = bootstrap_seed(777)
+    b = 2
+
+    matches = bootstrap_replicate_matches(snapshot, seed, b)
+    cold = fit_elo(matches, anchor=ANCHOR_AGENT)
+    warm = bootstrap_replicate(snapshot, seed, b)
+
+    assert warm.keys() == cold.keys()
+    assert warm[ANCHOR_AGENT] == 0.0 == cold[ANCHOR_AGENT]
+    for name in cold:
+        assert warm[name] == pytest.approx(cold[name], abs=1e-6)
+
+
+def test_same_store_and_seed_give_bit_identical_replicate_ratings_across_two_runs(tmp_path):
+    _write_bootstrap_fixture(tmp_path)
+    seed = bootstrap_seed(99)
+
+    run_a = list(bootstrap_replicates(load_snapshot(tmp_path), seed, 7))
+    run_b = list(bootstrap_replicates(load_snapshot(tmp_path), seed, 7))
+
+    assert run_a == run_b  # exact, not approximate -- two independent snapshot loads
+
+
+# ==============================================================================
+# 6. Delta-hat, the admissible-B order-statistic CIs, per-checkpoint CIs, and
+#    Mann-Kendall (tasks/m4/007, subtask 7.2)
+# ==============================================================================
+
+
+# --- delta_windows: the ceil(K/3) boundary sets ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("k", "expected"),
+    [
+        (3, ((1,), (3,))),
+        (4, ((1, 2), (3, 4))),
+        (5, ((1, 2), (4, 5))),
+    ],
+)
+def test_delta_windows_documented_boundary_sets(k, expected):
+    assert delta_windows(k) == expected
+
+
+def test_delta_windows_rejects_non_positive_k():
+    with pytest.raises(ValueError):
+        delta_windows(0)
+    with pytest.raises(ValueError):
+        delta_windows(-1)
+
+
+# --- delta_hat: the original-sample statistic --------------------------------------
+
+
+def test_delta_hat_matches_hand_computed_window_means():
+    # K=5 -> windows (1,2) and (4,5); mean(40,50) - mean(10,20) = 45 - 15 = 30.
+    curve = [(1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)]
+    assert delta_hat(curve) == pytest.approx(30.0)
+
+
+def test_delta_hat_is_indifferent_to_curve_order():
+    shuffled = [(3, 30.0), (1, 10.0), (5, 50.0), (2, 20.0), (4, 40.0)]
+    assert delta_hat(shuffled) == pytest.approx(30.0)
+
+
+def test_delta_hat_rejects_empty_curve():
+    with pytest.raises(ValueError):
+        delta_hat([])
+
+
+def test_delta_hat_rejects_a_non_contiguous_or_incomplete_series():
+    # Only versions {1, 3} present -- not the complete, contiguous 1..K set
+    # (task 1 pin 8: no prefix Delta is ever computed).
+    with pytest.raises(ValueError, match="complete, contiguous"):
+        delta_hat([(1, 10.0), (3, 30.0)])
+
+
+# --- replicate_deltas: Delta_b mapped over each replicate's own curve --------------
+
+
+def test_replicate_deltas_maps_delta_hat_over_each_replicates_ratings():
+    replicate_ratings = [
+        {
+            ANCHOR_AGENT: 0.0,
+            "rung7-v1-1": 0.0,
+            "rung7-v1-2": 10.0,
+            "rung7-v1-3": 20.0,
+            "rung7-v1-4": 30.0,
+            "rung7-v1-5": 40.0,
+        },
+        {
+            ANCHOR_AGENT: 0.0,
+            "rung7-v1-1": 100.0,
+            "rung7-v1-2": 100.0,
+            "rung7-v1-3": 100.0,
+            "rung7-v1-4": 100.0,
+            "rung7-v1-5": 100.0,
+        },
+    ]
+    # Replicate 0: windows (1,2)/(4,5) -> mean(30,40) - mean(0,10) = 35 - 5 = 30.
+    # Replicate 1: every version tied at 100 -> Delta = 0.
+    assert replicate_deltas(replicate_ratings) == [pytest.approx(30.0), pytest.approx(0.0)]
+
+
+# --- order_statistic_ci: the admissible-B rank rule --------------------------------
+
+
+def test_order_statistic_ci_at_b39_picks_ranks_1_and_39_with_ties():
+    # 39 values: five ties at the minimum (0), then 1..34 -- deliberately
+    # unsorted on input. Ranks (B+1)*0.025=1 and (B+1)*0.975=39 are exactly the
+    # overall min and max of the 39-element sample.
+    values = list(range(1, 35)) + [0.0] * 5
+    assert len(values) == 39
+    assert order_statistic_ci(values, 39) == (0.0, 34.0)
+
+
+def test_order_statistic_ci_rejects_non_admissible_b():
+    with pytest.raises(ValueError):
+        order_statistic_ci(list(range(100)), 100)
+    with pytest.raises(ValueError):
+        order_statistic_ci(list(range(2000)), 2000)
+
+
+def test_order_statistic_ci_rejects_wrong_length_input():
+    with pytest.raises(ValueError):
+        order_statistic_ci(list(range(10)), 39)
+
+
+def test_order_statistic_ci_defaults_to_the_pinned_production_b():
+    default_b = inspect.signature(order_statistic_ci).parameters["B"].default
+    assert default_b == BOOTSTRAP_B_PRODUCTION == 1999
+
+
+def test_1999_is_admissible_and_2000_is_not():
+    # Production B: ranks (1999+1)*0.025=50, (1999+1)*0.975=1950 -- both integral.
+    order_statistic_ci([0.0] * 1999, 1999)  # must not raise
+    with pytest.raises(ValueError):
+        order_statistic_ci([0.0] * 2000, 2000)
+
+
+# --- delta_gate: strictly-above-0 -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ci", "expected"),
+    [
+        ((0.5, 10.0), True),
+        ((-0.1, 10.0), False),
+        ((0.0, 5.0), False),  # exactly 0 is not "strictly above"
+    ],
+)
+def test_delta_gate(ci, expected):
+    assert delta_gate(ci) is expected
+
+
+# --- per_checkpoint_ci: the same rule, same replicates, no second resample --------
+
+
+def test_per_checkpoint_ci_applies_the_same_rule_column_wise_no_second_resample():
+    replicate_ratings = [
+        {ANCHOR_AGENT: 0.0, "rung7-v1-2": float(2 * b), "rung7-v1-1": float(b)} for b in range(39)
+    ]
+    result = per_checkpoint_ci(replicate_ratings, 39)
+    # v1's column is 0..38 (min/max at ranks 1/39); v2's is 0,2,...,76.
+    assert result == [(1, (0.0, 38.0)), (2, (0.0, 76.0))]
+
+
+def test_per_checkpoint_ci_rejects_wrong_replicate_count():
+    replicate_ratings = [{ANCHOR_AGENT: 0.0, "rung7-v1-1": 0.0}] * 10
+    with pytest.raises(ValueError):
+        per_checkpoint_ci(replicate_ratings, 39)
+
+
+def test_per_checkpoint_ci_defaults_to_the_pinned_production_b():
+    default_b = inspect.signature(per_checkpoint_ci).parameters["B"].default
+    assert default_b == BOOTSTRAP_B_PRODUCTION
+
+
+# --- mann_kendall: classic S, tie/continuity-corrected z, two-sided p -------------
+
+
+def test_mann_kendall_golden_without_ties():
+    # values [1, 3, 2, 5]: pairwise signs +,+,+,-,+,+ -> S = 4.
+    # variance = (4*3*13)/18 = 8.666...7; sigma = 2.943920288775949.
+    # z = (4 - 1)/sigma = 1.0190493307301363; p = erfc(z/sqrt(2)).
+    result = mann_kendall([1.0, 3.0, 2.0, 5.0])
+    assert result.insufficient_data is False
+    assert result.n == 4
+    assert result.s == 4
+    assert result.z == pytest.approx(1.0190493307301363)
+    assert result.p == pytest.approx(0.308179547467054)
+
+
+def test_mann_kendall_golden_with_ties():
+    # values [1, 2, 2, 3]: pairwise signs +,+,+,0,+,+ -> S = 5.
+    # tie term = 2*1*9 = 18; variance = (156 - 18)/18 = 7.666...7.
+    result = mann_kendall([1.0, 2.0, 2.0, 3.0])
+    assert result.insufficient_data is False
+    assert result.n == 4
+    assert result.s == 5
+    assert result.z == pytest.approx(1.4446302370292303)
+    assert result.p == pytest.approx(0.1485617748918687)
+
+
+def test_mann_kendall_golden_with_ties_and_a_downward_trend():
+    # The mirror image of the previous case: S and z flip sign, p is unchanged.
+    result = mann_kendall([3.0, 2.0, 2.0, 1.0])
+    assert result.s == -5
+    assert result.z == pytest.approx(-1.4446302370292303)
+    assert result.p == pytest.approx(0.1485617748918687)
+
+
+def test_mann_kendall_all_tied_forces_s_zero_z_zero_p_one():
+    result = mann_kendall([7.0, 7.0, 7.0, 7.0, 7.0])
+    assert result.insufficient_data is False
+    assert result.n == 5
+    assert result.s == 0
+    assert result.z == 0.0
+    assert result.p == 1.0
+
+
+def test_mann_kendall_below_three_points_is_insufficient_data():
+    result = mann_kendall([1.0, 2.0])
+    assert result == MannKendallResult(n=2, insufficient_data=True, s=None, z=None, p=None)
+
+
+def test_mann_kendall_never_claims_a_trend_when_insufficient():
+    result = mann_kendall([1.0])
+    assert result.insufficient_data is True
+    assert result.s is None
+    assert result.z is None
+    assert result.p is None
+
+
+# ==============================================================================
+# 7. verdict.json assembly (tasks/m4/007, subtask 7.3)
+# ==============================================================================
+
+
+def test_build_verdict_is_bit_identical_across_two_independently_built_runs(tmp_path):
+    """Same records + seed -> bit-identical verdict.json bytes (task 1 pin 7's
+    determinism discipline, at the whole-artifact grain)."""
+
+    def _build(root):
+        for version in (1, 2, 3):
+            _write_member(root, version, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+        _write_checkpoint_markers(root, [1, 2, 3])
+        _write_run_config(root, checkpoint_count=3, eval_seed=4242)
+        return build_verdict(root, B=39)
+
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    payload_a = _build(root_a)
+    payload_b = _build(root_b)
+
+    assert payload_a == payload_b
+    assert verdict_path(root_a).read_bytes() == verdict_path(root_b).read_bytes()
+
+
+def test_build_verdict_writes_exactly_what_it_returns(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=5)
+
+    payload = build_verdict(tmp_path, B=39)
+
+    assert verdict_path(tmp_path) == tmp_path / "eval" / "verdict.json"
+    on_disk = json.loads(verdict_path(tmp_path).read_text(encoding="utf-8"))
+    assert on_disk == payload
+
+
+def test_build_verdict_partial_k_snapshot_yields_null_delta_and_no_gate_key(tmp_path):
+    """The no-prefix-Delta golden (task 1 pin 8): a partial-K snapshot carries
+    per-checkpoint CIs and MK, but delta is null with a reason, and the "gate"
+    key exists nowhere in the artifact -- not nested, not advisory."""
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=99)  # K=3, only 2 scored
+
+    payload = build_verdict(tmp_path, B=39)
+
+    assert payload["checkpoints_evaluated"] == 2
+    assert payload["k_target"] == 3
+    assert payload["authoritative"] is False
+    assert payload["delta"] is None
+    assert isinstance(payload["reason"], str) and payload["reason"]
+    assert [row["model_version"] for row in payload["per_checkpoint"]] == [1, 2]
+    assert payload["mann_kendall"]["insufficient_data"] is True  # n=2 < 3
+    assert not _find_key(payload, "gate")
+
+
+def test_build_verdict_complete_k_set_carries_delta_ci_and_gate(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [0.0, 0.0, 0.5, 0.0])])
+    _write_member(tmp_path, 2, [(7, "random", [2.0, 2.0, 1.5, 2.0])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=17)
+
+    payload = build_verdict(tmp_path, B=39)
+
+    assert payload["checkpoints_evaluated"] == payload["k_target"] == 2
+    assert payload["delta"] is not None
+    assert set(payload["delta"]) == {"delta_hat", "ci", "gate"}
+    assert payload["delta"]["ci"][0] <= payload["delta"]["delta_hat"] <= payload["delta"]["ci"][1]
+    assert "non-production" in payload["reason"]
+
+
+def test_build_verdict_on_disk_partial_cell_perturbs_nothing(tmp_path):
+    """The bootstrap consumes only snapshot cells: a cell that is merely opened
+    and appended -- never completed -- must change nothing (task 1 pin 9 /
+    P2.2), including at the whole-verdict grain."""
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=123)
+
+    build_verdict(tmp_path, B=39)
+    baseline_bytes = verdict_path(tmp_path).read_bytes()
+
+    # A stray, never-completed member-3 cell -- structurally "scheduled" but not
+    # yet complete -- sits entirely outside every in-scope cell set.
+    header = _header(candidate_version=3, rung=7, opponent_id="random", n_pairs=2)
+    register_member(tmp_path, 3, [header.cell_id.to_string()])
+    _fill(tmp_path, header, [1.0, 1.0])  # opened + appended, never completed
+
+    build_verdict(tmp_path, B=39)
+    assert verdict_path(tmp_path).read_bytes() == baseline_bytes
+
+
+def test_build_verdict_authoritative_requires_complete_k_set_and_b_1999(tmp_path):
+    """authoritative flips only when the last required cell of the last member
+    completes, and only at B=1999: a complete K-set at B=39 is non-authoritative
+    but still carries Delta and CI; an incomplete K-set at B=1999 stays
+    non-authoritative regardless."""
+    run_complete = tmp_path / "complete"
+    _write_member(run_complete, 1, [(7, "random", [1.0] * 24)])
+    _write_checkpoint_markers(run_complete, [1])
+    _write_run_config(run_complete, checkpoint_count=1, eval_seed=7)
+
+    at_39 = build_verdict(run_complete, B=39)
+    assert at_39["authoritative"] is False
+    assert at_39["delta"] is not None
+
+    at_1999 = build_verdict(run_complete, B=1999)
+    assert at_1999["authoritative"] is True
+    assert at_1999["delta"] is not None
+
+    run_partial = tmp_path / "partial"
+    _write_member(run_partial, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(run_partial, [1])
+    _write_run_config(run_partial, checkpoint_count=2, eval_seed=7)  # K=2, only 1 scored
+
+    partial_at_1999 = build_verdict(run_partial, B=1999)
+    assert partial_at_1999["authoritative"] is False
+    assert partial_at_1999["delta"] is None
+
+
+def _null_pair_scores(rng: random.Random, n_pairs: int) -> list[float]:
+    """``n_pairs`` i.i.d. pair scores with no built-in trend (mean 1.0/2, symmetric).
+
+    Each of the pair's two games independently scores 0.0/0.5/1.0 with
+    probabilities 0.45/0.10/0.45 -- a fair, mildly-drawish coin, identical for
+    every member, so the population Delta is exactly 0.
+    """
+
+    def _game() -> float:
+        draw = rng.random()
+        if draw < 0.45:
+            return 0.0
+        if draw < 0.55:
+            return 0.5
+        return 1.0
+
+    return [_game() + _game() for _ in range(n_pairs)]
+
+
+@pytest.mark.slow
+def test_bootstrap_gate_false_at_approximately_the_nominal_rate_under_a_true_null(tmp_path):
+    """A synthetic no-improvement fixture (exchangeable pair scores, task 1 pin
+    7/8) over a complete tiny K-set: with no true Elo separation across
+    checkpoints, repeated independent data draws must gate True only rarely --
+    B=39's conservative min/max-based order-statistic CI (task 1 pin 7) is far
+    more conservative than the asymptotic 95% two-sided rate, so the empirical
+    false-positive rate should sit well below the nominal one-sided 2.5%.
+    """
+    k = 3
+    n_pairs = 6
+    n_reps = 60
+    b = 39
+
+    gates = []
+    for rep in range(n_reps):
+        root = tmp_path / f"null-{rep}"
+        rng = random.Random(1_000_000 + rep)
+        for version in range(1, k + 1):
+            _write_member(root, version, [(7, "random", _null_pair_scores(rng, n_pairs))])
+        snapshot = load_snapshot(root)
+        seed = bootstrap_seed(2_000_000 + rep)
+        replicate_ratings = list(bootstrap_replicates(snapshot, seed, b))
+        ci = order_statistic_ci(replicate_deltas(replicate_ratings), b)
+        gates.append(delta_gate(ci))
+
+    false_positive_rate = sum(gates) / n_reps
+    assert false_positive_rate <= 0.15, (
+        f"gate=True on {sum(gates)}/{n_reps} genuinely-null repetitions "
+        f"({false_positive_rate:.1%}) -- expected well below the nominal 2.5% "
+        "one-sided rate"
+    )
+
+
+def test_bootstrap_gate_true_under_a_strong_monotone_trend(tmp_path):
+    """A strong-trend fixture -- win rate climbing from 10% to 90% across a
+    complete K-set -- must reliably gate True."""
+    k = 4
+    n_pairs = 20
+    b = 39
+
+    def _biased_pair_scores(rng: random.Random, p_win: float) -> list[float]:
+        def _game() -> float:
+            return 1.0 if rng.random() < p_win else 0.0
+
+        return [_game() + _game() for _ in range(n_pairs)]
+
+    for rep in range(5):
+        root = tmp_path / f"trend-{rep}"
+        rng = random.Random(5_000_000 + rep)
+        for version in range(1, k + 1):
+            p_win = 0.1 + 0.8 * (version - 1) / (k - 1)  # 0.1 .. 0.9, strictly increasing
+            _write_member(root, version, [(7, "random", _biased_pair_scores(rng, p_win))])
+        snapshot = load_snapshot(root)
+        seed = bootstrap_seed(6_000_000 + rep)
+        replicate_ratings = list(bootstrap_replicates(snapshot, seed, b))
+        ci = order_statistic_ci(replicate_deltas(replicate_ratings), b)
+        assert delta_gate(ci) is True
+
+
+# ==============================================================================
+# 8. Doc <-> protocol-registry golden (tasks/m4/007, subtask 7.3)
+# ==============================================================================
+
+_DESIGN_DOC_PATH = (
+    Path(__file__).resolve().parent.parent / "metadocs" / "blokus-duo-az-design-v0_5.md"
+)
+_DOC_AMENDMENT_BRANCH = "docs/m4-pin-eval-protocol"
+# The bolded lead-in of the actual section-9 block. The bare phrase also appears
+# in the status-header changelog ("section 9 gains a ... block"), so anchoring on
+# the bold form keeps the parse scoped to the pins themselves.
+_PINNED_PROTOCOL_HEADING = "**Pre-registered protocol (M4 pins).**"
+
+
+def test_protocol_registry_matches_the_literal_pinned_values():
+    """Always asserted, independent of the doc amendment's merge status -- the
+    exact values tasks/m4/001's amendment pins, mirrored as module constants
+    (core.eval_protocol) so the protocol cannot silently drift once production
+    games exist."""
+    assert eval_protocol.PROTOCOL_VERSION == 1
+    assert eval_protocol.SCHEMA_VERSION == 2
+    assert eval_protocol.PAIRS_PER_CELL == 24
+    assert eval_protocol.EVAL_SIMS == 512
+    assert eval_protocol.RUNG8_LAG_DIVISOR == 4
+    assert eval_protocol.RUNG8_EARLIEST_VERSION == 1
+    assert eval_protocol.BOOTSTRAP_B_PRODUCTION == 1999
+    assert eval_protocol.BOOTSTRAP_B_ADMISSIBLE_MODULUS == 40
+    assert eval_protocol.BOOTSTRAP_B_ADMISSIBLE_REMAINDER == 39
+    assert eval_protocol.BOOTSTRAP_CI_LOWER_QUANTILE == 0.025
+    assert eval_protocol.BOOTSTRAP_CI_UPPER_QUANTILE == 0.975
+    # The rank rule at the pinned production B: (1999+1)*0.025=50, (1999+1)*0.975=1950.
+    b_plus_one = eval_protocol.BOOTSTRAP_B_PRODUCTION + 1
+    lower_rank = b_plus_one * eval_protocol.BOOTSTRAP_CI_LOWER_QUANTILE
+    upper_rank = b_plus_one * eval_protocol.BOOTSTRAP_CI_UPPER_QUANTILE
+    assert (lower_rank, upper_rank) == (50.0, 1950.0)
+
+
+def _extract_number(pattern: str, text: str) -> str | None:
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1).replace(",", "")
+
+
+def test_protocol_registry_matches_the_amended_design_doc_section_9_pins():
+    """Require the source-of-truth section-9 amendment and verify its pins."""
+    doc_text = _DESIGN_DOC_PATH.read_text(encoding="utf-8")
+    assert _PINNED_PROTOCOL_HEADING in doc_text, "section-9 protocol amendment must precede code"
+
+    # Scope the search to the block itself: from the heading to the next
+    # section boundary ('---' or the next '## ' heading) -- never the whole doc.
+    start = doc_text.index(_PINNED_PROTOCOL_HEADING)
+    rest = doc_text[start:]
+    end_match = re.search(r"\n(?:---|## )", rest)
+    block = rest[: end_match.start()] if end_match else rest
+
+    pairs_per_cell = _extract_number(r"pairs[- ]per[- ]cell[^0-9]{0,20}(\d[\d,]*)", block)
+    assert pairs_per_cell is not None, f"could not find a pairs-per-cell pin in: {block!r}"
+    assert int(pairs_per_cell) == eval_protocol.PAIRS_PER_CELL
+
+    eval_sims = _extract_number(r"\bS\s*=\s*(\d[\d,]*)", block)
+    assert eval_sims is not None, f"could not find the eval-sims (S) pin in: {block!r}"
+    assert int(eval_sims) == eval_protocol.EVAL_SIMS
+
+    bootstrap_b = _extract_number(r"`?\bB`?\s*=\s*(\d[\d,]*)", block)
+    assert bootstrap_b is not None, f"could not find the bootstrap B pin in: {block!r}"
+    assert int(bootstrap_b) == eval_protocol.BOOTSTRAP_B_PRODUCTION
+
+    assert "0.025" in block and "0.975" in block, (
+        f"could not find the order-statistic rank-rule's quantiles in: {block!r}"
+    )
+
+    rung8_lag = _extract_number(r"v`?\s*[−-]\s*⌈`?K`?\s*/\s*(\d+)⌉", block) or _extract_number(
+        r"lag[^0-9]{0,20}(\d+)", block
+    )
+    assert rung8_lag is not None, f"could not find the rung-8 lag divisor in: {block!r}"
+    assert int(rung8_lag) == eval_protocol.RUNG8_LAG_DIVISOR
+
+
+def test_empty_prefix_writes_provisional_verdict(tmp_path):
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=42)
+    payload = build_verdict(tmp_path, B=39)
+    assert payload["checkpoints_evaluated"] == 0
+    assert payload["authoritative"] is False
+    assert payload["per_checkpoint"] == []
+    assert payload["delta"] is None
+    assert "0 of 3" in payload["reason"]
+    assert payload["mann_kendall"] == {
+        "n": 0,
+        "insufficient_data": True,
+        "s": None,
+        "z": None,
+        "p": None,
+    }
+    assert json.loads(elo_curve_path(tmp_path).read_text())["rows"] == []
+    assert json.loads(verdict_path(tmp_path).read_text()) == payload
+
+
+def test_completed_later_cell_does_not_change_analyzed_evidence(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5])])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=42)
+    _write_checkpoint_markers(tmp_path, [1])
+    before = build_verdict(tmp_path, B=39)
+    _write_member(tmp_path, 3, [(7, "random", [2.0, 2.0])])
+    after = build_verdict(tmp_path, B=39)
+    assert before == after
+    assert len(load_snapshot(tmp_path).completed_cell_ids) == 2
+
+
+def test_analysis_refuses_old_protocol_before_replacing_artifact(tmp_path, monkeypatch):
+    from core.eval_store import ProtocolMismatchError
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5])])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=42)
+    _write_checkpoint_markers(tmp_path, [1])
+    build_verdict(tmp_path, B=39)
+    before = verdict_path(tmp_path).read_bytes()
+    monkeypatch.setitem(eval_protocol.REGISTRY, "seed_label_replicate", "different")
+    with pytest.raises(ProtocolMismatchError, match="stored protocol"):
+        build_verdict(tmp_path, B=39)
+    assert verdict_path(tmp_path).read_bytes() == before
+
+
+def test_all_statistical_conventions_are_hashed():
+    pinned = {
+        "seed_label_bootstrap": "bootstrap",
+        "seed_label_replicate": "replicate",
+        "delta_window_divisor": 3,
+        "delta_gate_threshold": 0.0,
+        "mk_min_observations": 3,
+        "virtual_draw_score": 0.5,
+        "virtual_draw_games": 1,
+        "bootstrap_resampling": "within-cell-paired-records-with-replacement",
+        "bootstrap_fit": "joint-refit-each-replicate-warm-started",
+        "bootstrap_iteration_order": "sorted-cell-id-then-stored-record-order",
+        "delta_window_rounding": "ceiling",
+        "delta_gate_comparison": "lower-ci-strictly-greater-than-threshold",
+        "mann_kendall_variance": "tie-corrected",
+        "mann_kendall_continuity": "subtract-sign-s",
+        "mann_kendall_p": "two-sided-normal",
+        "mann_kendall_insufficient": "s-z-p-null",
+        "mann_kendall_zero_variance": "s=0,z=0,p=1",
+        "snapshot_scope": "complete-contiguous-member-prefix-only",
+        "delta_snapshot_gate": "prefix-equals-k-target",
+        "authoritative_gate": "complete-k-set-production-b-and-production-cells",
+        "finite_fit": "one-virtual-draw-per-unordered-matchup",
+    }
+    assert PURPOSE_BOOTSTRAP == pinned["seed_label_bootstrap"]
+    assert eval_protocol.SEED_LABEL_REPLICATE == pinned["seed_label_replicate"]
+    for key, value in pinned.items():
+        assert eval_protocol.REGISTRY[key] == value
+
+
+def test_eval_config_serializes_and_records_protocol_stamps():
+    from core.runconfig import RunConfig, load_run_config
+
+    config = load_run_config()
+    raw = config.to_dict()
+    assert raw["evaluation"]["protocol_version"] == eval_protocol.PROTOCOL_VERSION
+    assert raw["evaluation"]["protocol_fingerprint"] == eval_protocol.protocol_fingerprint()
+    assert RunConfig.from_dict(raw) == config
+    # A stamp from an older registry is a record: read and re-serialized verbatim,
+    # never rejected and never relabeled with the live fingerprint.
+    raw["evaluation"]["protocol_fingerprint"] = "old"
+    stale = RunConfig.from_dict(raw)
+    assert stale.evaluation.protocol_fingerprint == "old"
+    assert stale.to_dict() == raw
+    raw["evaluation"]["protocol_fingerprint"] = ""
+    with pytest.raises(ValueError, match="protocol_fingerprint"):
+        RunConfig.from_dict(raw)
+    raw["evaluation"]["protocol_fingerprint"] = 7
+    with pytest.raises(TypeError, match="protocol_fingerprint"):
+        RunConfig.from_dict(raw)
+
+
+def test_stale_eval_stamp_does_not_block_resume_fork_or_verdict(tmp_path):
+    """An additive REGISTRY change must not make a training run's config unreadable.
+
+    Simulates a run whose ``config.json`` was stamped before a registry addition:
+    ``read_stored_config`` (the entry point of resume, fork, verify and
+    verdict) still loads it, and the stamp difference is classified non-material.
+    """
+    from core.run_identity import CONFIG_FILENAME, read_stored_config, resolve_resume
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    path = tmp_path / CONFIG_FILENAME
+    stored = json.loads(path.read_text())
+    stored["evaluation"]["protocol_fingerprint"] = "pre-registry-addition"
+    path.write_text(json.dumps(stored))
+
+    loaded = read_stored_config(tmp_path)
+    assert loaded.run.evaluation.protocol_fingerprint == "pre-registry-addition"
+    current = LaunchConfig.from_dict(
+        {
+            **stored,
+            "evaluation": {
+                k: v for k, v in stored["evaluation"].items() if not k.startswith("protocol_")
+            },
+        }
+    )
+    resolution = resolve_resume(tmp_path, current)
+    assert resolution.non_material_diff["evaluation.protocol_fingerprint"] == (
+        "pre-registry-addition",
+        eval_protocol.protocol_fingerprint(),
+    )
+    assert build_verdict(tmp_path, B=39)["checkpoints_evaluated"] == 1
+
+
+@pytest.mark.parametrize(
+    "ratings",
+    [
+        {"rung7-v1-1": 0.0, "rung7-v1-s128-2": 1.0},
+        {"rung7-v1-1": 0.0, "rung7-v1-s128-1": 1.0},
+    ],
+)
+def test_checkpoint_curve_refuses_mixed_budget_or_duplicate_versions(ratings):
+    with pytest.raises(ValueError, match="mixes search budgets|multiple rung-7 identities"):
+        checkpoint_elo(ratings)
+
+
+def test_checkpoint_curve_includes_honest_reduced_budget_identities():
+    assert checkpoint_elo({"rung7-v1-s128-2": 20.0, "rung7-v1-s128-1": 10.0}) == [
+        (1, 10.0),
+        (2, 20.0),
+    ]
+
+
+def test_production_b_cannot_make_reduced_cells_authoritative(tmp_path):
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.0])])
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    payload = build_verdict(tmp_path, B=1999)
+    assert payload["authoritative"] is False
+    assert payload["delta"] is not None
+    assert "non-production" in payload["reason"]
+
+
 @pytest.mark.parametrize("value", [1e6, -1e6, 1e308, 10**1000])
 def test_initial_ratings_rejects_huge_values_with_value_error(value):
     with pytest.raises(ValueError, match="magnitude"):
@@ -479,3 +1425,127 @@ def test_elo_curve_accepts_resolved_alias_of_snapshot_run(tmp_path):
     assert elo_curve(alias, load_snapshot(run_dir))["rows"][0]["gpu_hours"] == pytest.approx(
         2.0 / 3600.0
     )
+
+
+@pytest.mark.parametrize("budget", [128, 512, None])
+def test_source_search_settings_control_verdict_authority(tmp_path, budget):
+    # ``None`` = a header with no ``eval_sims`` key: it must not read as production S.
+    identity = "rung7-v1-1" if budget in (512, None) else f"rung7-v1-s{budget}-1"
+    eval_config = {"pairs_per_cell": 24}
+    if budget is not None:
+        eval_config["eval_sims"] = budget
+    header = build_header(
+        run_id="run",
+        cell_id=CellId(1, 7, "random", full_candidate_identity=identity),
+        candidate_identity=identity,
+        opponent_identity="random",
+        candidate_fingerprint={"orientation_table_hash": "test"},
+        eval_config=eval_config,
+        cell_seed=0,
+    )
+    register_member(tmp_path, 1, [header.cell_id.to_string()])
+    _fill(tmp_path, header, [1.0] * 24)
+    complete_cell(tmp_path, header.cell_id.to_string())
+    _write_checkpoint_markers(tmp_path, [1])
+    _write_run_config(tmp_path, checkpoint_count=1, eval_seed=7)
+    payload = build_verdict(tmp_path, B=1999)
+    assert payload["authoritative"] is (budget == 512)
+    assert len(payload["per_checkpoint"]) == 1
+    assert payload["delta"] is not None
+    if budget != 512:
+        assert "non-production" in payload["reason"]
+
+
+@pytest.mark.parametrize(
+    "identity", ["largest-shape", "random-seeded", "rung4-search", "custom-v2-s64"]
+)
+def test_production_identity_keeps_network_free_names_opaque(identity):
+    from core.eval_artifacts import _production_identity
+
+    assert _production_identity(identity) is True
+
+
+@pytest.mark.parametrize(
+    "identity, expected",
+    [
+        ("rung5-v1-3", True),
+        ("rung7-v1-30", True),
+        ("rung7-v1-s64-3", False),
+        ("rung6-v2-3", False),
+        ("rung7-v1-not-a-version", False),
+    ],
+)
+def test_production_identity_requires_full_bare_v1_network_names(identity, expected):
+    from core.eval_artifacts import _production_identity
+
+    assert _production_identity(identity) is expected
+
+
+def test_complete_prefix_missing_final_rung7_rating_yields_no_delta(tmp_path):
+    """Pin 8: a complete member prefix whose final member carries no rung-7
+    cell is not the complete K-set -- ``delta_hat`` must never silently run
+    over a shorter curve (Codex round 2 repro: K=3, member 3 rung-5 only)."""
+    _write_member(tmp_path, 1, [(7, "random", [0.0] * 24)])
+    _write_member(tmp_path, 2, [(7, "random", [2.0] * 24)])
+    _write_member(tmp_path, 3, [(5, "random", [1.0] * 24)])
+    _write_checkpoint_markers(tmp_path, [1, 2, 3])
+    _write_run_config(tmp_path, checkpoint_count=3, eval_seed=7)
+
+    payload = build_verdict(tmp_path, B=1999)
+
+    assert payload["checkpoints_evaluated"] == payload["k_target"] == 3
+    assert [row["model_version"] for row in payload["per_checkpoint"]] == [1, 2]
+    assert payload["authoritative"] is False
+    assert payload["delta"] is None
+    assert "[3]" in payload["reason"] and "rung-7" in payload["reason"]
+    assert not _find_key(payload, "gate")
+
+
+def test_verdict_curve_hash_survives_an_interleaved_curve_publication(tmp_path, monkeypatch):
+    """Pin 9: another publisher replacing the shared ``elo_curve.json`` between
+    this verdict's curve write and its hash must not rebind the verdict's curve
+    reference to a different snapshot."""
+    import hashlib
+
+    from core import eval_artifacts
+    from core.eval_artifacts import elo_curve_artifact_path
+
+    _write_member(tmp_path, 1, [(7, "random", [1.0, 1.5, 0.5, 2.0])])
+    _write_checkpoint_markers(tmp_path, [1, 2])
+    _write_run_config(tmp_path, checkpoint_count=2, eval_seed=11)
+
+    real_write = eval_artifacts._write_blob
+    interleaved = {"done": False}
+
+    def _write_then_interleave(path, blob):
+        real_write(path, blob)
+        if path == elo_curve_path(tmp_path) and not interleaved["done"]:
+            interleaved["done"] = True
+            _write_member(tmp_path, 2, [(7, "random", [1.5, 1.0, 2.0, 0.5])])
+            elo_curve(tmp_path, load_snapshot(tmp_path))  # a concurrent publisher
+
+    monkeypatch.setattr(eval_artifacts, "_write_blob", _write_then_interleave)
+    verdict = build_verdict(tmp_path, B=39)
+    assert interleaved["done"]
+
+    assert verdict["checkpoints_evaluated"] == 1
+    artifact = elo_curve_artifact_path(tmp_path, verdict["elo_curve_fingerprint"])
+    assert artifact.name == verdict["elo_curve_artifact"]
+    artifact_bytes = artifact.read_bytes()
+    assert hashlib.sha256(artifact_bytes).hexdigest() == verdict["elo_curve_fingerprint"]
+    referenced = json.loads(artifact_bytes)
+    assert referenced["snapshot_fingerprint"] == verdict["evidence_fingerprint"]
+    assert [row["model_version"] for row in referenced["rows"]] == [1]
+
+    # The shared path now holds the newer snapshot's curve, which must not
+    # verify under this verdict's hash.
+    shared = elo_curve_path(tmp_path).read_bytes()
+    assert len(json.loads(shared)["rows"]) == 2
+    assert hashlib.sha256(shared).hexdigest() != verdict["elo_curve_fingerprint"]
+
+
+def test_elo_curve_artifact_path_rejects_non_digest_names(tmp_path):
+    from core.eval_artifacts import elo_curve_artifact_path
+
+    with pytest.raises(ValueError, match="hex digest"):
+        elo_curve_artifact_path(tmp_path, "../verdict")
