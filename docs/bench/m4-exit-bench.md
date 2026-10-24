@@ -80,19 +80,31 @@ arithmetic, not measurement:
   moves per 30-ply game that is ≈ 2 min/game before any search overhead — most of the
   128.8 s/game mean.
 - Form 5 (policy only, no search) is one evaluation per move and is close to free.
-- The rung-4 opponent (UCT + random rollouts, pure Python, also at S = 512) is itself
-  minutes per game on the four `uct-rollout-v1` cells; the rung-1–3 opponents are
+- The rung-4 opponent (UCT + random rollouts, pure Python) does not use the network
+  search budget: `core.uct.UCTAgent` fixes `NUM_SIMULATIONS = 1000` per move (§12 M3's
+  frozen rung-4 convention), independent of `eval_sims = 512`. It is itself minutes per
+  game on the three `uct-rollout-v1` cells (one per form); the rung-1–3 opponents are
   negligible.
-- The bench ran on **one process** — 11 of 12 hardware threads idle for 53 minutes.
+- The bench plays **one game at a time** in one process. That is not the same as one
+  hardware thread: inference runs through torch with 6 intra-op threads, so how much of
+  the 12-thread CPU sat idle was not measured.
 
 ## What this does and does not establish
 
-**Does.** "Live and concurrent" (§12 M4) is falsifiable, and as configured it is false:
-22.3 h of eval per 1.13 h of training is a lag that grows by ~19 checkpoints per
-checkpoint, breaching pin 11's `LIVENESS_MAX_LAG = 4` at the second publish and never
-recovering; over K = 30 the harness would run ≈ 670 h past a ≈ 38 h training run. The
-harness code is not at fault — it played exactly the cells a live poll would, at the
-pinned budget.
+**Does.** "Live and concurrent" (§12 M4) is falsifiable, and as configured it is
+*projected* false. This is a projection from the measured rates, not an observed
+liveness breach: a two-member run cannot breach pin 11's lag bound, since lag
+(`core.eval_run.eval_lag`: newest published member minus the snapshot's complete-member
+prefix) is at most 2 at the second publish. Projected at constant rates, one checkpoint
+takes 22.32 h of eval against a 1.128 h publish cadence, so the backlog grows by
+≈ 1 − 1.128/22.32 ≈ **0.95 checkpoints per publish interval**. With nothing scored yet
+the lag samples run 1, 2, 3, 4, 5, 6, …; pin 11's breach is `lag > LIVENESS_MAX_LAG = 4`
+at `LIVENESS_BREACH_CONSECUTIVE = 2` consecutive publish samples, so the first possible
+breach is at the **sixth** publish. Over K = 30 the harness needs ≈ 30 × 22.32 ≈ 670 h
+of eval **in total**. Training stops after ≈ 34 h at this cadence (≈ 38 h at the Aug-23
+run's 1.26 h). After that the finite backlog does drain, but only ≈ 635 h later, which
+is far outside any "live" reading. The harness code is not at fault — it played exactly
+the cells a live poll would, at the pinned budget.
 
 **Does not.** This says nothing about correctness, and nothing about the GPU: pin 11's
 throughput bound (≤ 5 % learner degradation) is decided by the M5.5 pre-flight A/B, which
@@ -103,9 +115,11 @@ seconds/game will drift as later checkpoints play longer games.
 
 Ordered by what they cost in pinned decisions:
 
-1. **Parallel cell workers.** Cells are independent and the box has 12 threads; a multi-process
-   harness is an implementation change touching no pin. Ceiling on this hardware ≈ 8–10×
-   — necessary but, alone, probably not sufficient.
+1. **Parallel cell workers.** Cells are independent, so a multi-process harness is an
+   implementation change touching no pin. Its speedup on this hardware is **unmeasured**:
+   each process already runs torch with 6 intra-op threads, so N workers at that setting
+   can oversubscribe the 12-thread CPU rather than scale. Sizing it needs a
+   worker-count × intra-op-thread benchmark first.
 2. **`device: cuda` for the harness.** Batch-1 inference on the 4060 Ti was ≈ 4 ms in the M2.5
    gate vs. 16 ms here — ≈ 3–4× on the inference share. Shares the GPU with the learner, so
    it is governed by pin 11's A/B, not by this bench.
@@ -113,8 +127,8 @@ Ordered by what they cost in pinned decisions:
 4. **Re-pinning `S = 512` or 24 pairs/cell.** Both are material (pin 10): a new
    `protocol_version` and a new eval namespace. Last resort, not first.
 
-(1) + (2) together are the plausible route to `feasible: True`; a re-run of this bench
-after either change is the test.
+(1) + (2) together are the candidate route to `feasible: True` (neither speedup is
+measured here yet); a re-run of this bench after either change is the test.
 
 ## Reproducing
 
