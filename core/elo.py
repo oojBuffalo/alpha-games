@@ -4,8 +4,8 @@ Bradley–Terry/logistic ratings on the standard 400-point scale, fit by
 coordinate ascent over per-matchup aggregate scores (draws already counted
 0.5), with the anchor agent pinned at exactly 0 (rung 1 in the frozen ladder)
 and one virtual draw per unordered matchup so extreme small samples stay
-finite. This is M1.6 scaffolding — M4's pre-registered protocol supersedes it
-for the §1 verdict.
+finite. This is M1.6 scaffolding — M4's pre-registered protocol adopts it
+(virtual draw included) for the §1 verdict.
 """
 
 from __future__ import annotations
