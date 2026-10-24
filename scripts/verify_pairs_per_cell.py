@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Independently check the precision basis of the 24-pairs-per-cell pin (§9 pin 1).
 
-Deliberately standalone — pure stdlib, no ``core/`` import — so agreement with the
-protocol is evidence, not a shared bug. It re-derives the one-agent step of the
+The precision calculation is independent, pure stdlib, with its own fit step.
+The Gaussian sensitivity check uses the production Mann–Kendall implementation.
+The precision calculation re-derives the one-agent step of the
 pin-6 fit (bracket expansion + bisection with one virtual draw per matchup) and
 checks two independent routes against each other: the closed-form
 Fisher-information standard error, and a seeded Monte-Carlo through that fit
@@ -36,6 +37,10 @@ import argparse
 import json
 import math
 import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from collections.abc import Sequence
 
 # --- the pinned protocol constants this script checks (design doc §6.2, §9) ------
@@ -52,6 +57,9 @@ MAX_RUNG8_CELLS = 3
 REPS = 4000
 SEED = 1
 Z_95 = 1.96
+PLATEAU_M = 16
+PLATEAU_MARGIN = 75.0
+PLATEAU_WIDTH = 150.0
 ELO_PER_NAT = 400.0 / math.log(10.0)
 
 #: Representative true ratings of frozen rungs 1–4 (rung 1 is the Elo-0 anchor).
@@ -63,6 +71,7 @@ SCENARIOS: tuple[tuple[str, float, tuple[float, ...]], ...] = (
     ("early", 100.0, RUNG_ELOS),
     ("mid", 400.0, RUNG_ELOS + (370.0, 250.0, 100.0)),
     ("late", 900.0, RUNG_ELOS + (880.0, 700.0, 100.0)),
+    ("plateau-late", 900.0, RUNG_ELOS + (900.0, 900.0, 100.0)),
 )
 
 IDEALIZATIONS = (
@@ -236,6 +245,52 @@ def budget(pairs: int = PINNED_PAIRS, k: int = K) -> dict[str, int]:
     }
 
 
+def plateau_location_simulation(reps: int, seed: int) -> dict:
+    """Gaussian SE=35 sensitivity model; no joint-fit or bootstrap coverage claim.
+
+    Reports location+precision and full MK conjunction rates both at one look
+    and at any two consecutive K=30 looks. Uses production MK to measure power;
+    all intervals have idealized known variance, so this is a sensitivity check
+    rather than a substitute for the evidence-backed detector fixture.
+    """
+    from core.eval_stats import mann_kendall
+
+    rng = random.Random(seed)
+    se = 35.0
+    half = PLATEAU_M // 2
+    radius = Z_95 * se * math.sqrt(2 / half)
+    out = {}
+    for slope in (0, 5, 10, 15):
+        one_location = one_full = any_confirmed = 0
+        for _ in range(reps):
+            curve = [slope * i + rng.gauss(0, se) for i in range(K)]
+            previous = False
+            confirmed = False
+            for end in range(PLATEAU_M, K + 1):
+                values = curve[end - PLATEAU_M : end]
+                delta = (sum(values[-half:]) - sum(values[:half])) / half
+                location = abs(delta) + radius < PLATEAU_MARGIN and 2 * radius < PLATEAU_WIDTH
+                passed = location and mann_kendall(values).p >= 0.05
+                if end == PLATEAU_M:
+                    one_location += location
+                    one_full += passed
+                confirmed |= previous and passed
+                previous = passed
+            any_confirmed += confirmed
+        out[str(slope)] = {
+            "location_pass_one_look": one_location / reps,
+            "full_pass_one_look": one_full / reps,
+            "confirmed_any_look": any_confirmed / reps,
+        }
+    return {
+        "m": PLATEAU_M,
+        "margin": PLATEAU_MARGIN,
+        "se": se,
+        "width_95": 2 * radius,
+        "rates_by_elo_per_checkpoint": out,
+    }
+
+
 # --- driver -----------------------------------------------------------------------
 
 
@@ -265,6 +320,10 @@ def compute(reps: int = REPS, seed: int = SEED) -> dict:
                 "mc_p97_5": mc["p97_5"],
                 "mc_half_width_95": mc["half_width_95"],
             }
+        for scenario in per_scenario.values():
+            scenario["window_contrast_width_95"] = (
+                2 * Z_95 * scenario["analytic_se"] * math.sqrt(2 / (PLATEAU_M // 2))
+            )
         se_early = per_scenario["early"]["analytic_se"]
         se_late = per_scenario["late"]["analytic_se"]
         delta_se = math.sqrt(se_early**2 / GROUP + se_late**2 / GROUP)
@@ -274,6 +333,7 @@ def compute(reps: int = REPS, seed: int = SEED) -> dict:
             "delta_half_width_95": Z_95 * delta_se,
         }
     return {
+        "plateau_location_simulation": plateau_location_simulation(reps, seed),
         "idealizations": list(IDEALIZATIONS),
         "k": K,
         "group": GROUP,
@@ -312,6 +372,7 @@ def _report(data: dict) -> str:
             lines.append(
                 f"{name:5s} true={sc['true_elo']:5.0f} cells={sc['subset_cells']}  "
                 f"analytic SE={s['analytic_se']:5.1f}  MC SD={s['mc_sd']:5.1f}  "
+                f"window 95% width={s['window_contrast_width_95']:.1f}  "
                 f"MC mean={s['mc_mean']:6.1f} bias={s['mc_bias']:+6.1f}  "
                 f"95% band=[{s['mc_p2_5']:6.1f}, "
                 f"{s['mc_p97_5']:6.1f}]  half-width={s['mc_half_width_95']:5.1f}"
@@ -320,6 +381,8 @@ def _report(data: dict) -> str:
             f"   => §1 Δ (mean of {data['group']} late − mean of {data['group']} early): "
             f"SE={entry['delta_se']:.1f}  95% half-width={entry['delta_half_width_95']:.1f} Elo"
         )
+    lines.append("\nGaussian SE=35 sensitivity model (not bootstrap coverage):")
+    lines.append(json.dumps(data["plateau_location_simulation"], sort_keys=True))
     return "\n".join(lines)
 
 

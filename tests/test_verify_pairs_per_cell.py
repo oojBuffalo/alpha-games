@@ -59,6 +59,11 @@ def test_form7_cell_counts(vp):
     assert (24 * min(cells), 24 * max(cells)) == (168, 792)
 
 
+def test_illustrative_subset_scenario_counts(vp):
+    cells = {name: len(opps) for name, _, opps in vp.SCENARIOS}
+    assert cells == {"early": 4, "mid": 7, "late": 7, "plateau-late": 7}
+
+
 def test_analytic_delta_half_width_band(vp):
     """Pin 1's illustrative subset Δ half-width: ≈27 Elo at 24 pairs, ≈39 at 12, ≈19 at 48."""
     hw = {
@@ -123,3 +128,24 @@ def test_joint_diagnostic_precision_and_shrinkage():
     assert results[0]["fisher_half_width_95"] == pytest.approx(
         2 * results[2]["fisher_half_width_95"], rel=1e-10
     )
+
+
+def test_plateau_constants_match_the_protocol_registry(vp):
+    """The script's sensitivity model uses the pinned §12 M4 plateau constants."""
+    from core import eval_protocol
+
+    assert vp.PLATEAU_M == eval_protocol.PLATEAU_WINDOW_M
+    assert vp.PLATEAU_MARGIN == eval_protocol.PLATEAU_EQUIVALENCE_MARGIN_ELO
+    assert vp.PLATEAU_WIDTH == eval_protocol.PLATEAU_CI_WIDTH_THRESHOLD_ELO
+
+
+def test_plateau_location_simulation_reproduces_the_doc_sensitivity_figures(vp):
+    """§12 M4's quoted 100% / 76.8% / 0.875% / 0% confirmation rates (4,000 seeded runs)."""
+    sim = vp.plateau_location_simulation(vp.REPS, vp.SEED)
+    rates = sim["rates_by_elo_per_checkpoint"]
+    assert vp.REPS == 4000
+    assert sim["width_95"] == pytest.approx(68.6, abs=0.05)
+    assert rates["0"]["confirmed_any_look"] == 1.0
+    assert rates["5"]["confirmed_any_look"] == pytest.approx(0.768)
+    assert rates["10"]["confirmed_any_look"] == pytest.approx(0.00875)
+    assert rates["15"]["confirmed_any_look"] == 0.0
