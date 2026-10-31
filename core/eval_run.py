@@ -8,7 +8,7 @@ resume/relaunch pattern, but for a different kind of process: not a training
 run, but a long-lived reader/player that watches one already-launched run
 and appends to ``core.eval_store``'s per-cell record store.
 
-This module owns seven things (the CLI face itself,
+This module owns eight things (the CLI face itself,
 ``scripts/run_eval.py``, is subtask 9.3):
 
 * :class:`EvalConfig` -- one eval harness launch's full protocol, loaded from
@@ -53,6 +53,14 @@ This module owns seven things (the CLI face itself,
   real seconds/game, games/hour, and the projected per-checkpoint cost
   against the watched run's own publish cadence -- the task 1 pin 11
   feasibility number, measured rather than asserted.
+* Harness execution (:class:`EvalExecution`; design doc §9 "Harness
+  execution") -- how many spawned pair workers play at once and at how
+  many torch intra-op threads each, for both the watch loop and the bench.
+  Never material: every pair's seeds are pure functions of the cell id and
+  pair index, the parent stays the sole eval-namespace writer and appends
+  each cell in ascending pair order, so a cell file is byte-identical to
+  the serial loop's. Each launch records its execution
+  (``eval/execution.json``), and the pin-11 A/B's ON arm must match it.
 
 **Game-generic by construction:** this module never imports ``games.*`` and
 never names a game-specific agent or balancer. Every function that needs a
@@ -70,16 +78,21 @@ import hashlib
 import json
 import logging
 import math
+import multiprocessing
 import os
+import queue
 import re
 import threading
 import time
+import traceback
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from core.artifact_fingerprint import build_fingerprint
 from core.checkpoint import list_published_versions, published_checkpoint_path
@@ -108,6 +121,7 @@ from core.eval_protocol import (
 from core.eval_stats import _validate_admissible_B, bootstrap_seed, elo_curve_path, verdict_path
 from core.eval_store import (
     CellId,
+    PairRecord,
     _read_manifest,
     append_pair_record,
     build_cell_id,
@@ -1050,6 +1064,57 @@ def _resolve_opponent_factory(
     )
 
 
+def _check_cell_factories(
+    parsed: CellId, candidate_factory: AgentFactory, opponent_factory: AgentFactory
+) -> None:
+    """Refuse to play a cell whose factories build agents under other identities.
+
+    Args:
+        parsed: The cell's parsed identity.
+        candidate_factory: The candidate agent's factory.
+        opponent_factory: The opponent agent's factory.
+
+    Raises:
+        ValueError: If either factory's agent name disagrees with the cell id.
+    """
+    if candidate_factory(0).name != parsed.candidate_identity:
+        raise ValueError("candidate identity disagrees with configured factory")
+    if opponent_factory(0).name != parsed.opponent_id:
+        raise ValueError("opponent identity disagrees with configured factory")
+
+
+def _open_pending_cell(
+    run_dir: Path,
+    run_id: str,
+    config: EvalConfig,
+    parsed: CellId,
+    candidate_fingerprint: Mapping[str, Any],
+) -> int:
+    """Create (or reopen) one cell's file under its header; return its next pair index.
+
+    Args:
+        run_dir: The watched run's root directory.
+        run_id: The watched run's identity.
+        config: This launch's resolved :class:`EvalConfig`.
+        parsed: The cell's parsed identity.
+        candidate_fingerprint: The live game's artifact fingerprint.
+
+    Returns:
+        The index of the first pair not yet recorded in the cell file
+        (:func:`core.eval_store.open_cell_for_write`'s own contract).
+    """
+    header = build_header(
+        run_id=run_id,
+        cell_id=parsed,
+        candidate_identity=parsed.candidate_identity,
+        opponent_identity=parsed.opponent_id,
+        eval_config=config.as_eval_config_snapshot(),
+        candidate_fingerprint=candidate_fingerprint,
+        cell_seed=cell_seed(config.eval_seed, parsed.to_string()),
+    )
+    return open_cell_for_write(run_dir, header)
+
+
 def _play_pending_cell(
     run_dir: Path,
     run_id: str,
@@ -1083,20 +1148,8 @@ def _play_pending_cell(
         :func:`core.eval_store.complete_cell` on a prior attempt).
     """
     cell_id = parsed.to_string()
-    if candidate_factory(0).name != parsed.candidate_identity:
-        raise ValueError("candidate identity disagrees with configured factory")
-    if opponent_factory(0).name != parsed.opponent_id:
-        raise ValueError("opponent identity disagrees with configured factory")
-    header = build_header(
-        run_id=run_id,
-        cell_id=parsed,
-        candidate_identity=parsed.candidate_identity,
-        opponent_identity=parsed.opponent_id,
-        eval_config=config.as_eval_config_snapshot(),
-        candidate_fingerprint=candidate_fingerprint,
-        cell_seed=cell_seed(config.eval_seed, cell_id),
-    )
-    start_index = open_cell_for_write(run_dir, header)
+    _check_cell_factories(parsed, candidate_factory, opponent_factory)
+    start_index = _open_pending_cell(run_dir, run_id, config, parsed, candidate_fingerprint)
     remaining = config.pairs_per_cell - start_index
     played = 0
     if remaining > 0:
@@ -1115,6 +1168,461 @@ def _play_pending_cell(
             played += 1
     complete_cell(run_dir, cell_id)
     return played
+
+
+# --- harness execution: parallel pair workers (design doc §9 "Harness execution") --
+#
+# How many mirrored pairs play at once, and with how many torch intra-op
+# threads each, is an execution setting, never protocol: every pair's seeds
+# are pure functions of (eval_seed, cell id, pair index), so a pair plays the
+# same whichever process plays it. Workers only load checkpoints and play; the
+# parent stays the eval namespace's sole writer and appends each cell's pairs
+# strictly in ascending pair index, so a cell file is byte-identical to the
+# serial loop's on a deterministic device.
+
+_EXECUTION_FILENAME = "execution.json"
+
+#: How long the parent waits on a worker message before re-checking that every
+#: worker is still alive (a worker killed outright never reports an error).
+_WORKER_POLL_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class EvalExecution:
+    """How one harness launch executes its games -- never what it plays (§9).
+
+    Neither field is material for the relaunch guard, fingerprinted, or
+    stamped onto a cell header: they change no game. They are recorded on
+    every ``--bench`` result, on the harness's per-launch execution record
+    (:func:`read_eval_execution`), and on the pin-11 A/B's ON arm, which the
+    launch execution must match.
+
+    Attributes:
+        workers: Worker processes playing pairs concurrently. ``1`` plays every
+            pair in the calling process, exactly the serial loop.
+        torch_threads: Torch intra-op threads per playing process, or ``None``
+            to leave torch's own default in place.
+    """
+
+    workers: int = 1
+    torch_threads: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate both settings.
+
+        Raises:
+            ValueError: If ``workers`` is not a positive ``int``, or
+                ``torch_threads`` is neither ``None`` nor a positive ``int``
+                (``bool`` rejected for both).
+        """
+        if isinstance(self.workers, bool) or not isinstance(self.workers, int):
+            raise ValueError(f"workers must be a positive int, got {self.workers!r}")
+        _positive(self.workers, "workers")
+        if self.torch_threads is not None:
+            if isinstance(self.torch_threads, bool) or not isinstance(self.torch_threads, int):
+                raise ValueError(
+                    f"torch_threads must be None or a positive int, got {self.torch_threads!r}"
+                )
+            _positive(self.torch_threads, "torch_threads")
+
+
+#: A picklable, argument-free callable that rebuilds the watched game and its
+#: eval profile inside a spawned worker (``games.registry.
+#: build_eval_worker_setup`` at the script layer -- ``core/`` never imports
+#: ``games.*``).
+WorkerSetup = Callable[[], tuple[Game, EvalProfile]]
+
+
+def _rung_identity_map(profile: EvalProfile) -> dict[str, AgentFactory]:
+    """Map every declared network-free rung's identity to its factory."""
+    return {
+        profile.rung_identity(rung): profile.network_free_rungs[rung] for rung in profile.rungs()
+    }
+
+
+def eval_execution_path(run_dir: Path | str) -> Path:
+    """Return ``<run_dir>/eval/execution.json``, the latest launch's execution record."""
+    return eval_dir(run_dir) / _EXECUTION_FILENAME
+
+
+def write_eval_execution(
+    run_dir: Path | str, *, device: str, workers: int, torch_threads: int
+) -> dict[str, Any]:
+    """Record the execution the current launch actually plays under.
+
+    Unlike the provenance file this is rewritten by every launch: execution is
+    not material, so a relaunch may change it, and the pin-11 liveness report
+    judges an A/B against whatever the harness last launched with.
+
+    Args:
+        run_dir: The watched run's root directory.
+        device: The eval device (``EvalConfig.device``).
+        workers: Worker processes playing pairs.
+        torch_threads: Torch intra-op threads per playing process, as torch
+            reported them inside that process.
+
+    Returns:
+        The record written.
+    """
+    record = {
+        "device": device,
+        "workers": workers,
+        "torch_threads": torch_threads,
+        "launched_at": time.time(),
+    }
+    _atomic_write_json(eval_execution_path(run_dir), record)
+    return record
+
+
+def read_eval_execution(run_dir: Path | str) -> dict[str, Any] | None:
+    """Return the latest launch's execution record, or ``None`` before any launch."""
+    path = eval_execution_path(run_dir)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+class EvalWorkerError(RuntimeError):
+    """A pair worker failed or died; the harness stops rather than leave a gap."""
+
+
+def _pair_worker_main(
+    setup: WorkerSetup,
+    ckpt_dir: str,
+    device: str,
+    eval_sims: int,
+    eval_seed: int,
+    torch_threads: int | None,
+    parent_pid: int,
+    tasks: Any,
+    results: Any,
+) -> None:
+    """One pair worker's process body -- a ``spawn``-context ``Process`` target.
+
+    Rebuilds the game, profile, and its own checkpoint-load cache, reports
+    ``("ready", torch_threads)``, then plays one mirrored pair per
+    ``(cell_id, version, pair_index)`` task, sending ``("pair", cell_id,
+    record)`` back. Any failure sends ``("error", cell_id, traceback)`` and
+    exits; a ``None`` task, or the parent disappearing, exits quietly.
+
+    Args:
+        setup: Rebuilds ``(game, profile)`` in this process.
+        ckpt_dir: The watched run's checkpoint directory.
+        device: Torch device for inference.
+        eval_sims: The rung-6/7 (and rung-8) search budget *S*.
+        eval_seed: The harness's root seed (:func:`cell_seed`).
+        torch_threads: Intra-op threads to set, or ``None`` for torch's default.
+        parent_pid: The parent's pid; a reparented worker exits.
+        tasks: The shared task queue.
+        results: The shared result queue.
+    """
+    cell_id = None
+    try:
+        if torch_threads is not None:
+            torch.set_num_threads(torch_threads)
+        game, profile = setup()
+        rung_identities = _rung_identity_map(profile)
+        cache = _CandidateCache(
+            ckpt_dir=Path(ckpt_dir), game=game, device=device, eval_sims=eval_sims
+        )
+        factories: dict[str, tuple[AgentFactory, AgentFactory]] = {}
+        results.put(("ready", torch.get_num_threads()))
+        while os.getppid() == parent_pid:
+            try:
+                task = tasks.get(timeout=_WORKER_POLL_SECONDS)
+            except queue.Empty:
+                continue
+            if task is None:
+                return
+            cell_id, version, pair_index = task
+            if cell_id not in factories:
+                parsed = parse_cell_id(cell_id)
+                candidate = cache.candidate_factory(version, parsed.rung)
+                opponent = _resolve_opponent_factory(parsed.opponent_id, rung_identities, cache)
+                _check_cell_factories(parsed, candidate, opponent)
+                factories[cell_id] = (candidate, opponent)
+            candidate, opponent = factories[cell_id]
+            (result,) = play_pairs(
+                game,
+                candidate,
+                opponent,
+                n_pairs=1,
+                seed=cell_seed(eval_seed, cell_id),
+                opening_balancer=profile.opening_balancer,
+                start_pair_index=pair_index,
+            )
+            results.put(("pair", cell_id, pair_result_to_record(result)))
+    except BaseException:
+        results.put(("error", cell_id, traceback.format_exc()))
+
+
+class _PairWorkerPool:
+    """``W`` spawned pair workers sharing one task queue and one result queue.
+
+    Lives for one :func:`run_watch_loop` (or :func:`bench_candidate`) call, so
+    each worker's checkpoint cache stays warm across polls. Every message is
+    read through :meth:`next_pair`, which raises :class:`EvalWorkerError` on a
+    reported failure or on a worker that exited without one.
+    """
+
+    def __init__(
+        self,
+        workers: int,
+        setup: WorkerSetup,
+        *,
+        ckpt_dir: Path,
+        device: str,
+        eval_sims: int,
+        eval_seed: int,
+        torch_threads: int | None,
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        self._tasks = context.Queue()
+        self._results = context.Queue()
+        self._processes = [
+            context.Process(
+                target=_pair_worker_main,
+                args=(
+                    setup,
+                    str(ckpt_dir),
+                    device,
+                    eval_sims,
+                    eval_seed,
+                    torch_threads,
+                    os.getpid(),
+                    self._tasks,
+                    self._results,
+                ),
+                name=f"eval-pair-worker-{index}",
+                daemon=True,
+            )
+            for index in range(workers)
+        ]
+        for process in self._processes:
+            process.start()
+        try:
+            reported = {self._next("ready")[1] for _ in self._processes}
+            if len(reported) != 1:
+                raise EvalWorkerError(
+                    f"pair workers disagree on their torch intra-op threads: {sorted(reported)}"
+                )
+        except BaseException:
+            self.close(abort=True)
+            raise
+        #: Torch intra-op threads, as every worker reported them after setup.
+        self.torch_threads = reported.pop()
+
+    def _next(self, expected: str) -> tuple:
+        """Return the next worker message of kind ``expected``.
+
+        Raises:
+            EvalWorkerError: On an ``error`` message, a message of another
+                kind, or a worker that has exited.
+        """
+        while True:
+            try:
+                message = self._results.get(timeout=_WORKER_POLL_SECONDS)
+            except queue.Empty:
+                dead = [p for p in self._processes if not p.is_alive()]
+                if dead:
+                    codes = ", ".join(f"{p.name}={p.exitcode}" for p in dead)
+                    raise EvalWorkerError(f"pair worker(s) exited unexpectedly: {codes}") from None
+                continue
+            if message[0] == "error":
+                raise EvalWorkerError(f"pair worker failed on cell {message[1]!r}:\n{message[2]}")
+            if message[0] != expected:
+                raise EvalWorkerError(f"expected a {expected!r} message, got {message[0]!r}")
+            return message
+
+    def submit(self, cell_id: str, version: int, pair_index: int) -> None:
+        """Queue one pair for whichever worker is free first."""
+        self._tasks.put((cell_id, version, pair_index))
+
+    def next_pair(self) -> tuple[str, PairRecord]:
+        """Block until some worker finishes a pair; return ``(cell_id, record)``."""
+        _, cell_id, record = self._next("pair")
+        return cell_id, record
+
+    def close(self, *, abort: bool = False) -> None:
+        """Stop every worker -- after its queued work (default) or at once.
+
+        Args:
+            abort: Terminate immediately (an error path, with tasks possibly
+                still queued) instead of letting workers drain to their
+                ``None`` sentinel.
+        """
+        if not abort:
+            for _ in self._processes:
+                self._tasks.put(None)
+            for process in self._processes:
+                process.join(timeout=10)
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+        self._tasks.cancel_join_thread()
+        self._tasks.close()
+        self._results.close()
+
+
+class _CellAppender:
+    """Append one cell's pairs strictly in ascending index as workers return them.
+
+    A pair that finishes ahead of a predecessor is held until every earlier
+    index has been appended, so the cell file never depends on finishing
+    order. A kill loses only held pairs, which the next launch replays from
+    the cell's first missing index.
+
+    Attributes:
+        cell_id: The cell's finished id string.
+        next_index: The next pair index the cell file expects.
+        stop: One past the last pair index this cell plays.
+    """
+
+    def __init__(self, run_dir: Path, cell_id: str, start: int, stop: int) -> None:
+        self.cell_id = cell_id
+        self.next_index = start
+        self.stop = stop
+        self._path = cell_path(run_dir, cell_id)
+        self._held: dict[int, PairRecord] = {}
+
+    @property
+    def complete(self) -> bool:
+        """Whether every pair up to ``stop`` has been appended."""
+        return self.next_index >= self.stop
+
+    def add(self, record: PairRecord) -> int:
+        """Hold ``record``, append every now-contiguous pair, and return how many.
+
+        Raises:
+            ValueError: If ``record``'s index is outside this cell's pending
+                range or was already received.
+        """
+        index = record.pair_index
+        if not self.next_index <= index < self.stop or index in self._held:
+            raise ValueError(
+                f"cell {self.cell_id!r}: unexpected pair index {index} "
+                f"(pending [{self.next_index}, {self.stop}))"
+            )
+        self._held[index] = record
+        appended = 0
+        while self.next_index in self._held:
+            append_pair_record(self._path, self._held.pop(self.next_index))
+            self.next_index += 1
+            appended += 1
+        return appended
+
+
+def _play_pending_parallel(
+    pool: _PairWorkerPool,
+    run_dir: Path,
+    run_id: str,
+    config: EvalConfig,
+    pending: Sequence[tuple[int, CellId]],
+    candidate_fingerprint: Mapping[str, Any],
+    on_cell_complete: Callable[[str], None],
+) -> int:
+    """Play every pending cell's missing pairs across ``pool``; return pairs appended.
+
+    The parent opens (or reopens) each cell under its header, queues one task
+    per missing pair in member/cell/pair order, then appends results through a
+    :class:`_CellAppender` per cell and completes each cell the moment its
+    last pair lands.
+
+    Args:
+        pool: The running worker pool.
+        run_dir: The watched run's root directory.
+        run_id: The watched run's identity.
+        config: This launch's resolved :class:`EvalConfig`.
+        pending: ``(member_version, parsed_cell_id)`` for every cell not yet
+            complete, in scheduling order.
+        candidate_fingerprint: The live game's artifact fingerprint.
+        on_cell_complete: Called with each cell id once it is complete.
+
+    Returns:
+        The number of pairs newly appended.
+
+    Raises:
+        EvalWorkerError: If a worker fails, dies, or returns a pair for a cell
+            this call never queued.
+    """
+    appenders: dict[str, _CellAppender] = {}
+    for version, parsed in pending:
+        cell_id = parsed.to_string()
+        start = _open_pending_cell(run_dir, run_id, config, parsed, candidate_fingerprint)
+        if start >= config.pairs_per_cell:
+            complete_cell(run_dir, cell_id)
+            on_cell_complete(cell_id)
+            continue
+        appenders[cell_id] = _CellAppender(run_dir, cell_id, start, config.pairs_per_cell)
+        for pair_index in range(start, config.pairs_per_cell):
+            pool.submit(cell_id, version, pair_index)
+
+    appended = 0
+    open_cells = len(appenders)
+    while open_cells:
+        cell_id, record = pool.next_pair()
+        appender = appenders.get(cell_id)
+        if appender is None:
+            raise EvalWorkerError(f"pair worker returned a pair for unqueued cell {cell_id!r}")
+        appended += appender.add(record)
+        if appender.complete:
+            complete_cell(run_dir, cell_id)
+            on_cell_complete(cell_id)
+            open_cells -= 1
+    return appended
+
+
+@contextmanager
+def _torch_threads(torch_threads: int | None):
+    """Set this process's torch intra-op threads for the block, then restore them."""
+    previous = torch.get_num_threads()
+    if torch_threads is not None:
+        torch.set_num_threads(torch_threads)
+    try:
+        yield torch.get_num_threads()
+    finally:
+        torch.set_num_threads(previous)
+
+
+@contextmanager
+def _execution_pool(
+    execution: EvalExecution,
+    worker_setup: WorkerSetup | None,
+    *,
+    ckpt_dir: Path,
+    config: EvalConfig,
+):
+    """Yield ``(pool_or_None, effective_torch_threads)`` for one harness call.
+
+    ``workers == 1`` yields no pool: the caller plays in-process under
+    ``execution.torch_threads``. Otherwise a :class:`_PairWorkerPool` is
+    started, closed normally on success and aborted on any exception.
+
+    Raises:
+        ValueError: If ``workers > 1`` and no picklable ``worker_setup`` was
+            supplied.
+    """
+    if execution.workers == 1:
+        with _torch_threads(execution.torch_threads) as threads:
+            yield None, threads
+        return
+    if worker_setup is None:
+        raise ValueError("workers > 1 needs a picklable worker_setup to rebuild the game")
+    pool = _PairWorkerPool(
+        execution.workers,
+        worker_setup,
+        ckpt_dir=ckpt_dir,
+        device=config.device,
+        eval_sims=config.eval_sims,
+        eval_seed=config.eval_seed,
+        torch_threads=execution.torch_threads,
+    )
+    try:
+        yield pool, pool.torch_threads
+    except BaseException:
+        pool.close(abort=True)
+        raise
+    else:
+        pool.close()
 
 
 @dataclass(frozen=True)
@@ -1252,6 +1760,7 @@ def compare_liveness_throughput(
     *,
     eval_device: str | None = None,
     throughput_counts: Mapping[str, int] | None = None,
+    eval_execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare matched single-GPU off/on windows after a fixed game warmup.
 
@@ -1268,6 +1777,12 @@ def compare_liveness_throughput(
             each arm discards ``throughput.warmup_games`` completions and times
             the next ``throughput.measure_games``); the evidence's counts must
             equal them exactly, so a shorter, transient window cannot pass.
+        eval_execution: The harness's latest launch execution record
+            (:func:`read_eval_execution`), or ``None`` before any launch. The
+            ON arm must record its own ``eval_workers``/``eval_torch_threads``;
+            when they differ from this record the result is insufficient data
+            (design doc §9 "Harness execution": an A/B holds only for the
+            execution it was measured under), never a pass or a breach.
 
     Returns:
         The throughput half of the liveness report.
@@ -1318,6 +1833,12 @@ def compare_liveness_throughput(
             )
         if not on["eval_checkpoint"]:
             raise ValueError("ON window must identify its fixed eval checkpoint")
+        on_execution = {"workers": on["eval_workers"], "torch_threads": on["eval_torch_threads"]}
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in on_execution.values()
+        ):
+            raise ValueError("ON window must record positive eval_workers and eval_torch_threads")
         rates = {}
         steps_per_second = {}
         for name, window in (("harness_off", off), ("harness_on", on)):
@@ -1357,6 +1878,18 @@ def compare_liveness_throughput(
             steps_per_second[name] = (steps_end - steps_start) / (end - start)
     except (KeyError, TypeError) as exc:
         raise ValueError(f"invalid throughput window evidence: {exc}") from exc
+    if eval_execution is not None:
+        launched = {key: eval_execution[key] for key in ("workers", "torch_threads")}
+        if launched != on_execution:
+            return {
+                "throughput_degradation": None,
+                "throughput_breached": None,
+                "throughput_reason": (
+                    f"insufficient_data: the A/B ON arm ran {on_execution} but the harness "
+                    f"launched with {launched}; record an A/B under the launch execution"
+                ),
+                "throughput_windows": windows,
+            }
     degradation = 1 - rates["harness_on"] / rates["harness_off"]
     return {
         "throughput_degradation": degradation,
@@ -1380,10 +1913,12 @@ LIVENESS_OBSERVATION_RULE = {
     ),
     "throughput": (
         "paired A/B from one restored learner checkpoint: OFF (harness idle) then ON "
-        "(harness playing at production S on its configured device); each arm "
-        "discards warmup_games completed games, then times exactly measure_games; "
-        "degradation = 1 - ON_rate/OFF_rate, breach strictly above "
-        "max_throughput_degradation"
+        "(harness playing at production S on its configured device, recording its "
+        "worker count and intra-op threads); each arm discards warmup_games "
+        "completed games, then times exactly measure_games; degradation = 1 - "
+        "ON_rate/OFF_rate, breach strictly above max_throughput_degradation; an ON "
+        "arm whose workers/threads differ from the harness's latest launch "
+        "execution is insufficient data"
     ),
     "in_run_series": (
         "per-publish-interval games_per_hour and learner_steps_per_sec, for "
@@ -1534,6 +2069,7 @@ def build_liveness_report(
                 throughput_windows,
                 eval_device=eval_device,
                 throughput_counts=_stored_throughput_counts(run_dir),
+                eval_execution=read_eval_execution(run_dir),
             )
             _atomic_write_json(
                 eval_dir(run_dir) / "liveness-throughput.json", dict(throughput_windows)
@@ -1623,7 +2159,10 @@ class _LivenessMonitor:
         throughput_path = eval_dir(self.run_dir) / "liveness-throughput.json"
         windows = json.loads(throughput_path.read_text()) if throughput_path.exists() else None
         throughput = compare_liveness_throughput(
-            windows, eval_device=self.eval_device, throughput_counts=self.throughput_counts
+            windows,
+            eval_device=self.eval_device,
+            throughput_counts=self.throughput_counts,
+            eval_execution=read_eval_execution(self.run_dir),
         )
         ordered = sorted(self.samples, key=lambda sample: sample["published_version"])
         consecutive = 0
@@ -1720,6 +2259,8 @@ def run_watch_loop(
     single_pass: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     on_member_complete: Callable[[int], None] | None = None,
+    execution: EvalExecution | None = None,
+    worker_setup: WorkerSetup | None = None,
 ) -> WatchLoopResult:
     """Run the M4 watch/resume/catch-up loop over one watched run (§9; 9.2).
 
@@ -1772,6 +2313,15 @@ def run_watch_loop(
             relaunch, without interrupting scoring. A caller that can tell its
             artifacts are already current (``scripts/run_eval.py`` compares the
             stored verdict's evidence fingerprint) skips the regeneration.
+            With parallel workers, members are reported in ascending order
+            only: a member is marked once it and every earlier schedulable
+            member are complete.
+        execution: How this launch plays (design doc §9 "Harness
+            execution"); ``None`` is one in-process worker at torch's default
+            threads. Recorded to ``eval/execution.json`` at launch
+            (:func:`write_eval_execution`); never material.
+        worker_setup: A picklable callable rebuilding ``(game, profile)`` in a
+            spawned worker -- required when ``execution.workers > 1``.
 
     Returns:
         A :class:`WatchLoopResult` summarizing the call.
@@ -1782,7 +2332,10 @@ def run_watch_loop(
         FileNotFoundError: If the watched run has no recorded ``config.json``
             or ``run_record.json`` yet (:func:`watched_k_total`,
             ``core.run_identity.read_run_record``).
+        ValueError: If ``execution.workers > 1`` without a ``worker_setup``.
+        EvalWorkerError: If a pair worker fails or dies.
     """
+    execution = execution or EvalExecution()
     run_dir = Path(run_dir)
     run_id = read_run_record(run_dir).run_id
     k_total = watched_k_total(run_dir)
@@ -1793,9 +2346,7 @@ def run_watch_loop(
     resolve_eval_launch(run_dir, config)
     ckpt_dir = checkpoint_dir(run_dir)
     candidate_fingerprint = build_fingerprint(game)
-    rung_identities = {
-        profile.rung_identity(rung): profile.network_free_rungs[rung] for rung in profile.rungs()
-    }
+    rung_identities = _rung_identity_map(profile)
     cache = _CandidateCache(
         ckpt_dir=ckpt_dir, game=game, device=config.device, eval_sims=config.eval_sims
     )
@@ -1807,51 +2358,48 @@ def run_watch_loop(
     stopped_reason = "single_pass"
 
     reports = _ReportCoalescer(on_member_complete)
-    with _monitor_liveness(run_dir, k_total, poll_interval, eval_device=config.device):
+    with (
+        _monitor_liveness(run_dir, k_total, poll_interval, eval_device=config.device),
+        _execution_pool(execution, worker_setup, ckpt_dir=ckpt_dir, config=config) as (
+            pool,
+            torch_threads,
+        ),
+    ):
+        write_eval_execution(
+            run_dir, device=config.device, workers=execution.workers, torch_threads=torch_threads
+        )
         while True:
             polls += 1
             available = schedulable_versions(run_dir, k_total)
-            pairs_this_poll = 0
 
-            for version in available:
-                required = required_cell_ids(
-                    version,
+            if pool is None:
+                pairs_this_poll = _serial_poll(
+                    run_dir,
+                    run_id,
+                    config,
+                    game,
                     profile,
                     available,
                     k_total,
-                    config.forms,
-                    lag_divisor=config.rung8_lag_divisor,
-                    earliest=config.rung8_earliest_version,
-                    eval_sims=config.eval_sims,
+                    candidate_fingerprint,
+                    cache,
+                    rung_identities,
+                    completed_members,
+                    reports,
                 )
-                register_member(run_dir, version, required)
-                pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
-                if not pending:
-                    completed_members.add(version)
-                    reports.mark(version)
-                    continue
-                # Report the members completed so far before this one's play
-                # starts -- once, however many were already complete.
-                reports.flush()
-                for cid in pending:
-                    parsed = parse_cell_id(cid)
-                    candidate_factory = cache.candidate_factory(version, parsed.rung)
-                    opponent_factory = _resolve_opponent_factory(
-                        parsed.opponent_id, rung_identities, cache
-                    )
-                    pairs_this_poll += _play_pending_cell(
-                        run_dir,
-                        run_id,
-                        config,
-                        game,
-                        profile,
-                        parsed,
-                        candidate_factory,
-                        opponent_factory,
-                        candidate_fingerprint,
-                    )
-                completed_members.add(version)
-                reports.mark(version)
+            else:
+                pairs_this_poll = _parallel_poll(
+                    pool,
+                    run_dir,
+                    run_id,
+                    config,
+                    profile,
+                    available,
+                    k_total,
+                    candidate_fingerprint,
+                    completed_members,
+                    reports,
+                )
 
             reports.flush()
             total_pairs_played += pairs_this_poll
@@ -1874,6 +2422,155 @@ def run_watch_loop(
         pairs_played=total_pairs_played,
         completed_members=tuple(sorted(completed_members)),
         stopped_reason=stopped_reason,
+    )
+
+
+def _serial_poll(
+    run_dir: Path,
+    run_id: str,
+    config: EvalConfig,
+    game: Game,
+    profile: EvalProfile,
+    available: Sequence[int],
+    k_total: int,
+    candidate_fingerprint: Mapping[str, Any],
+    cache: _CandidateCache,
+    rung_identities: Mapping[str, AgentFactory],
+    completed_members: set[int],
+    reports: _ReportCoalescer,
+) -> int:
+    """One :func:`run_watch_loop` poll played in-process, member by member.
+
+    Args:
+        run_dir: The watched run's root directory.
+        run_id: The watched run's identity.
+        config: This launch's resolved :class:`EvalConfig`.
+        game: The live game/adapter to play on.
+        profile: The watched game's declared eval profile.
+        available: This poll's schedulable member versions, ascending.
+        k_total: The watched run's checkpoint count *K*.
+        candidate_fingerprint: The live game's artifact fingerprint.
+        cache: The loop's checkpoint-load cache.
+        rung_identities: Every declared network-free rung's identity -> factory.
+        completed_members: The loop's complete-member set, updated in place.
+        reports: The loop's report coalescer.
+
+    Returns:
+        The number of pairs newly played this poll.
+    """
+    played = 0
+    for version in available:
+        required = required_cell_ids(
+            version,
+            profile,
+            available,
+            k_total,
+            config.forms,
+            lag_divisor=config.rung8_lag_divisor,
+            earliest=config.rung8_earliest_version,
+            eval_sims=config.eval_sims,
+        )
+        register_member(run_dir, version, required)
+        pending = [cid for cid in required if not is_cell_complete(run_dir, cid)]
+        if not pending:
+            completed_members.add(version)
+            reports.mark(version)
+            continue
+        # Report the members completed so far before this one's play
+        # starts -- once, however many were already complete.
+        reports.flush()
+        for cid in pending:
+            parsed = parse_cell_id(cid)
+            candidate_factory = cache.candidate_factory(version, parsed.rung)
+            opponent_factory = _resolve_opponent_factory(parsed.opponent_id, rung_identities, cache)
+            played += _play_pending_cell(
+                run_dir,
+                run_id,
+                config,
+                game,
+                profile,
+                parsed,
+                candidate_factory,
+                opponent_factory,
+                candidate_fingerprint,
+            )
+        completed_members.add(version)
+        reports.mark(version)
+    return played
+
+
+def _parallel_poll(
+    pool: _PairWorkerPool,
+    run_dir: Path,
+    run_id: str,
+    config: EvalConfig,
+    profile: EvalProfile,
+    available: Sequence[int],
+    k_total: int,
+    candidate_fingerprint: Mapping[str, Any],
+    completed_members: set[int],
+    reports: _ReportCoalescer,
+) -> int:
+    """One :func:`run_watch_loop` poll's scheduling and play across a worker pool.
+
+    Registers every schedulable member's required cells first, then plays all
+    pending cells at once (:func:`_play_pending_parallel`). A member joins
+    ``completed_members`` the moment its last cell completes; the report hook
+    is marked only for the ascending prefix of complete members, so a member
+    finishing ahead of an earlier one never advances the reported version
+    past a gap.
+
+    Args:
+        pool: The running worker pool.
+        run_dir: The watched run's root directory.
+        run_id: The watched run's identity.
+        config: This launch's resolved :class:`EvalConfig`.
+        profile: The watched game's declared eval profile.
+        available: This poll's schedulable member versions, ascending.
+        k_total: The watched run's checkpoint count *K*.
+        candidate_fingerprint: The live game's artifact fingerprint.
+        completed_members: The loop's complete-member set, updated in place.
+        reports: The loop's report coalescer.
+
+    Returns:
+        The number of pairs newly appended this poll.
+    """
+    outstanding: dict[int, set[str]] = {}
+    pending: list[tuple[int, CellId]] = []
+    for version in available:
+        required = required_cell_ids(
+            version,
+            profile,
+            available,
+            k_total,
+            config.forms,
+            lag_divisor=config.rung8_lag_divisor,
+            earliest=config.rung8_earliest_version,
+            eval_sims=config.eval_sims,
+        )
+        register_member(run_dir, version, required)
+        cells = [cid for cid in required if not is_cell_complete(run_dir, cid)]
+        outstanding[version] = set(cells)
+        pending.extend((version, parse_cell_id(cid)) for cid in cells)
+
+    def settle() -> None:
+        prefix = True
+        for version in available:
+            if outstanding[version]:
+                prefix = False
+                continue
+            completed_members.add(version)
+            if prefix:
+                reports.mark(version)
+        reports.flush()
+
+    def on_cell_complete(cell_id: str) -> None:
+        outstanding[parse_cell_id(cell_id).candidate_version].discard(cell_id)
+        settle()
+
+    settle()
+    return _play_pending_parallel(
+        pool, run_dir, run_id, config, pending, candidate_fingerprint, on_cell_complete
     )
 
 
@@ -1971,6 +2668,10 @@ class BenchResult:
             (``EvalConfig.eval_sims`` -- the configured production value,
             never a reduced bench-only budget).
         device: The torch device actually used (``EvalConfig.device``).
+        workers: Pair worker processes the sample was played across
+            (:class:`EvalExecution`; ``1`` is in-process).
+        torch_threads: Torch intra-op threads per playing process, as torch
+            reported them there.
         pairs_per_cell: The *production* pairs-per-cell value
             (``EvalConfig.pairs_per_cell``) the projection below scales by --
             never the smaller count actually sampled here.
@@ -1982,9 +2683,12 @@ class BenchResult:
             at ``bench_pairs_per_cell`` pairs.
         games_played: Total games actually played (``2 * bench_pairs_per_cell
             * cells_benched`` -- each pair plays two seat-swapped games).
-        elapsed_seconds: Total wall-clock time spent playing them.
-        seconds_per_game: ``elapsed_seconds / games_played``.
-        games_per_hour: ``3600 / seconds_per_game``.
+        elapsed_seconds: Total wall-clock time spent playing them (with
+            ``workers > 1``, from every worker ready to the last pair back).
+        seconds_per_game: ``elapsed_seconds / games_played`` -- wall-clock
+            seconds per game across all workers, so the projection below
+            measures ``workers`` rather than assuming linear scaling.
+        games_per_hour: ``3600 / seconds_per_game`` (aggregate).
         games_per_checkpoint: The projected games one full required-cell set
             plays at the *production* ``pairs_per_cell`` (``cells_benched *
             pairs_per_cell * 2``) -- never the smaller sampled count.
@@ -2003,6 +2707,8 @@ class BenchResult:
     candidate_version: int
     eval_sims: int
     device: str
+    workers: int
+    torch_threads: int
     pairs_per_cell: int
     bench_pairs_per_cell: int
     cells_benched: int
@@ -2021,6 +2727,8 @@ class BenchResult:
             "candidate_version": self.candidate_version,
             "eval_sims": self.eval_sims,
             "device": self.device,
+            "workers": self.workers,
+            "torch_threads": self.torch_threads,
             "pairs_per_cell": self.pairs_per_cell,
             "bench_pairs_per_cell": self.bench_pairs_per_cell,
             "cells_benched": self.cells_benched,
@@ -2070,6 +2778,8 @@ def bench_candidate(
     game: Game,
     *,
     n_pairs: int = 1,
+    execution: EvalExecution | None = None,
+    worker_setup: WorkerSetup | None = None,
 ) -> BenchResult:
     """Measure real throughput against the newest published member (§9 pin 11).
 
@@ -2094,15 +2804,24 @@ def bench_candidate(
         n_pairs: Mirrored pairs to sample per required cell (small; the
             *production* ``pairs_per_cell`` from ``config`` is used only for
             the projection, never actually played here).
+        execution: How to play the sample (:class:`EvalExecution`); ``None``
+            is one in-process worker at torch's default threads. With
+            ``workers > 1`` every sampled pair is queued at once, exactly as
+            a live poll queues a member's pairs.
+        worker_setup: A picklable ``(game, profile)`` rebuild for spawned
+            workers -- required when ``execution.workers > 1``.
 
     Returns:
         The measured :class:`BenchResult`.
 
     Raises:
-        ValueError: If ``n_pairs < 1``, or if no member checkpoint is
+        ValueError: If ``n_pairs < 1``, if no member checkpoint is
             schedulable yet (:func:`schedulable_versions`) -- there is
-            nothing real to bench against.
+            nothing real to bench against -- or if ``execution.workers > 1``
+            without a ``worker_setup``.
+        EvalWorkerError: If a pair worker fails or dies.
     """
+    execution = execution or EvalExecution()
     if n_pairs < 1:
         raise ValueError(f"n_pairs must be >= 1, got {n_pairs}")
     run_dir = Path(run_dir)
@@ -2125,32 +2844,41 @@ def bench_candidate(
         eval_sims=config.eval_sims,
     )
 
-    rung_identities = {
-        profile.rung_identity(rung): profile.network_free_rungs[rung] for rung in profile.rungs()
-    }
-    cache = _CandidateCache(
-        ckpt_dir=checkpoint_dir(run_dir),
-        game=game,
-        device=config.device,
-        eval_sims=config.eval_sims,
-    )
-
+    ckpt_dir = checkpoint_dir(run_dir)
     games_played = 0
-    start = time.perf_counter()
-    for cid in required:
-        parsed = parse_cell_id(cid)
-        candidate_factory = cache.candidate_factory(candidate_version, parsed.rung)
-        opponent_factory = _resolve_opponent_factory(parsed.opponent_id, rung_identities, cache)
-        results = play_pairs(
-            game,
-            candidate_factory,
-            opponent_factory,
-            n_pairs=n_pairs,
-            seed=cell_seed(config.eval_seed, cid),
-            opening_balancer=profile.opening_balancer,
-        )
-        games_played += 2 * len(results)
-    elapsed = time.perf_counter() - start
+    with _execution_pool(execution, worker_setup, ckpt_dir=ckpt_dir, config=config) as (
+        pool,
+        torch_threads,
+    ):
+        start = time.perf_counter()
+        if pool is None:
+            rung_identities = _rung_identity_map(profile)
+            cache = _CandidateCache(
+                ckpt_dir=ckpt_dir, game=game, device=config.device, eval_sims=config.eval_sims
+            )
+            for cid in required:
+                parsed = parse_cell_id(cid)
+                candidate_factory = cache.candidate_factory(candidate_version, parsed.rung)
+                opponent_factory = _resolve_opponent_factory(
+                    parsed.opponent_id, rung_identities, cache
+                )
+                results = play_pairs(
+                    game,
+                    candidate_factory,
+                    opponent_factory,
+                    n_pairs=n_pairs,
+                    seed=cell_seed(config.eval_seed, cid),
+                    opening_balancer=profile.opening_balancer,
+                )
+                games_played += 2 * len(results)
+        else:
+            for cid in required:
+                for pair_index in range(n_pairs):
+                    pool.submit(cid, candidate_version, pair_index)
+            for _ in range(len(required) * n_pairs):
+                pool.next_pair()
+                games_played += 2
+        elapsed = time.perf_counter() - start
 
     seconds_per_game = elapsed / games_played
     games_per_hour = 3600.0 / seconds_per_game
@@ -2169,6 +2897,8 @@ def bench_candidate(
         candidate_version=candidate_version,
         eval_sims=config.eval_sims,
         device=config.device,
+        workers=execution.workers,
+        torch_threads=torch_threads,
         pairs_per_cell=config.pairs_per_cell,
         bench_pairs_per_cell=n_pairs,
         cells_benched=cells_benched,

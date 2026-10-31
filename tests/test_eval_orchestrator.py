@@ -41,6 +41,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import pickle
 import sys
 import threading
 from pathlib import Path
@@ -119,7 +120,7 @@ from core.train import make_optimizer, make_scaler
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.baselines import LargestPieceAgent, start_square_balancer
 from games.blokus_duo.config import MICRO_CONFIG
-from games.registry import build_eval_profile
+from games.registry import build_eval_profile, build_eval_worker_setup
 
 M4_EVAL_CONFIG_PATH = "configs/m4_eval.json"
 
@@ -1163,7 +1164,7 @@ def test_acceptance_concurrent_run_scores_every_member_end_to_end(tmp_path):
 
     def _run_harness() -> None:
         try:
-            game, profile = run_eval._resolve_watched_game(str(run_dir))
+            game, profile, _ = run_eval._resolve_watched_game(str(run_dir))
             run_watch_loop(
                 run_dir,
                 eval_config,
@@ -1855,8 +1856,8 @@ def test_liveness_constants_golden():
         eval_protocol.LIVENESS_BREACH_CONSECUTIVE,
         eval_protocol.LIVENESS_MAX_THROUGHPUT_DEGRADATION,
         eval_protocol.LIVENESS_OBSERVATION_RULE_VERSION,
-    ) == (4, 2, 0.05, 1)
-    assert eval_run.LIVENESS_OBSERVATION_RULE["version"] == 1
+    ) == (4, 2, 0.05, 2)
+    assert eval_run.LIVENESS_OBSERVATION_RULE["version"] == 2
     assert set(eval_run.LIVENESS_OBSERVATION_RULE) == {
         "version",
         "lag",
@@ -1968,6 +1969,8 @@ def _throughput_windows(on_duration=100, *, warmup_games=5, measure_games=10):
             "eval_active": True,
             "eval_sims": 512,
             "eval_device": "cpu",
+            "eval_workers": 1,
+            "eval_torch_threads": 6,
             "eval_checkpoint": "sha256:fixed-eval",
         },
     }
@@ -2283,3 +2286,275 @@ def test_monitor_drops_a_torn_final_sample_on_restart(tmp_path):
     monitor.sample()
     lines = path.read_text().splitlines()
     assert [json.loads(line)["published_version"] for line in lines] == [1, 2]
+
+
+# --- harness execution: parallel pair workers (design doc §9 "Harness execution") --
+
+
+def _fast_worker_setup():
+    """Picklable worker rebuild of this file's micro game + fast profile."""
+    return BlokusDuo(config=MICRO_CONFIG), FAST_PROFILE
+
+
+def _failing_worker_setup():
+    raise RuntimeError("worker setup exploded")
+
+
+_TWO_WORKERS = eval_run.EvalExecution(workers=2, torch_threads=1)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"workers": 0}, {"workers": True}, {"torch_threads": 0}, {"torch_threads": 1.5}],
+)
+def test_eval_execution_rejects_invalid_settings(fields):
+    with pytest.raises(ValueError):
+        eval_run.EvalExecution(**fields)
+
+
+def test_parallel_watch_loop_stores_byte_identical_cells_to_the_serial_loop(tmp_path):
+    serial_dir, parallel_dir = tmp_path / "serial", tmp_path / "parallel"
+    for run_dir in (serial_dir, parallel_dir):
+        _build_watched_run(run_dir, k_total=2)
+
+    serial = run_watch_loop(
+        serial_dir, _eval_config(serial_dir), FAST_PROFILE, GAME, single_pass=True
+    )
+    parallel = run_watch_loop(
+        parallel_dir,
+        _eval_config(parallel_dir),
+        FAST_PROFILE,
+        GAME,
+        single_pass=True,
+        execution=_TWO_WORKERS,
+        worker_setup=_fast_worker_setup,
+    )
+
+    assert parallel.completed_members == serial.completed_members == (1, 2)
+    assert parallel.pairs_played == serial.pairs_played
+    assert _cell_bytes(parallel_dir) == _cell_bytes(serial_dir)
+    assert eval_run.read_eval_execution(parallel_dir) | {"launched_at": None} == {
+        "device": "cpu",
+        "workers": 2,
+        "torch_threads": 1,
+        "launched_at": None,
+    }
+
+
+def test_parallel_kill_mid_poll_then_relaunch_matches_an_uninterrupted_run(tmp_path, monkeypatch):
+    baseline_dir, killed_dir = tmp_path / "baseline", tmp_path / "killed"
+    for run_dir in (baseline_dir, killed_dir):
+        _build_watched_run(run_dir, k_total=1)
+    run_watch_loop(baseline_dir, _eval_config(baseline_dir), FAST_PROFILE, GAME, single_pass=True)
+
+    real_append = eval_run.append_pair_record
+    calls = {"n": 0}
+
+    def flaky_append(path, record):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise RuntimeError("simulated kill mid-poll")
+        return real_append(path, record)
+
+    monkeypatch.setattr(eval_run, "append_pair_record", flaky_append)
+    with pytest.raises(RuntimeError, match="simulated kill mid-poll"):
+        run_watch_loop(
+            killed_dir,
+            _eval_config(killed_dir),
+            FAST_PROFILE,
+            GAME,
+            single_pass=True,
+            execution=_TWO_WORKERS,
+            worker_setup=_fast_worker_setup,
+        )
+    monkeypatch.undo()
+
+    relaunch = run_watch_loop(
+        killed_dir,
+        _eval_config(killed_dir),
+        FAST_PROFILE,
+        GAME,
+        single_pass=True,
+        execution=_TWO_WORKERS,
+        worker_setup=_fast_worker_setup,
+    )
+    assert relaunch.completed_members == (1,)
+    assert _cell_bytes(killed_dir) == _cell_bytes(baseline_dir)
+
+
+def test_parallel_watch_loop_reports_members_in_ascending_order_only(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=3)
+    calls: list[int] = []
+    run_watch_loop(
+        run_dir,
+        _eval_config(run_dir),
+        FAST_PROFILE,
+        GAME,
+        single_pass=True,
+        on_member_complete=calls.append,
+        execution=_TWO_WORKERS,
+        worker_setup=_fast_worker_setup,
+    )
+    assert calls == sorted(calls) and calls[-1] == 3
+    assert len(calls) == len(set(calls))
+
+
+def test_parallel_worker_failure_stops_the_harness_loudly(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=1)
+    with pytest.raises(eval_run.EvalWorkerError, match="worker setup exploded"):
+        run_watch_loop(
+            run_dir,
+            _eval_config(run_dir),
+            FAST_PROFILE,
+            GAME,
+            single_pass=True,
+            execution=_TWO_WORKERS,
+            worker_setup=_failing_worker_setup,
+        )
+    # The writer lock was released: an ordinary relaunch scores the member.
+    result = run_watch_loop(run_dir, _eval_config(run_dir), FAST_PROFILE, GAME, single_pass=True)
+    assert result.completed_members == (1,)
+
+
+def test_parallel_execution_requires_a_worker_setup(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=1)
+    with pytest.raises(ValueError, match="worker_setup"):
+        run_watch_loop(
+            run_dir,
+            _eval_config(run_dir),
+            FAST_PROFILE,
+            GAME,
+            single_pass=True,
+            execution=_TWO_WORKERS,
+        )
+
+
+def _pair_record(index: int) -> PairRecord:
+    return PairRecord(
+        pair_index=index,
+        pair_seed=index,
+        score_a=0.5,
+        games=(GameRecordSnapshot(plies=3, opening=0), GameRecordSnapshot(plies=3, opening=1)),
+    )
+
+
+def test_cell_appender_appends_strictly_in_pair_order(tmp_path, monkeypatch):
+    appended: list[int] = []
+    monkeypatch.setattr(
+        eval_run, "append_pair_record", lambda path, record: appended.append(record.pair_index)
+    )
+    appender = eval_run._CellAppender(tmp_path, "cell", start=1, stop=5)
+
+    assert appender.add(_pair_record(3)) == 0
+    assert appender.add(_pair_record(2)) == 0
+    assert appender.add(_pair_record(1)) == 3
+    assert appended == [1, 2, 3] and not appender.complete
+    assert appender.add(_pair_record(4)) == 1
+    assert appender.complete
+    for bad in (0, 4, 5):
+        with pytest.raises(ValueError, match="unexpected pair index"):
+            appender.add(_pair_record(bad))
+
+
+def test_serial_launch_records_its_execution_and_restores_torch_threads(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=1)
+    before = torch.get_num_threads()
+    run_watch_loop(
+        run_dir,
+        _eval_config(run_dir),
+        FAST_PROFILE,
+        GAME,
+        single_pass=True,
+        execution=eval_run.EvalExecution(torch_threads=1),
+    )
+    record = eval_run.read_eval_execution(run_dir)
+    assert (record["device"], record["workers"], record["torch_threads"]) == ("cpu", 1, 1)
+    assert torch.get_num_threads() == before
+
+
+def test_bench_candidate_with_workers_plays_the_same_sample(tmp_path):
+    run_dir = tmp_path / "run"
+    _build_watched_run(run_dir, k_total=2)
+    config = _eval_config(run_dir, pairs_per_cell=3)
+    serial = bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=2)
+    parallel = bench_candidate(
+        run_dir,
+        config,
+        FAST_PROFILE,
+        GAME,
+        n_pairs=2,
+        execution=_TWO_WORKERS,
+        worker_setup=_fast_worker_setup,
+    )
+    assert (parallel.workers, parallel.torch_threads) == (2, 1)
+    assert serial.workers == 1
+    assert parallel.games_played == serial.games_played == serial.cells_benched * 2 * 2
+    assert parallel.projected_hours_per_checkpoint == pytest.approx(
+        parallel.games_per_checkpoint * parallel.seconds_per_game / 3600.0
+    )
+    assert not (run_dir / "eval").exists()
+
+
+@pytest.mark.parametrize("field, value", [("eval_workers", 0), ("eval_torch_threads", None)])
+def test_liveness_throughput_requires_the_on_arm_execution(field, value):
+    windows = _throughput_windows()
+    windows["harness_on"][field] = value
+    with pytest.raises(ValueError, match="eval_workers and eval_torch_threads"):
+        eval_run.compare_liveness_throughput(
+            windows, eval_device="cpu", throughput_counts=_UNIT_COUNTS
+        )
+
+
+def test_liveness_throughput_is_insufficient_under_a_different_launch_execution():
+    windows = _throughput_windows(120)
+    matched = eval_run.compare_liveness_throughput(
+        windows,
+        eval_device="cpu",
+        throughput_counts=_UNIT_COUNTS,
+        eval_execution={"device": "cpu", "workers": 1, "torch_threads": 6},
+    )
+    assert matched["throughput_breached"] is True
+    mismatched = eval_run.compare_liveness_throughput(
+        windows,
+        eval_device="cpu",
+        throughput_counts=_UNIT_COUNTS,
+        eval_execution={"device": "cpu", "workers": 4, "torch_threads": 3},
+    )
+    assert mismatched["throughput_breached"] is None
+    assert mismatched["throughput_degradation"] is None
+    assert mismatched["throughput_reason"].startswith("insufficient_data")
+
+
+def test_liveness_report_judges_the_ab_against_the_latest_launch_execution(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    stored = read_stored_config(tmp_path).run.throughput
+    windows = _throughput_windows(
+        120, warmup_games=stored.warmup_games, measure_games=stored.measure_games
+    )
+    report = eval_run.build_liveness_report(tmp_path, throughput_windows=windows, eval_device="cpu")
+    assert report["throughput_breached"] is True
+    eval_run.write_eval_execution(tmp_path, device="cpu", workers=4, torch_threads=3)
+    report = eval_run.build_liveness_report(tmp_path, eval_device="cpu")
+    assert report["throughput_breached"] is None
+
+
+@pytest.mark.parametrize("mode", ["--report", "--plateau", "--liveness"])
+@pytest.mark.parametrize("flag", [["--workers", "2"], ["--torch-threads", "2"]])
+def test_execution_flags_apply_to_launch_and_bench_only(mode, flag, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        run_eval.main(["unused.json", mode, *flag])
+    assert excinfo.value.code == 2
+    assert "launch/--bench only" in capsys.readouterr().err
+
+
+def test_registry_eval_worker_setup_is_picklable_and_rebuilds_game_and_profile(tmp_path):
+    _build_watched_run(tmp_path, k_total=1)
+    # Round-trips our own freshly built object -- the spawn boundary it must cross.
+    setup = pickle.loads(pickle.dumps(build_eval_worker_setup(read_stored_config(tmp_path).run)))
+    game, profile = setup()
+    assert game.policy_shape == GAME.policy_shape
+    assert profile == build_eval_profile("blokus_duo")
