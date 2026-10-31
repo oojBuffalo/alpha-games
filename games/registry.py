@@ -230,3 +230,30 @@ def build_eval_profile(game: str) -> EvalProfile:
             f"no eval profile registered for game {game!r}; games with a declared "
             f"eval profile are {list(registered_eval_profiles())}"
         ) from None
+
+
+def _eval_worker_setup(game_factory: GameFactory, game: str) -> tuple[Game, EvalProfile]:
+    """Build one eval worker's ``(game, profile)`` -- the picklable target below."""
+    return game_factory(), build_eval_profile(game)
+
+
+def build_eval_worker_setup(run_config: RunConfig) -> Callable[[], tuple[Game, EvalProfile]]:
+    """Build the picklable ``(game, profile)`` rebuild a spawned eval worker runs.
+
+    ``core.eval_run``'s parallel pair workers (design doc §9 "Harness
+    execution") start under the ``"spawn"`` context, so they cannot inherit
+    the parent's live adapter or profile; this pairs :func:`build_game_factory`
+    with the game's name for :func:`build_eval_profile`, as a
+    ``functools.partial`` around a module-level function.
+
+    Args:
+        run_config: The watched run's full protocol.
+
+    Returns:
+        A zero-argument callable returning ``(game, eval_profile)``.
+
+    Raises:
+        ValueError: If the game has no registry entry or no eval profile.
+    """
+    build_eval_profile(run_config.game)
+    return functools.partial(_eval_worker_setup, build_game_factory(run_config), run_config.game)
