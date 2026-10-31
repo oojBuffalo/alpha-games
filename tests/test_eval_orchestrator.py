@@ -175,7 +175,7 @@ def test_config_doc_agreement_with_core_eval_protocol():
     assert config.rung8_earliest_version == eval_protocol.RUNG8_EARLIEST_VERSION
     assert config.bootstrap_b == eval_protocol.BOOTSTRAP_B_PRODUCTION
     assert config.forms == (5, 6, 7)
-    assert config.device == "cpu"
+    assert config.device == "cuda"
 
 
 def test_config_eval_seed_independent_of_the_watched_run_seed():
