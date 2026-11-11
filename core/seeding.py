@@ -10,9 +10,9 @@ and they are the whole point:
     parallel actors decorrelate by label and crash-resume needs no persisted RNG state.
 
 The single-process M2.5 label set is the purpose constants below: net init, Dirichlet
-(D7), ∝N move selection (D10), MCTS tie-breaks, symmetry-augmentation ``g`` (D9), and
-replay-window sampling. Pure stdlib, no torch/NumPy: net init consumes the derived int
-directly via ``torch.manual_seed``.
+(D7), ∝N move selection (D10), MCTS tie-breaks, the playout-cap tier draw (D6),
+symmetry-augmentation ``g`` (D9), and replay-window sampling. Pure stdlib, no torch/NumPy:
+net init consumes the derived int directly via ``torch.manual_seed``.
 
 M3 (issue #53) adds the multi-actor label family and durable-coordinate keying without
 reshaping this API: :meth:`GameRNGs.for_actor_game` derives ``("actor", actor_id, "game",
@@ -46,6 +46,7 @@ PURPOSE_NET_INIT = "net-init"
 PURPOSE_DIRICHLET = "dirichlet"
 PURPOSE_MOVE_SELECTION = "move-selection"
 PURPOSE_TIE_BREAK = "tie-break"
+PURPOSE_PCR_TIER = "pcr-tier"
 PURPOSE_AUGMENTATION = "augmentation"
 PURPOSE_WINDOW_SAMPLING = "replay-sampling"
 
@@ -160,11 +161,15 @@ class GameRNGs:
         move_selection: D10 ∝N sampling stream.
         tie_break: MCTS tie-break stream (kept apart from move selection so a tie-break
             draw never shifts the played-move sequence).
+        pcr_tier: D6 playout-cap tier-draw stream (§12 M5) -- one draw per ply past the
+            always-full plies, and none at all with playout-cap randomization off, so
+            the draw can never shift the Dirichlet or move-selection sequences.
     """
 
     dirichlet: random.Random
     move_selection: random.Random
     tie_break: random.Random
+    pcr_tier: random.Random
 
     @classmethod
     def for_game(
@@ -193,6 +198,7 @@ class GameRNGs:
             dirichlet=component_rng(run_seed, *labels, PURPOSE_DIRICHLET),
             move_selection=component_rng(run_seed, *labels, PURPOSE_MOVE_SELECTION),
             tie_break=component_rng(run_seed, *labels, PURPOSE_TIE_BREAK),
+            pcr_tier=component_rng(run_seed, *labels, PURPOSE_PCR_TIER),
         )
 
     @classmethod
