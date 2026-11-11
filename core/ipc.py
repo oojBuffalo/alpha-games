@@ -103,14 +103,17 @@ from pathlib import Path
 from typing import Any
 
 from core.actor import ActorDriver, PacingFn, RefreshFn, RefreshResult, WaitFn
+from core.amp import AmpMode, amp_evaluator
 from core.checkpoint import load_checkpoint, published_checkpoint_path, read_latest_pointer
 from core.game import Game
 from core.learner import PACING_HOLD, LearnerDriver, pacing_file_path, read_pacing_file
 from core.metrics import EpochMetricsWriter
 from core.network import Network, NetworkConfig, make_network_evaluator
 from core.observability import (
+    SERIES_ACTOR_AMP_ACTIVE,
     PositionCounter,
     count_positions,
+    gauge_record,
     segment_end_record,
     segment_start_record,
 )
@@ -206,6 +209,7 @@ def build_actor_refresh(
     poll_interval: float = 1.0,
     wait: WaitFn | None = None,
     position_counter: PositionCounter | None = None,
+    metrics_writer: EpochMetricsWriter | None = None,
 ) -> RefreshFn:
     """Build the real ``refresh`` seam: the learner's ``latest`` pointer, live.
 
@@ -227,6 +231,12 @@ def build_actor_refresh(
     naming the same ``latest`` (the common case -- most games are played
     between publishes, not across one) neither touch the disk again nor
     rebuild a ``Network``.
+
+    **Actor-side AMP.** Every built evaluator runs under the run's inference
+    autocast policy (``core.amp.AmpMode.resolve(device)``: live on CUDA, an
+    exact no-op elsewhere -- the train step's own rule, derived from the
+    device, never a config field). ``core.amp.amp_evaluator`` is the outermost
+    wrapper, so the counter and the forward both run inside the context.
 
     Args:
         game: The adapter every loaded checkpoint's fingerprint is validated
@@ -250,11 +260,14 @@ def build_actor_refresh(
             evaluator is wrapped with ``core.observability.count_positions``
             before caching, so every leaf-inference call this actor makes
             through it adds ``1`` position to the counter (M3's batch-1
-            bridge). ``None`` (the default) returns
-            ``core.network.make_network_evaluator``'s evaluator unwrapped --
-            byte-identical to every call site that predates this parameter.
-            Wrapped once per newly-built version, never re-wrapped on a
-            cache hit.
+            bridge). ``None`` (the default) counts nothing. Wrapped once per
+            newly-built version, never re-wrapped on a cache hit.
+        metrics_writer: Optional. When given, the *observed* autocast state
+            -- read from inside the context at this closure's first leaf
+            evaluation, not inferred from ``device`` -- is appended to it as
+            one ``core.observability.SERIES_ACTOR_AMP_ACTIVE`` gauge record:
+            once per closure (so once per actor epoch), however many
+            checkpoint versions are loaded afterwards.
 
     Returns:
         A zero-argument ``RefreshFn`` returning ``(evaluator, model_version)``
@@ -264,6 +277,19 @@ def build_actor_refresh(
     net_config = network_config if network_config is not None else NetworkConfig.from_game(game)
     wait_fn = wait if wait is not None else lambda: _default_wait(poll_interval)
     cache: dict[str, Any] = {"version": None, "evaluator": None}
+    amp = AmpMode.resolve(device)
+    amp_recorded = False
+
+    def record_amp(live: bool) -> None:
+        """Persist the observed autocast state, the first time only.
+
+        Args:
+            live: Whether autocast was live inside the evaluation context.
+        """
+        nonlocal amp_recorded
+        if metrics_writer is not None and not amp_recorded:
+            metrics_writer.append(gauge_record(SERIES_ACTOR_AMP_ACTIVE, float(live)))
+        amp_recorded = True
 
     def refresh() -> RefreshResult:
         version = read_latest_pointer(directory)
@@ -277,7 +303,7 @@ def build_actor_refresh(
             evaluator = make_network_evaluator(net, game, device=device)
             if position_counter is not None:
                 evaluator = count_positions(evaluator, position_counter)
-            cache["evaluator"] = evaluator
+            cache["evaluator"] = amp_evaluator(evaluator, amp, observe=record_amp)
             cache["version"] = version
         return cache["evaluator"], cache["version"]
 
@@ -346,9 +372,9 @@ def run_actor_process(
     stay optional/``None``-default so a driver built directly (most of
     ``tests/test_actor.py``) is unaffected. This process entrypoint opens this
     actor's ``run_dir/metrics/actor-<actor_id>-<epoch>.jsonl`` writer, a fresh
-    :class:`~core.observability.PositionCounter`, and wires the counter into
+    :class:`~core.observability.PositionCounter`, and wires both into
     :func:`build_actor_refresh` so every leaf-inference call this actor makes
-    is counted.
+    is counted and the autocast state its forwards ran under is recorded.
 
     Args:
         game_factory: Builds this process's adapter instance.
@@ -362,7 +388,8 @@ def run_actor_process(
         ckpt_dir: The learner's checkpoint directory (read-only from here).
         run_dir: The run's root directory (the pacing file lives here).
         run_seed: The run's recorded root seed.
-        device: Torch device for leaf inference.
+        device: Torch device for leaf inference; also decides inference
+            autocast (:func:`build_actor_refresh`).
         network_config: Network architecture for loaded checkpoints -- must
             match the learner's (see :func:`build_actor_refresh`).
         refresh_poll_interval: Seconds between retries while no checkpoint
@@ -383,6 +410,7 @@ def run_actor_process(
         network_config=network_config,
         poll_interval=refresh_poll_interval,
         position_counter=position_counter,
+        metrics_writer=metrics_writer,
     )
     pacing = build_actor_pacing(run_dir)
     driver = ActorDriver(

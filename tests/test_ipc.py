@@ -29,8 +29,10 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from core.actor import ActorDriver
+from core.amp import AmpMode
 from core.artifact_fingerprint import FingerprintMismatchError
 from core.checkpoint import (
     list_published_versions,
@@ -52,7 +54,9 @@ from core.learner import (
     pacing_file_path,
     write_pacing_file,
 )
+from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
+from core.observability import SERIES_ACTOR_AMP_ACTIVE, reduce_run
 from core.replay_shard import SampleRecord, read_shard, shard_filename, write_shard
 from core.replay_window import ReplayWindow
 from core.runconfig import TrainingConfig, load_run_config
@@ -252,6 +256,85 @@ def test_refresh_raises_loudly_on_fingerprint_mismatch(tmp_path):
     mismatched = build_actor_refresh(game=OTHELLO, ckpt_dir=ckpt_dir)
     with pytest.raises(FingerprintMismatchError):
         mismatched()
+
+
+def _amp_records(run_dir, proc="actor-0"):
+    """Every persisted ``actor_amp_active`` value for one actor, in append order."""
+    return [
+        rec["value"]
+        for rec in iter_epoch_records(run_dir, proc)
+        if rec.get("series") == SERIES_ACTOR_AMP_ACTIVE
+    ]
+
+
+def test_refresh_persists_the_observed_amp_state_once_per_actor_epoch(tmp_path):
+    """On CPU autocast is an exact no-op, and the durable record says so."""
+    shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
+    _write_ttt_shard(shard_dir, "run", "a", 0, 10)
+    training = _ttt_training_config(
+        publish_interval=1, checkpoint_count=3, replay_warmup_positions=1
+    )
+    learner = _make_learner(shard_dir, ckpt_dir, run_dir, training=training)  # publishes v0
+    refresh = build_actor_refresh(
+        game=TTT,
+        ckpt_dir=ckpt_dir,
+        network_config=TTT_NET_CONFIG,
+        metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
+    )
+    state = TTT.initial_state()
+
+    eval0, _ = refresh()
+    assert _amp_records(run_dir) == []  # building an evaluator observes nothing
+    eval0(TTT, state)
+    eval0(TTT, state)
+    assert _amp_records(run_dir) == [0.0]
+
+    learner._run_step()  # publishes v1 -> a freshly built evaluator
+    eval1, version = refresh()
+    assert version == 1 and eval1 is not eval0
+    eval1(TTT, state)
+    assert _amp_records(run_dir) == [0.0]  # one record per actor epoch, not per version
+    assert reduce_run(run_dir).gauges[SERIES_ACTOR_AMP_ACTIVE] == 0.0
+
+
+def test_refresh_amp_record_is_the_observed_state_not_the_device(tmp_path, monkeypatch):
+    """The record reads torch's live state from inside the context.
+
+    CPU autocast is real (bfloat16), so forcing the mode on while the device
+    stays ``"cpu"`` separates the two: a record re-derived from the device
+    would read ``0.0`` here.
+    """
+    shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
+    _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
+    forced = AmpMode(device_type="cpu", enabled=True)
+    monkeypatch.setattr(AmpMode, "resolve", classmethod(lambda cls, device: forced))
+    refresh = build_actor_refresh(
+        game=TTT,
+        ckpt_dir=ckpt_dir,
+        device="cpu",
+        network_config=TTT_NET_CONFIG,
+        metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
+    )
+    evaluator, _ = refresh()
+    evaluator(TTT, TTT.initial_state())
+    assert _amp_records(run_dir) == [1.0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_refresh_on_cuda_persists_a_live_amp_record(tmp_path):
+    shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
+    _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
+    refresh = build_actor_refresh(
+        game=TTT,
+        ckpt_dir=ckpt_dir,
+        device="cuda",
+        network_config=TTT_NET_CONFIG,
+        metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
+    )
+    evaluator, _ = refresh()
+    evaluator(TTT, TTT.initial_state())
+    assert _amp_records(run_dir) == [1.0]
+    assert reduce_run(run_dir).gauges[SERIES_ACTOR_AMP_ACTIVE] == 1.0
 
 
 # ==============================================================================

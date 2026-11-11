@@ -76,7 +76,7 @@ test battery exercises the arithmetic and the gates, never the spike).
 on/off among the recorded evidence, so both timed paths — the batch-1 forwards
 behind ``r`` (both nets identically, or the ratio is not apples-to-apples) and
 every self-play leaf evaluation — run inside the run's single
-``run_micro.AmpMode`` context, inference-only (``torch.inference_mode`` +
+``core.amp.AmpMode`` context, inference-only (``torch.inference_mode`` +
 autocast, no ``GradScaler``). The reported flag is then read back out of
 :attr:`ForwardRatio.amp` and :attr:`SpikeResult.amp`, both *observed* from
 inside those contexts, and the two must agree — nothing recomputes
@@ -122,12 +122,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# ``run_micro`` (sibling script, on sys.path above): the spike times *the*
-# learner step and *the* AMP policy, not copies of them — any drift between a
-# re-implementation here and the real loop would silently change the measured
-# number, which is the one thing this script exists to get right.
-from run_micro import AmpMode, _learner_step, amp_evaluator, build_game, game_identity  # noqa: E402
+# ``run_micro`` (sibling script, on sys.path above) and ``core.amp``: the spike
+# times *the* learner step and *the* AMP policy, not copies of them — any drift
+# between a re-implementation here and the real loop would silently change the
+# measured number, which is the one thing this script exists to get right.
+from run_micro import _learner_step, build_game, game_identity  # noqa: E402
 
+from core.amp import AmpMode, amp_evaluator  # noqa: E402
 from core.game import Game, State  # noqa: E402
 from core.mcts import Evaluator  # noqa: E402
 from core.network import Network, NetworkConfig, make_network_evaluator  # noqa: E402
@@ -479,7 +480,7 @@ def counting_evaluator(evaluator: Evaluator, amp: AmpMode) -> tuple[Evaluator, l
 
     The third counter is the AMP measurement: it asks torch, per evaluation,
     whether autocast is live *at that moment*. For it to see anything, this
-    wrapper must sit **inside** ``run_micro.amp_evaluator``'s context — which
+    wrapper must sit **inside** ``core.amp.amp_evaluator``'s context — which
     is exactly how :func:`run_spike` composes them, and why the report's AMP
     flag describes the forwards that ran rather than the device they ran on.
 
@@ -1276,7 +1277,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Run the spike, project, and emit the report and the mechanical verdict.
 
-    AMP is resolved once (:class:`~run_micro.AmpMode`) and that one value opens
+    AMP is resolved once (:class:`~core.amp.AmpMode`) and that one value opens
     every autocast context; the header's AMP flag comes back out of the two
     measurements via :func:`observed_amp`, never from the device. An official
     run always persists its report (:func:`resolve_out_path`).

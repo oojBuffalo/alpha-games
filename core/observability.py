@@ -22,8 +22,12 @@ name and aggregation rule below is frozen, not an implementation detail.
   memory. :data:`SERIES_GAMES_COMPLETED`, :data:`SERIES_POSITIONS_EVALUATED`,
   and :data:`SERIES_SIMS_RUN` are the pinned delta series (actor-owned).
 * ``"gauge"`` -- a latest-value observation, never summed: loss components,
-  the D5 replay ratio. Only the most recent record in run time order matters
-  (learner-owned).
+  the D5 replay ratio (learner-owned). Only the most recent record in run
+  time order matters. :data:`SERIES_ACTOR_AMP_ACTIVE` is the one actor-owned
+  gauge: ``1.0`` iff inference autocast was *observed* live inside the context
+  an actor's leaf evaluations run under, ``0.0`` otherwise -- written once per
+  actor epoch, at that actor's first evaluation (``core.ipc``), so every
+  actor's own metrics file states what its forwards ran under.
 * ``"total"`` -- a coordinator-owned exact cumulative that must never be
   summed across records (summing an already-cumulative value overcounts).
   :data:`SERIES_LEARNER_STEP` is the pinned total series: exactly one writer
@@ -78,6 +82,9 @@ SERIES_GAMES_COMPLETED = "games_completed"
 SERIES_POSITIONS_EVALUATED = "positions_evaluated"
 SERIES_SIMS_RUN = "sims_run"
 SERIES_LEARNER_STEP = "learner_step"
+
+# Actor-owned gauge (module docstring): the observed inference-autocast state.
+SERIES_ACTOR_AMP_ACTIVE = "actor_amp_active"
 
 RATE_GAMES_PER_HOUR = "games_per_hour"
 RATE_SIMS_PER_SEC = "sims_per_sec"
