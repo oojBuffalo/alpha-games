@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core import learner as learner_module
 from core.actor import VALIDATE_TIER_SIMS, ActorDriver
 from core.checkpoint import list_published_versions
 from core.ipc import build_actor_pacing, build_actor_refresh
@@ -42,6 +43,15 @@ from core.observability import (
     KIND_SPIKE_STOP,
     KIND_TOTAL,
     SERIES_INFERENCE_BATCHES,
+    SERIES_LEARNER_STEP,
+    SERIES_REPLAY_RATIO,
+    WINDOW_BOUND_BY_REPLAY_WARMUP,
+    WINDOW_BOUND_BY_WARMUP_GAMES,
+    WINDOW_FEWER_THAN_TWO_RECORDS,
+    WINDOW_NO_RECORD,
+    WINDOW_REPLAY_WARMUP_NOT_REACHED,
+    WINDOW_TOO_FEW_GAMES,
+    WINDOW_ZERO_SPAN,
     InferenceBatchCounter,
     PositionCounter,
     ReducedRun,
@@ -52,6 +62,7 @@ from core.observability import (
     inference_batch_size_series,
     is_real_cuda,
     reduce_run,
+    reduce_window,
     segment_end_record,
     segment_start_record,
     shutdown_forced_record,
@@ -716,3 +727,277 @@ def test_live_path_smoke_a_real_single_process_run_reduces_to_sane_numbers(tmp_p
         assert learner_step >= 0
         assert positions_evaluated >= 0
         assert gpu_hours >= 0
+
+
+# ==============================================================================
+# 5. The windowed reducer, scripted (§12 M5)
+# ==============================================================================
+#
+# Every rate below is fixture arithmetic over hand-written timestamps. Nothing
+# here measures throughput.
+
+
+def _flush_game(writer, timestamp, *, stored=5, played=None, sims=100, evals=None, extra=()):
+    """Append one finished game's flush: the actor's own series, on one timestamp.
+
+    Args:
+        writer: The actor's epoch writer.
+        timestamp: The flush's single timestamp (the game's completion time).
+        stored: The game's ``positions_stored`` delta.
+        played: The game's ``positions_played`` delta. Defaults to ``stored``.
+        sims: The game's ``sims_run`` delta.
+        evals: The game's ``positions_evaluated`` delta, or ``None`` to omit
+            the series (an actor with no position counter).
+        extra: Further ``(series, value)`` deltas of the same flush.
+    """
+    played = stored if played is None else played
+    deltas = [
+        ("games_completed", 1),
+        ("sims_run", sims),
+        ("positions_played", played),
+        ("positions_stored", stored),
+        *extra,
+    ]
+    if evals is not None:
+        deltas.append(("positions_evaluated", evals))
+    for series, value in deltas:
+        writer.append(delta_record(series, value, timestamp=timestamp))
+
+
+def _seven_games(tmp_path, **flush_kwargs):
+    """Seven games, 5 stored positions each, completing at t = 10, 20, ..., 70.
+
+    Two actors alternate, so run-wide game ``k`` (1-based) completes at
+    ``10 * k`` and cumulative stored positions after it are ``5 * k``.
+    """
+    actors = [EpochMetricsWriter(tmp_path, "actor-0"), EpochMetricsWriter(tmp_path, "actor-1")]
+    for k in range(1, 8):
+        _flush_game(actors[k % 2], 10.0 * k, **flush_kwargs)
+    return actors
+
+
+def _measurements(result):
+    """Every field of a windowed result except its two verdict fields."""
+    values = dataclasses.asdict(result)
+    del values["reason"], values["unavailable"]
+    return values
+
+
+def _assert_insufficient(result, reason):
+    """Assert a window-level verdict: a named reason, and no number anywhere."""
+    assert result.reason == reason
+    measurements = _measurements(result)
+    assert all(value is None for value in measurements.values()), measurements
+    assert result.unavailable == dict.fromkeys(measurements, reason)
+
+
+def test_window_excludes_a_fast_warm_up_the_whole_run_average_includes(tmp_path):
+    """The whole-run rate clears a floor that the warm-up-excluded window does not."""
+    actors = [EpochMetricsWriter(tmp_path, "actor-0"), EpochMetricsWriter(tmp_path, "actor-1")]
+    for k in range(1, 11):  # ten warm-up games, one a second
+        _flush_game(actors[k % 2], float(k), sims=1000, evals=900)
+    for k in range(1, 5):  # four measured games, one every hundred seconds
+        _flush_game(actors[k % 2], 10.0 + 100.0 * k, sims=400, evals=300)
+    floor = 100.0
+
+    whole_run = reduce_run(tmp_path).rates["games_per_hour"]
+    window = reduce_window(tmp_path, warmup_games=10, measure_games=4, replay_warmup_positions=20)
+
+    assert whole_run == pytest.approx(14 * 3600 / 409)  # first record to last: ~123
+    assert whole_run >= floor
+    assert window.reason is None
+    assert window.games_per_hour == pytest.approx(3600 * 4 / 400)  # 36
+    assert window.games_per_hour < floor
+    assert (window.window_start, window.window_end) == (10.0, 410.0)
+    assert (window.start_game_ordinal, window.end_game_ordinal) == (10, 14)
+    assert window.games_in_window == 4
+    assert window.binding_condition == WINDOW_BOUND_BY_WARMUP_GAMES
+    # Summed over the four measured games only: none of the warm-up's deltas.
+    assert window.stored_positions_per_hour == pytest.approx(4 * 5 * 3600 / 400)
+    assert window.sims_per_sec == pytest.approx(4 * 400 / 400)
+    assert window.net_evals_per_sec == pytest.approx(4 * 300 / 400)
+
+
+def test_window_starts_at_the_stored_positions_condition_when_it_is_the_later(tmp_path):
+    _seven_games(tmp_path)
+    # Game 2 meets the game count at t=20; stored positions reach 18 at game 4, t=40.
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.reason is None
+    assert window.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
+    assert (window.window_start, window.window_end) == (40.0, 60.0)
+    assert (window.start_game_ordinal, window.end_game_ordinal) == (4, 6)
+    assert window.games_per_hour == pytest.approx(3600 * 2 / 20)
+
+
+def test_window_starts_at_the_game_count_condition_when_it_is_the_later(tmp_path):
+    _seven_games(tmp_path)
+    # Stored positions reach 8 at game 2, t=20; game 3 meets the game count at t=30.
+    window = reduce_window(tmp_path, warmup_games=3, measure_games=2, replay_warmup_positions=8)
+
+    assert window.reason is None
+    assert window.binding_condition == WINDOW_BOUND_BY_WARMUP_GAMES
+    assert (window.window_start, window.window_end) == (30.0, 50.0)
+    assert (window.start_game_ordinal, window.end_game_ordinal) == (3, 5)
+
+
+def test_window_start_met_by_both_conditions_at_one_game_names_the_stored_positions(tmp_path):
+    _seven_games(tmp_path)
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=1, replay_warmup_positions=10)
+    assert window.window_start == 20.0
+    assert window.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
+
+
+def test_window_with_no_warm_up_games_still_waits_for_the_stored_positions(tmp_path):
+    _seven_games(tmp_path)
+    window = reduce_window(tmp_path, warmup_games=0, measure_games=3, replay_warmup_positions=11)
+    assert window.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
+    assert (window.start_game_ordinal, window.end_game_ordinal) == (3, 6)
+
+
+@pytest.mark.parametrize(
+    "kwargs,reason",
+    [
+        # Seven games: the warm-up alone needs eight.
+        (dict(warmup_games=8, measure_games=1, replay_warmup_positions=1), "too_few_games"),
+        # The window opens at game 3 and needs five more; four remain.
+        (dict(warmup_games=3, measure_games=5, replay_warmup_positions=1), "too_few_games"),
+        # Thirty-five positions are stored in all.
+        (dict(warmup_games=1, measure_games=1, replay_warmup_positions=36), "replay_warmup"),
+    ],
+    ids=["warm_up_never_ends", "measurement_never_ends", "stored_positions_never_reached"],
+)
+def test_window_that_never_completes_is_insufficient_data_with_a_named_reason(
+    tmp_path, kwargs, reason
+):
+    _seven_games(tmp_path)
+    expected = {
+        "too_few_games": WINDOW_TOO_FEW_GAMES,
+        "replay_warmup": WINDOW_REPLAY_WARMUP_NOT_REACHED,
+    }[reason]
+    _assert_insufficient(reduce_window(tmp_path, **kwargs), expected)
+
+
+def test_window_over_an_empty_run_dir_is_insufficient_data(tmp_path):
+    result = reduce_window(tmp_path, warmup_games=1, measure_games=1, replay_warmup_positions=1)
+    _assert_insufficient(result, WINDOW_TOO_FEW_GAMES)
+
+
+def test_window_spanning_zero_time_is_insufficient_data_never_a_rate(tmp_path):
+    _flush_game(EpochMetricsWriter(tmp_path, "actor-0"), 10.0)
+    _flush_game(EpochMetricsWriter(tmp_path, "actor-1"), 10.0)  # the same instant
+    result = reduce_window(tmp_path, warmup_games=1, measure_games=1, replay_warmup_positions=1)
+    _assert_insufficient(result, WINDOW_ZERO_SPAN)
+
+
+def test_window_counts_a_game_by_its_run_wide_ordinal_not_its_timestamp_alone(tmp_path):
+    """A game sharing the start's timestamp but ordered after it is inside the window."""
+    a0, a1 = EpochMetricsWriter(tmp_path, "actor-0"), EpochMetricsWriter(tmp_path, "actor-1")
+    _flush_game(a0, 10.0, sims=1)
+    _flush_game(a0, 20.0, sims=10)  # run-wide game 2: the start
+    _flush_game(a1, 20.0, sims=100)  # game 3, same timestamp, ordered after (proc name)
+    _flush_game(a0, 30.0, sims=1000)  # game 4: the end
+
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=1)
+
+    assert (window.window_start, window.window_end) == (20.0, 30.0)
+    assert (window.start_game_ordinal, window.end_game_ordinal) == (2, 4)
+    # Games 3 and 4 only: the start game's own sims belong to the warm-up.
+    assert window.sims_per_sec == pytest.approx((100 + 1000) / 10)
+
+
+def _write_learner_steps(tmp_path, steps):
+    """Append the learner's per-step ``learner_step`` total and ``replay_ratio`` gauge.
+
+    Args:
+        tmp_path: The run directory.
+        steps: ``(timestamp, learner_step, replay_ratio)`` triples.
+    """
+    learner = EpochMetricsWriter(tmp_path, "learner")
+    for timestamp, step, ratio in steps:
+        learner.append(total_record("learner_step", step, timestamp=timestamp))
+        learner.append(gauge_record(SERIES_REPLAY_RATIO, ratio, timestamp=timestamp))
+
+
+def test_window_learner_fields_are_endpoint_readings_of_the_learner_series(tmp_path):
+    _seven_games(tmp_path)
+    _write_learner_steps(tmp_path, [(5.0, 3, 1.0), (35.0, 7, 5.5), (55.0, 9, 4.2), (65.0, 12, 3.9)])
+    # The window is [40, 60]: step 7 is the reading at its start, step 9 at its end.
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.learner_steps_in_window == 2
+    assert window.learner_steps_per_sec == pytest.approx(2 / 20)
+    assert window.replay_ratio_at_window_end == 4.2  # the last gauge at or before t=60
+
+
+def test_window_with_a_parked_learner_reports_zero_steps_as_a_measurement(tmp_path):
+    """No step record inside the window is an exact zero, not missing data."""
+    _seven_games(tmp_path)
+    _write_learner_steps(tmp_path, [(35.0, 7, 5.5), (65.0, 8, 3.9)])
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.learner_steps_in_window == 0
+    assert window.learner_steps_per_sec == 0.0
+    assert window.replay_ratio_at_window_end == 5.5  # above the ceiling: no paced step
+    assert "learner_steps_per_sec" not in window.unavailable
+
+
+def test_window_without_a_learner_reading_at_its_start_states_so_never_a_zero(tmp_path):
+    _seven_games(tmp_path)
+    learner = EpochMetricsWriter(tmp_path, "learner")
+    learner.append(total_record("learner_step", 1, timestamp=45.0))  # first step: mid-window
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.reason is None  # the window itself is sound
+    assert window.games_per_hour == pytest.approx(3600 * 2 / 20)
+    assert window.learner_steps_in_window is None
+    assert window.learner_steps_per_sec is None
+    assert window.replay_ratio_at_window_end is None
+    assert window.unavailable["learner_steps_in_window"] == WINDOW_FEWER_THAN_TWO_RECORDS
+    assert window.unavailable["learner_steps_per_sec"] == WINDOW_FEWER_THAN_TWO_RECORDS
+    assert window.unavailable["replay_ratio_at_window_end"] == WINDOW_NO_RECORD
+
+
+def test_window_field_is_none_exactly_when_it_is_named_unavailable(tmp_path):
+    _seven_games(tmp_path)  # no positions_evaluated series, no learner
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.net_evals_per_sec is None
+    assert window.unavailable["net_evals_per_sec"] == WINDOW_NO_RECORD
+    missing = {name for name, value in _measurements(window).items() if value is None}
+    assert missing == set(window.unavailable)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(warmup_games=-1, measure_games=1, replay_warmup_positions=1),
+        dict(warmup_games=1, measure_games=0, replay_warmup_positions=1),
+        dict(warmup_games=1, measure_games=1, replay_warmup_positions=-1),
+    ],
+    ids=["negative_warmup", "zero_measure", "negative_replay_warmup"],
+)
+def test_window_rejects_an_impossible_protocol(tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        reduce_window(tmp_path, **kwargs)
+
+
+def test_window_reads_the_same_series_names_the_learner_writes():
+    assert SERIES_REPLAY_RATIO == learner_module.SERIES_REPLAY_RATIO
+    assert SERIES_LEARNER_STEP == learner_module.SERIES_LEARNER_STEP
+
+
+def test_reduce_run_is_unchanged_by_the_windowed_reducer(tmp_path):
+    _seven_games(tmp_path, evals=7)
+    _write_learner_steps(tmp_path, [(5.0, 3, 1.0), (65.0, 12, 3.9)])  # every rate finite
+    before = reduce_run(tmp_path)
+    reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+    assert reduce_run(tmp_path) == before
+    assert before.rates["games_per_hour"] == pytest.approx(7 * 3600 / 60)  # first to last
+    assert [f.name for f in dataclasses.fields(ReducedRun)] == [
+        "totals",
+        "rates",
+        "gauges",
+        "gpu_hours",
+        "checkpoints",
+    ]

@@ -3,9 +3,11 @@
 ``core.metrics`` owns *storage*: one append-only epoch-stamped JSONL file per
 process, never shared, never rewound across a restart. This module owns
 *meaning* -- what a record's ``kind`` field says about how it may be
-aggregated, the one function (:func:`reduce_run`) allowed to aggregate them,
-and the counting primitive that turns network inference into the
-positions-evaluated series. Design doc §1 (the primary criterion's plot
+aggregated, the one function (:func:`reduce_run`) allowed to aggregate them
+over a whole run and its sibling (:func:`reduce_window`, §12 M5) that
+aggregates one warm-up-excluded window of the same records, and the counting
+primitive that turns network inference into the positions-evaluated series.
+Design doc §1 (the primary criterion's plot
 x-axes: cumulative network evaluations and GPU-hours) and §12 M3's
 observability bullet are the source of this contract; M4's eval harness
 (issue #72) consumes :func:`reduce_run`'s return value as-is, so every field
@@ -102,7 +104,7 @@ from __future__ import annotations
 import functools
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +133,11 @@ SERIES_GAMES_COMPLETED = "games_completed"
 SERIES_POSITIONS_EVALUATED = "positions_evaluated"
 SERIES_SIMS_RUN = "sims_run"
 SERIES_LEARNER_STEP = "learner_step"
+
+# The learner's per-step D5 replay-ratio gauge. ``core.learner`` owns and
+# writes it; the name is repeated here, as ``learner_step``'s is, because
+# that module imports this one.
+SERIES_REPLAY_RATIO = "replay_ratio"
 
 # Actor-owned gauge (module docstring): the observed inference-autocast state.
 SERIES_ACTOR_AMP_ACTIVE = "actor_amp_active"
@@ -757,3 +764,340 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
         gpu_hours=gpu_seconds / _SECONDS_PER_HOUR,
         checkpoints=checkpoints,
     )
+
+
+# --- the windowed reducer (§12 M5) ---------------------------------------------
+
+# Which start condition bound a window (``WindowedRun.binding_condition``).
+WINDOW_BOUND_BY_WARMUP_GAMES = "warmup_games"
+WINDOW_BOUND_BY_REPLAY_WARMUP = "replay_warmup_positions"
+
+# Insufficient-data reasons. The first three are window-level
+# (``WindowedRun.reason``): no window exists, so no field holds a number.
+WINDOW_TOO_FEW_GAMES = "too_few_games_for_window"
+WINDOW_REPLAY_WARMUP_NOT_REACHED = "replay_warmup_positions_not_reached"
+WINDOW_ZERO_SPAN = "zero_span_window"
+# The rest are per-field (``WindowedRun.unavailable``), inside a sound window.
+WINDOW_FEWER_THAN_TWO_RECORDS = "fewer_than_two_records"
+WINDOW_NO_RECORD = "no_record"
+
+
+@dataclass(frozen=True)
+class WindowedRun:
+    """The return shape of :func:`reduce_window`: one warm-up-excluded window (§12 M5).
+
+    Every field but the two verdict fields is a measurement, and each is
+    ``None`` exactly when :attr:`unavailable` names it -- never ``0.0``, never
+    ``nan``, so arithmetic on a missing value fails loudly instead of
+    comparing quietly.
+
+    Attributes:
+        reason: The window-level verdict. ``None`` when the window exists.
+            Otherwise the named reason no window could be formed --
+            :data:`WINDOW_TOO_FEW_GAMES` (the warm-up game count was never
+            reached, or fewer than ``measure_games`` games completed after
+            the start), :data:`WINDOW_REPLAY_WARMUP_NOT_REACHED` (cumulative
+            stored positions never reached the threshold) or
+            :data:`WINDOW_ZERO_SPAN` (the start and the end carry one
+            timestamp) -- and every measurement is ``None``.
+        unavailable: ``{field name: reason}`` for every measurement that is
+            ``None``. Under a window-level verdict, every measurement mapped
+            to :attr:`reason`. Inside a sound window, the per-field reasons:
+            :data:`WINDOW_NO_RECORD` (the field's source series has no
+            usable record: none in the window for a summed series, none at
+            or before the window end for a latest-value one) and
+            :data:`WINDOW_FEWER_THAN_TWO_RECORDS` (the ``learner_step``
+            series has no record at or before the window start, so the two
+            endpoint readings its difference needs do not exist).
+        window_start: Timestamp of the start flush (:func:`reduce_window`).
+        window_end: Timestamp of the end flush.
+        start_game_ordinal: Run-wide cumulative ``games_completed`` through
+            the start flush. Games up to and including it are warm-up.
+        end_game_ordinal: Run-wide cumulative ``games_completed`` through the
+            end flush, the last game of the window.
+        binding_condition: Which start condition was met later --
+            :data:`WINDOW_BOUND_BY_WARMUP_GAMES` or
+            :data:`WINDOW_BOUND_BY_REPLAY_WARMUP`; the second when one flush
+            meets both.
+        games_in_window: ``end_game_ordinal - start_game_ordinal``:
+            ``measure_games``, every actor writing one game per flush.
+        games_per_hour: ``3600 * games_in_window / (window_end -
+            window_start)`` -- the pinned rate form. Exact: both boundaries
+            are game completions.
+        stored_positions_per_hour: The window's summed ``positions_stored``
+            deltas, per hour of the window span.
+        sims_per_sec: The window's summed ``sims_run`` deltas, per second.
+        net_evals_per_sec: The window's summed ``positions_evaluated``
+            deltas, per second.
+        learner_steps_in_window: The ``learner_step`` total series' endpoint
+            difference: its last value at or before ``window_end`` minus its
+            last value at or before ``window_start``. Never a sum of the
+            series' values, which are each already cumulative. The two
+            readings may be one record: no step completed in the window, an
+            exact ``0`` (the learner writes one record per step).
+        learner_steps_per_sec: ``learner_steps_in_window`` per second of the
+            window span.
+        replay_ratio_at_window_end: The learner's last ``replay_ratio``
+            gauge at or before ``window_end``. Recorded beside the rate, not
+            judged here: above the D5 ceiling it means the learner took no
+            paced step by the window's end.
+    """
+
+    reason: str | None
+    unavailable: dict[str, str]
+    window_start: float | None = None
+    window_end: float | None = None
+    start_game_ordinal: int | None = None
+    end_game_ordinal: int | None = None
+    binding_condition: str | None = None
+    games_in_window: int | None = None
+    games_per_hour: float | None = None
+    stored_positions_per_hour: float | None = None
+    sims_per_sec: float | None = None
+    net_evals_per_sec: float | None = None
+    learner_steps_in_window: int | None = None
+    learner_steps_per_sec: float | None = None
+    replay_ratio_at_window_end: float | None = None
+
+
+def _game_flushes(
+    ordered: list[tuple[float, str, int, dict[str, Any]]],
+) -> list[tuple[float, dict[str, Any]]]:
+    """Group the actors' delta records into per-game flushes, in run time order.
+
+    An actor flushes every series of a finished game on one timestamp,
+    ``games_completed`` first (``core.actor``). A flush is therefore a
+    ``games_completed`` delta plus the delta records that follow it from the
+    same process on the same timestamp -- contiguous in the pinned order
+    (:func:`_ordered_records`). A delta record outside any such group belongs
+    to no game and is not counted.
+
+    Args:
+        ordered: Every record, in the pinned total order.
+
+    Returns:
+        ``(timestamp, {series: summed delta})`` per flush, in that order.
+    """
+    flushes: list[tuple[float, dict[str, Any]]] = []
+    owner: tuple[str, float] | None = None
+    for ts, proc, _seq, rec in ordered:
+        if rec.get("kind") != KIND_DELTA:
+            continue
+        series = rec["series"]
+        if series == SERIES_GAMES_COMPLETED:
+            flushes.append((ts, {}))
+            owner = (proc, ts)
+        elif owner != (proc, ts):
+            continue
+        deltas = flushes[-1][1]
+        deltas[series] = deltas.get(series, 0) + rec["value"]
+    return flushes
+
+
+def _window_start(
+    cumulative_games: list[Any],
+    cumulative_stored: list[Any],
+    *,
+    warmup_games: int,
+    replay_warmup_positions: int,
+) -> tuple[int | None, str]:
+    """Apply the window-start rule -- the one place it is written (§12 M5).
+
+    The window starts at the **later** of two flushes: (a) the one at which
+    the run-wide cumulative ``games_completed`` reaches ``warmup_games``, and
+    (b) the one at which the run-wide cumulative ``positions_stored`` reaches
+    ``replay_warmup_positions`` -- the point from which the learner's D5
+    pacing is live.
+
+    Args:
+        cumulative_games: Run-wide cumulative ``games_completed`` through
+            each flush, in run time order.
+        cumulative_stored: Run-wide cumulative ``positions_stored`` through
+            each flush, in the same order.
+        warmup_games: Condition (a)'s game count.
+        replay_warmup_positions: Condition (b)'s stored-position count.
+
+    Returns:
+        ``(index of the start flush, which condition bound it)`` -- (b) when
+        one flush meets both -- or ``(None, the insufficient-data reason)``
+        when a condition is never met.
+    """
+    games_at = next((i for i, n in enumerate(cumulative_games) if n >= warmup_games), None)
+    if games_at is None:
+        return None, WINDOW_TOO_FEW_GAMES
+    stored_at = next(
+        (i for i, n in enumerate(cumulative_stored) if n >= replay_warmup_positions), None
+    )
+    if stored_at is None:
+        return None, WINDOW_REPLAY_WARMUP_NOT_REACHED
+    if stored_at >= games_at:
+        return stored_at, WINDOW_BOUND_BY_REPLAY_WARMUP
+    return games_at, WINDOW_BOUND_BY_WARMUP_GAMES
+
+
+def _last_at_or_before(
+    ordered: list[tuple[float, str, int, dict[str, Any]]], kind: str, series: str, timestamp: float
+) -> Any:
+    """Return a series' last recorded value at or before ``timestamp``.
+
+    Args:
+        ordered: Every record, in the pinned total order.
+        kind: The record kind to read (:data:`KIND_TOTAL` or :data:`KIND_GAUGE`).
+        series: The series name.
+        timestamp: The inclusive upper bound.
+
+    Returns:
+        The value, or ``None`` if the series has no record that early.
+    """
+    value = None
+    for ts, _proc, _seq, rec in ordered:
+        if ts > timestamp:
+            break
+        if rec.get("kind") == kind and rec.get("series") == series:
+            value = rec["value"]
+    return value
+
+
+def _insufficient_window(reason: str) -> WindowedRun:
+    """Return the verdict for a window that could not be formed.
+
+    Args:
+        reason: The window-level reason.
+
+    Returns:
+        A :class:`WindowedRun` with every measurement ``None`` and named
+        unavailable for ``reason``.
+    """
+    measurements = [f.name for f in fields(WindowedRun) if f.name not in ("reason", "unavailable")]
+    return WindowedRun(reason=reason, unavailable=dict.fromkeys(measurements, reason))
+
+
+def reduce_window(
+    run_dir: Path | str,
+    *,
+    warmup_games: int,
+    measure_games: int,
+    replay_warmup_positions: int,
+) -> WindowedRun:
+    """Reduce a run's metrics over one run-wide, warm-up-excluded window (§12 M5).
+
+    The sibling of :func:`reduce_run`, over the same records in the same
+    pinned order, and the only other place a delta series is summed or a
+    total series differenced. :func:`reduce_run` is first-record-to-last
+    with no warm-up slice and is unchanged; this slices one window out. It
+    returns measurements and data-sufficiency verdicts only -- no floor, no
+    pass or fail.
+
+    **The window.** Run-wide: every actor's finished games, merged in the
+    pinned record order, each game one flush (:func:`_game_flushes`). It
+    starts at the later of two conditions (:func:`_window_start`) and ends at
+    the flush at which the run-wide cumulative ``games_completed`` reaches
+    the start's own cumulative count plus ``measure_games``. Both boundaries
+    are read on one clock, the metrics records' timestamps. The games after
+    the start flush through the end flush are the window's games; a game is
+    placed by its run-wide ordinal, so one that shares the start's timestamp
+    but is ordered after it is inside.
+
+    **Aggregation rules.** A summed (``delta``) field adds the window's
+    games' flushes, whole. A flush is stamped when its game finishes, so a
+    window's sums include the part of its first games played before
+    ``window_start`` and exclude the games still in flight at ``window_end``:
+    each such field is exact **up to one actor flush period** (one game per
+    actor) at each boundary -- a stated bound, never interpolated.
+    ``games_per_hour`` carries no such bound. A ``total`` series
+    (``learner_step``) is differenced between its endpoint readings, never
+    summed. A ``gauge`` is read at its last record at or before the boundary.
+    Learner and gauge records are placed by timestamp alone.
+
+    **Insufficient data is an explicit verdict.** A window that cannot be
+    formed returns a named :attr:`WindowedRun.reason` and no number; a field
+    whose own series cannot support it is ``None`` with its reason in
+    :attr:`WindowedRun.unavailable`.
+
+    Args:
+        run_dir: The run's root directory (``core.metrics.metrics_dir``).
+        warmup_games: Completed games, run-wide, before the window may start
+            (``throughput.warmup_games``).
+        measure_games: Completed games the window spans
+            (``throughput.measure_games``).
+        replay_warmup_positions: Cumulative stored positions before the
+            window may start (``training.replay_warmup_positions``).
+
+    Returns:
+        The :class:`WindowedRun`.
+
+    Raises:
+        ValueError: If ``warmup_games`` or ``replay_warmup_positions`` is
+            negative, or ``measure_games`` is not positive.
+    """
+    if warmup_games < 0 or replay_warmup_positions < 0 or measure_games < 1:
+        raise ValueError(
+            "need warmup_games >= 0, replay_warmup_positions >= 0 and measure_games >= 1; got "
+            f"{warmup_games}, {replay_warmup_positions}, {measure_games}"
+        )
+    ordered = _ordered_records(run_dir)
+    flushes = _game_flushes(ordered)
+    cumulative_games: list[Any] = []
+    cumulative_stored: list[Any] = []
+    games = stored = 0
+    for _ts, deltas in flushes:
+        games += deltas[SERIES_GAMES_COMPLETED]
+        stored += deltas.get(SERIES_POSITIONS_STORED, 0)
+        cumulative_games.append(games)
+        cumulative_stored.append(stored)
+
+    start, binding = _window_start(
+        cumulative_games,
+        cumulative_stored,
+        warmup_games=warmup_games,
+        replay_warmup_positions=replay_warmup_positions,
+    )
+    if start is None:
+        return _insufficient_window(binding)
+    target = cumulative_games[start] + measure_games
+    end = next((i for i in range(start + 1, len(flushes)) if cumulative_games[i] >= target), None)
+    if end is None:
+        return _insufficient_window(WINDOW_TOO_FEW_GAMES)
+    window_start, window_end = flushes[start][0], flushes[end][0]
+    span = window_end - window_start
+    if span <= 0:
+        return _insufficient_window(WINDOW_ZERO_SPAN)
+
+    sums: dict[str, Any] = {}
+    for _ts, deltas in flushes[start + 1 : end + 1]:
+        for series, value in deltas.items():
+            sums[series] = sums.get(series, 0) + value
+
+    def per(series: str, unit_seconds: float) -> float | None:
+        """Return a summed series' rate over the window, or ``None`` if it has no record."""
+        return sums[series] / (span / unit_seconds) if series in sums else None
+
+    games_in_window = cumulative_games[end] - cumulative_games[start]
+    step_at_start = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_start)
+    step_at_end = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_end)
+    learner_steps = None if step_at_start is None else step_at_end - step_at_start
+
+    values: dict[str, Any] = {
+        "window_start": window_start,
+        "window_end": window_end,
+        "start_game_ordinal": cumulative_games[start],
+        "end_game_ordinal": cumulative_games[end],
+        "binding_condition": binding,
+        "games_in_window": games_in_window,
+        "games_per_hour": games_in_window / (span / _SECONDS_PER_HOUR),
+        "stored_positions_per_hour": per(SERIES_POSITIONS_STORED, _SECONDS_PER_HOUR),
+        "sims_per_sec": per(SERIES_SIMS_RUN, 1.0),
+        "net_evals_per_sec": per(SERIES_POSITIONS_EVALUATED, 1.0),
+        "learner_steps_in_window": learner_steps,
+        "learner_steps_per_sec": None if learner_steps is None else learner_steps / span,
+        "replay_ratio_at_window_end": _last_at_or_before(
+            ordered, KIND_GAUGE, SERIES_REPLAY_RATIO, window_end
+        ),
+    }
+    reasons = dict.fromkeys(
+        ("learner_steps_in_window", "learner_steps_per_sec"), WINDOW_FEWER_THAN_TWO_RECORDS
+    )
+    unavailable = {
+        name: reasons.get(name, WINDOW_NO_RECORD) for name, value in values.items() if value is None
+    }
+    return WindowedRun(reason=None, unavailable=unavailable, **values)
