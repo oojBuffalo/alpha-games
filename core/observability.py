@@ -1130,7 +1130,9 @@ def reduce_window(
     Args:
         run_dir: The run's root directory (``core.metrics.metrics_dir``).
         warmup_games: Completed games, run-wide, before the window may start
-            (``throughput.warmup_games``).
+            (``throughput.warmup_games``). ``0`` and ``1`` give the same
+            window: at least one stored position is required, and the first
+            exists only once the first game is flushed (:func:`_window_start`).
         measure_games: Completed games the window spans
             (``throughput.measure_games``).
         replay_warmup_positions: Cumulative stored positions before the
