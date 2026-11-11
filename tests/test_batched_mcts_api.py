@@ -111,3 +111,23 @@ GOLDEN_CASES = {
 def test_serial_search_matches_the_pre_batching_golden(case):
     make_game, seed = GOLDEN_CASES[case]
     assert _seeded_search(make_game(), seed) == SERIAL_GOLDEN[case]
+
+
+# --- bookkeeping primitives: completed-simulations counter + in-flight marker ----------
+
+
+@pytest.mark.parametrize("make_game", [TicTacToe, Connect4])
+def test_run_counts_completed_simulations_and_leaves_nothing_in_flight(make_game):
+    game = make_game()
+    m = MCTS(game)
+    assert m.completed_simulations == 0
+
+    root = m.run(120, root_state=game.initial_state())
+    assert m.completed_simulations == 120
+    assert not any(node.in_flight for node in _all_nodes(root))
+
+    # The counter is engine-lifetime: subtree reuse and incremental runs only add to it.
+    m.advance(m.best_action())
+    m.run(30)
+    assert m.completed_simulations == 150
+    assert not any(node.in_flight for node in _all_nodes(m.root))

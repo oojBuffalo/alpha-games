@@ -51,6 +51,7 @@ class _Node:
         "vloss",
         "children",
         "is_expanded",
+        "in_flight",
     )
 
     def __init__(self, state: State, is_terminal: bool, to_play: PlayerId | None):
@@ -67,6 +68,9 @@ class _Node:
         self.vloss: list[int] = []
         self.children: list[_Node | None] = []
         self.is_expanded = False
+        # True while this node is the leaf of a descent that has not been backed up yet
+        # (design doc §6.2: the in-flight-leaf marker; set on terminal leaves too).
+        self.in_flight = False
 
 
 class MCTS:
@@ -130,6 +134,9 @@ class MCTS:
         # noise is re-drawn per incarnation (D7) — once, not on every run() call.
         self._root_epoch = 0
         self._noised_epoch = -1
+        # Simulations backed up over this engine's lifetime — never reset, not by
+        # set_root() and not by advance(); callers read deltas around a run().
+        self.completed_simulations = 0
 
     # --- public API ------------------------------------------------------------
 
@@ -158,6 +165,8 @@ class MCTS:
             path, leaf, leaf_value = self._descend(apply_vloss=True)
             ref_player, value = self._leaf_value(leaf, path, leaf_value)
             self._backup(path, ref_player, value)
+            leaf.in_flight = False
+            self.completed_simulations += 1
         return self.root
 
     def advance(self, action: Action) -> None:
@@ -362,18 +371,22 @@ class MCTS:
     def _descend(self, apply_vloss: bool = True):
         """Select from the root to a leaf, expanding it if it is a fresh non-terminal.
 
-        Applies virtual loss to each traversed edge (removed on backup). Returns
-        ``(path, leaf, leaf_value)`` where ``path`` is a list of ``(node, edge_index)``
-        and ``leaf_value`` is the freshly-expanded leaf's value (mover's perspective),
-        or ``None`` if the leaf is terminal (value comes from ``terminal_utility``).
+        Applies virtual loss to each traversed edge (removed on backup) and marks the
+        returned leaf in flight (cleared by :meth:`run` once the path is backed up).
+        Returns ``(path, leaf, leaf_value)`` where ``path`` is a list of
+        ``(node, edge_index)`` and ``leaf_value`` is the freshly-expanded leaf's value
+        (mover's perspective), or ``None`` if the leaf is terminal (value comes from
+        ``terminal_utility``).
         """
         path: list[tuple[_Node, int]] = []
         node = self.root
         assert node is not None
         while True:
             if node.is_terminal:
+                node.in_flight = True
                 return path, node, None
             if not node.is_expanded:
+                node.in_flight = True
                 value = self._expand(node)
                 return path, node, value
             i = self._select_edge(node)
