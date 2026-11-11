@@ -151,6 +151,28 @@ def wait_for_completion(
     launched.wait(poll_interval, shutdown_grace)
 
 
+def _check_stop_arguments(spike_games: int | None, shutdown_grace_seconds: float) -> None:
+    """Refuse a stop argument no run could honour, before a run exists.
+
+    Every launch mode calls this first, so a refusal leaves no run directory
+    and no process behind.
+
+    Args:
+        spike_games: The run-wide completed-game target, or ``None``.
+        shutdown_grace_seconds: The shutdown grace period.
+
+    Raises:
+        ValueError: If ``spike_games`` is given and not positive, or
+            ``shutdown_grace_seconds`` is negative, ``nan`` or infinite.
+    """
+    if spike_games is not None and spike_games < 1:
+        raise ValueError(f"--spike-games must be >= 1, got {spike_games}")
+    if not math.isfinite(shutdown_grace_seconds) or shutdown_grace_seconds < 0:
+        raise ValueError(
+            f"--shutdown-grace-seconds must be finite and >= 0, got {shutdown_grace_seconds}"
+        )
+
+
 def cmd_launch(
     config_path: Path | str,
     *,
@@ -183,7 +205,13 @@ def cmd_launch(
 
     Returns:
         The live run.
+
+    Raises:
+        ValueError: If a stop argument is unusable
+            (:func:`_check_stop_arguments`); raised before anything is
+            written or started.
     """
+    _check_stop_arguments(spike_games, shutdown_grace_seconds)
     launch_config = load_launch_config(config_path)
     run_id = generate_run_id(launch_config, now=now)
     root = run_root(launch_config, run_id)
@@ -242,7 +270,11 @@ def cmd_resume(
     Raises:
         core.run_identity.MaterialConfigDiffError: On any material config
             difference.
+        ValueError: If a stop argument is unusable
+            (:func:`_check_stop_arguments`); raised before anything is
+            read, written or started.
     """
+    _check_stop_arguments(spike_games, shutdown_grace_seconds)
     new_launch_config = load_launch_config(config_path)
     resolution = resolve_resume(run_dir, new_launch_config)
     for path, (old, new) in sorted(resolution.non_material_diff.items()):
@@ -296,7 +328,13 @@ def cmd_fork(
 
     Returns:
         The live run.
+
+    Raises:
+        ValueError: If a stop argument is unusable
+            (:func:`_check_stop_arguments`); raised before anything is
+            written or started.
     """
+    _check_stop_arguments(spike_games, shutdown_grace_seconds)
     new_launch_config = load_launch_config(config_path)
     resolution = resolve_fork(parent_run_dir, new_launch_config, now=now)
     write_provenance(
@@ -432,13 +470,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.config is None:
         parser.error("config is required unless --verify-acceptance is given")
     # Refused here, before any mode writes a run's provenance.
-    if args.spike_games is not None and args.spike_games < 1:
-        parser.error(f"--spike-games must be >= 1, got {args.spike_games}")
+    try:
+        _check_stop_arguments(args.spike_games, args.shutdown_grace_seconds)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.spike_games is not None and args.no_block:
         parser.error("--spike-games needs a blocking run: with --no-block nothing enforces it")
-    grace = args.shutdown_grace_seconds
-    if not math.isfinite(grace) or grace < 0:
-        parser.error(f"--shutdown-grace-seconds must be finite and >= 0, got {grace}")
 
     block = not args.no_block
     try:

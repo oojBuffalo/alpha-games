@@ -594,6 +594,85 @@ def test_the_cli_threads_the_stop_arguments_into_every_launch_mode(monkeypatch, 
     assert seen["shutdown_grace_seconds"] == DEFAULT_SHUTDOWN_GRACE_SECONDS
 
 
+class _RecordingRun:
+    """A stand-in live run that only records how it was waited on."""
+
+    wait_args = None
+
+    def wait(self, poll_interval=None, shutdown_grace="not passed"):
+        self.wait_args = (poll_interval, shutdown_grace)
+
+
+def _record_launches(monkeypatch):
+    """Replace the shared launch tail with a recorder that starts no process.
+
+    Returns:
+        The list each call appends ``(keyword arguments, stand-in run)`` to.
+    """
+    launches = []
+
+    def fake_launch(launch_config, run_id, root, **kwargs):
+        del launch_config, run_id, root
+        launches.append((kwargs, _RecordingRun()))
+        return launches[-1][1]
+
+    monkeypatch.setattr(rs, "_launch", fake_launch)
+    return launches
+
+
+@pytest.mark.parametrize("mode", ["launch", "resume", "fork"])
+def test_each_launch_mode_hands_the_stop_arguments_to_the_run_it_starts(
+    tmp_path, monkeypatch, mode
+):
+    launches = _record_launches(monkeypatch)
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    rs.cmd_launch(cfg, block=False, now=1_700_000_000.0)  # a parent's provenance, no process
+    parent = _only_run_dir(tmp_path)
+    launches.clear()
+
+    stop = dict(spike_games=7, shutdown_grace_seconds=42.0)
+    if mode == "launch":
+        rs.cmd_launch(cfg, now=1_700_000_500.0, **stop)
+    elif mode == "resume":
+        rs.cmd_resume(cfg, parent, **stop)
+    else:
+        rs.cmd_fork(cfg, parent, now=1_700_000_500.0, **stop)
+
+    ((kwargs, run),) = launches
+    assert kwargs["spike_games"] == 7  # the target reaches the run that enforces it
+    assert run.wait_args == (rs.DEFAULT_WAIT_POLL_INTERVAL, 42.0)  # and the grace its wait
+
+
+@pytest.mark.parametrize("mode", ["launch", "resume", "fork"])
+@pytest.mark.parametrize(
+    "stop",
+    [
+        dict(shutdown_grace_seconds=float("nan")),
+        dict(shutdown_grace_seconds=float("inf")),
+        dict(shutdown_grace_seconds=-1.0),
+        dict(spike_games=0),
+    ],
+    ids=["nan_grace", "inf_grace", "negative_grace", "zero_target"],
+)
+def test_each_launch_mode_refuses_an_unusable_stop_argument_before_doing_anything(
+    tmp_path, monkeypatch, mode, stop
+):
+    """A direct caller gets the refusal the CLI gives, before a run exists to be orphaned."""
+    launches = _record_launches(monkeypatch)
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    parent = tmp_path / "runs" / "no-such-run"  # never read: the refusal comes first
+
+    with pytest.raises(ValueError, match="--spike-games|--shutdown-grace-seconds"):
+        if mode == "launch":
+            rs.cmd_launch(cfg, **stop)
+        elif mode == "resume":
+            rs.cmd_resume(cfg, parent, **stop)
+        else:
+            rs.cmd_fork(cfg, parent, **stop)
+    assert launches == []
+    assert not (tmp_path / "runs").exists()  # no provenance written
+
+
 @pytest.mark.parametrize(
     "stop_args",
     [
