@@ -18,6 +18,7 @@ from core.metrics import EpochMetricsWriter
 from core.observability import (
     CHECKPOINT_PUBLISHED_KIND,
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_LEARNER_STEP,
@@ -72,10 +73,11 @@ def _write_game_shard(shard_dir, run_id, actor_id, seq, movers, model_version, g
     write_shard(shard_dir / shard_id, game, records, run_id=run_id, actor_id=actor_id, seq=seq)
 
 
-def _run_config_stub(*, batch_size, publish_interval):
+def _run_config_stub(*, batch_size, publish_interval, playout_cap_randomization=False):
     """A minimal duck-typed run-config stand-in (mirrors ``tests/test_learner.py``)."""
     return SimpleNamespace(
-        training=SimpleNamespace(batch_size=batch_size, publish_interval=publish_interval)
+        training=SimpleNamespace(batch_size=batch_size, publish_interval=publish_interval),
+        self_play=SimpleNamespace(playout_cap_randomization=playout_cap_randomization),
     )
 
 
@@ -233,6 +235,51 @@ def test_fails_when_no_game_has_a_consecutive_mover_sequence(tmp_path):
     check = _check(report, "at least one consecutive-mover (blocked-skip) sequence")
     assert not check.passed
     assert not report.passed
+
+
+def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
+    """Dropped plies put same-mover samples side by side with no skip played.
+
+    A strictly alternating game that stored plies 0, 1 and 3 reads as movers
+    0, 1, 1: the stored-sample test would name it as a blocked skip. On a run
+    whose config has playout-cap randomization on, the check fails closed.
+    """
+    name = "at least one consecutive-mover (blocked-skip) sequence"
+    root = tmp_path / "run"
+    shard_dir = root / "shards"
+    shard_dir.mkdir(parents=True)
+    for i in range(_NUM_GAMES):
+        movers = [0, 1, 1] if i < _NUM_GAMES // 2 else [0, 1, 0]
+        model_version = 0 if i < _NUM_GAMES // 2 else 1
+        _write_game_shard(shard_dir, "run", "0", i, movers, model_version)
+    _write_actor_metrics(root, num_games=_NUM_GAMES)
+    _write_learner_metrics(root, learner_step=_LEARNER_STEP, published_versions=(0, 1))
+    _write_checkpoints(root / "checkpoints", (0, 1))
+
+    # Read as an all-stored run, those shards pass: that reading is the M3 one.
+    stored_all = verify_acceptance(root, TTT, _run_config())
+    assert stored_all.passed
+
+    # Not evaluable means not evaluable: the run's own transition counter
+    # being positive does not turn the check into a pass.
+    EpochMetricsWriter(root, "actor-1").append(
+        delta_record(SERIES_CONSECUTIVE_MOVER_TRANSITIONS, 3)
+    )
+    schedule_on = _run_config_stub(
+        batch_size=_BATCH_SIZE, publish_interval=_PUBLISH_INTERVAL, playout_cap_randomization=True
+    )
+    report = verify_acceptance(root, TTT, schedule_on)
+    check = _check(report, name)
+    assert not check.passed
+    assert not report.passed
+    # The detail names the durable evidence and claims no reader for it.
+    assert check.detail.endswith(
+        f"the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} series, which this checklist does not read"
+    )
+    assert "[FAIL] " + name in report.render()
+    # Every other check reads exactly as it did.
+    others = [(c.name, c.passed, c.detail) for c in report.checks if c.name != name]
+    assert others == [(c.name, c.passed, c.detail) for c in stored_all.checks if c.name != name]
 
 
 def test_fails_when_no_reload_observed(tmp_path):
