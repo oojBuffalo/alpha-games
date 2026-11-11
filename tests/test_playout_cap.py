@@ -253,16 +253,19 @@ def test_the_tier_draw_comes_from_the_pcr_tier_stream_once_per_drawn_ply():
     assert [sample.tier for sample in result.samples] == names
 
 
+@pytest.mark.parametrize("k_temp", [4, 9])
 @pytest.mark.parametrize("leaf_batch_size", [1, 4])
-def test_a_d6_game_matches_a_reference_loop_on_the_public_search_api(leaf_batch_size):
+def test_a_d6_game_matches_a_reference_loop_on_the_public_search_api(leaf_batch_size, k_temp):
     """Only the budget varies by tier.
 
     The reference plays the same game with the engine directly: root noise on
     at every ply, D10 selection at every ply, the root's raw counts as the
     target, the subtree reused after every move, and the configured leaf batch
-    size at every tier.
+    size at every tier. This game's two mid-tier plies are 4 and 7, so at
+    ``k_temp`` 4 they take the argmax branch and at 9 every ply -- full, mid
+    and fast -- is sampled.
     """
-    cfg = d6_cfg(leaf_batch_size=leaf_batch_size)
+    cfg = d6_cfg(leaf_batch_size=leaf_batch_size, k_temp=k_temp)
     result = play_game(TTT, None, cfg, GameRNGs.for_actor_game(*D6_GAME))
 
     rngs = GameRNGs.for_actor_game(*D6_GAME)
@@ -276,11 +279,12 @@ def test_a_d6_game_matches_a_reference_loop_on_the_public_search_api(leaf_batch_
         search.run(budget, batch_size=leaf_batch_size)
         visits = search.action_visit_counts()
         targets.append(tuple(visits.items()))
-        action = select_move(visits, ply, 4, rngs.move_selection)
+        action = select_move(visits, ply, k_temp, rngs.move_selection)
         search.advance(action)
         state = TTT.apply(state, action)
         moves.append(action)
 
+    assert [sample.tier for sample in result.samples][4] == "mid"
     assert result.moves == tuple(moves)
     assert [sample.sparse_pi for sample in result.samples] == targets
 
@@ -291,11 +295,12 @@ def test_a_d6_game_is_a_pure_function_of_its_seed():
     assert again == first
 
 
-# ``play_game`` on the tree this change was built on (commit c77fd68), for
+# ``play_game`` at commit c77fd68, an ancestor of the branch this change is
+# built on and the last tree before the move loop was restructured, for
 # Tic-Tac-Toe with the uniform evaluator at a fixed 64 sims: actor 3's games
 # 0-7 under run seed 2026. Per ``leaf_batch_size``: the moves of each game, and
 # one digest over every game's moves, utilities and every field a sample then
-# had. Captured from that tree before the move loop was restructured.
+# had.
 FIXED_GOLDEN_GAMES = 8
 FIXED_GOLDEN = {
     1: (

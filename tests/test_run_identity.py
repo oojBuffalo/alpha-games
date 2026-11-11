@@ -68,7 +68,7 @@ V1_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v1.js
 V1_LAUNCH_TIME_HASH = "1f18e71e6f6b73f649e2d2c05107aca832773dd88d56de9a6e8964ad8ff536a3"
 
 # A genuine schema-v2 stored ``config.json``: ``configs/blokus_duo.json`` as the
-# batched-leaf-inference tree (commit c77fd68) parsed and wrote it through
+# batched-leaf-inference branch (at commit c77fd68) parsed and wrote it through
 # ``write_provenance`` -- ``self_play.leaf_batch_size`` present, no
 # playout-cap-randomization keys.
 V2_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v2.json"
