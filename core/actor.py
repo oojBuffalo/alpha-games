@@ -9,14 +9,17 @@ and is deliberately kept out of ``core.selfplay`` so the shared loop stays a
 plain function any caller (the micro loop, evaluation, this module) can drive
 without inheriting actor concerns it doesn't have.
 
-**The D6 validate tier is an actor-layer assertion, not a game-loop one.**
-``core.selfplay.play_game`` stays fully parameterizable over ``cfg.sims`` —
-the micro loop runs it at 64, evaluation at whatever ``EvaluationConfig.sims``
-names. :class:`ActorDriver` is the caller that is *pinned* to "fixed 128
-sims, no playout-cap randomization" (§7), so that is exactly where the check
-belongs: :func:`validate_actor_self_play_config` runs once, at construction,
-and raises loudly rather than letting a misconfigured actor silently search
-at the wrong budget for an entire run.
+**The D6 budgets are an actor-layer assertion, not a game-loop one.**
+``core.selfplay.play_game`` stays fully parameterizable over its config —
+the micro loop runs it at a fixed 64, evaluation at whatever
+``EvaluationConfig.sims`` names. :class:`ActorDriver` is the caller that is
+*pinned* to D6 (§7), in exactly two shapes: the validate tier (fixed 128
+sims, playout-cap randomization off) and the playout-cap schedule (plies 0-1
+at 512; later plies 25% at 256, 75% at 64). So that is exactly where the
+check belongs: :func:`validate_actor_self_play_config` runs once, at
+construction, and raises loudly on anything else — a hybrid of the two
+included — rather than letting a misconfigured actor silently search at the
+wrong budget for an entire run.
 
 **Durable identity has exactly one source: the writer's persisted state.**
 ``core.replay_shard.ShardWriter`` already owns a crash-safe
@@ -58,9 +61,9 @@ publication) build against.
 supplies them (every test predating this issue) gets byte-identical
 behavior. When both are given, every finished game flushes three ``delta``
 records to ``metrics_writer`` at the game boundary: ``games_completed``
-(always ``1``), ``sims_run`` (``result.plies * self_play.sims`` -- exact and
-cheap, since a validate-tier actor runs no playout-cap randomization, so
-every ply searches exactly ``self_play.sims`` simulations), and
+(always ``1``), ``sims_run`` (``GameResult.sims_run`` -- the exact sum of
+the budgets the game's plies were searched at, which under playout-cap
+randomization is not ``plies * self_play.sims``), and
 ``positions_evaluated`` (drained from ``position_counter``, which the
 caller is responsible for wiring into the actual evaluator via
 ``core.observability.count_positions`` -- this module never constructs an
@@ -69,7 +72,9 @@ evaluator itself). ``positions_evaluated`` is omitted entirely when no
 optional ``batch_counter``, wired into the evaluator the same way, adds the
 inference-batch accounting deltas to the same flush (``inference_batches``
 plus the non-zero size buckets -- ``core.observability``), under the same
-omitted-when-absent rule.
+omitted-when-absent rule. A game played under playout-cap randomization also
+flushes its per-tier move counts (``moves_full_512`` / ``moves_mid_256`` /
+``moves_fast_64``, each only when non-zero); a validate-tier game writes none.
 """
 
 from __future__ import annotations
@@ -83,6 +88,9 @@ from core.mcts import BatchEvaluator, Evaluator
 from core.metrics import EpochMetricsWriter
 from core.observability import (
     SERIES_GAMES_COMPLETED,
+    SERIES_MOVES_FAST_64,
+    SERIES_MOVES_FULL_512,
+    SERIES_MOVES_MID_256,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
     InferenceBatchCounter,
@@ -92,18 +100,28 @@ from core.observability import (
 from core.replay_shard import PendingSample, ShardWriter
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
-from core.selfplay import GameResult, Sample, play_game
+from core.selfplay import TIER_FAST, TIER_FULL, TIER_MID, GameResult, Sample, play_game
 
 # D6: validate the loop at a fixed simulation count first (§7); the actor is
 # pinned to it, the shared game loop is not.
 VALIDATE_TIER_SIMS = 128
 
-# The playout-cap-randomization flag D8/M5 will eventually add to
-# SelfPlayConfig, under a name not yet pinned. Read defensively via getattr
-# rather than a direct attribute access, so this check is already correct
-# (the attribute is absent => PCR is absent) and needs no edit as of M5,
-# only the constant below to be renamed to match whatever M5 pins.
-_PCR_ATTR = "playout_cap_randomization"
+# D6: then the playout-cap schedule (§7) -- plies 0-1 always at the full
+# budget; every later ply at the mid budget with this probability, else fast.
+PCR_FULL_SIMS = 512
+PCR_MID_SIMS = 256
+PCR_FAST_SIMS = 64
+PCR_MID_PROBABILITY = 0.25
+PCR_FULL_PLIES = 2
+
+# The delta series each playout-cap tier's plies are counted under. The fixed
+# tier (playout-cap randomization off) has none: ``sims_run / sims`` is its
+# ply count.
+_TIER_SERIES = {
+    TIER_FULL: SERIES_MOVES_FULL_512,
+    TIER_MID: SERIES_MOVES_MID_256,
+    TIER_FAST: SERIES_MOVES_FAST_64,
+}
 
 # One weight refresh: the evaluator to search with (None = the M0 uniform/zero
 # path), the model version pinned for every sample of the next game, and --
@@ -121,25 +139,43 @@ StopFn = Callable[[], bool]
 
 
 def validate_actor_self_play_config(cfg: SelfPlayConfig) -> None:
-    """Assert ``cfg`` is the D6 validate tier an :class:`ActorDriver` requires.
+    """Assert ``cfg`` is one of the two D6 shapes an :class:`ActorDriver` runs.
+
+    The validate tier is ``sims == 128`` with playout-cap randomization off
+    (the ``pcr_*`` scalars are unused there and not checked). The playout-cap
+    schedule is the flag on with ``sims`` and all four ``pcr_*`` scalars at
+    the D6 pins. Nothing in between is accepted; ``leaf_batch_size`` is free
+    in both.
 
     Args:
         cfg: The self-play scalars an actor is about to be built with.
 
     Raises:
-        ValueError: If ``cfg.sims`` is not exactly :data:`VALIDATE_TIER_SIMS`,
-            or playout-cap randomization is enabled.
+        ValueError: If ``cfg`` is neither shape.
     """
-    if cfg.sims != VALIDATE_TIER_SIMS:
-        raise ValueError(
-            "actor self-play config must run the D6 validate tier: sims must be "
-            f"exactly {VALIDATE_TIER_SIMS}, got {cfg.sims}"
-        )
-    if getattr(cfg, _PCR_ATTR, False):
-        raise ValueError(
-            "actor self-play config must run the D6 validate tier: playout-cap "
-            "randomization must be absent or disabled"
-        )
+    schedule = (
+        cfg.sims,
+        cfg.pcr_mid_sims,
+        cfg.pcr_fast_sims,
+        cfg.pcr_mid_probability,
+        cfg.pcr_full_plies,
+    )
+    d6_schedule = (PCR_FULL_SIMS, PCR_MID_SIMS, PCR_FAST_SIMS, PCR_MID_PROBABILITY, PCR_FULL_PLIES)
+    if cfg.playout_cap_randomization:
+        if schedule == d6_schedule:
+            return
+    elif cfg.sims == VALIDATE_TIER_SIMS:
+        return
+    raise ValueError(
+        "actor self-play config must be one of the two D6 shapes: the validate tier "
+        f"(sims {VALIDATE_TIER_SIMS}, playout-cap randomization off) or the playout-cap "
+        f"schedule (playout-cap randomization on, sims {PCR_FULL_SIMS}, pcr_mid_sims "
+        f"{PCR_MID_SIMS}, pcr_fast_sims {PCR_FAST_SIMS}, pcr_mid_probability "
+        f"{PCR_MID_PROBABILITY}, pcr_full_plies {PCR_FULL_PLIES}); got "
+        f"playout_cap_randomization={cfg.playout_cap_randomization}, sims={cfg.sims}, "
+        f"pcr_mid_sims={cfg.pcr_mid_sims}, pcr_fast_sims={cfg.pcr_fast_sims}, "
+        f"pcr_mid_probability={cfg.pcr_mid_probability}, pcr_full_plies={cfg.pcr_full_plies}"
+    )
 
 
 def _default_wait() -> None:
@@ -197,7 +233,7 @@ class ActorDriver:
             caller constructs it, exactly as ``core.selfplay.play_game``
             expects.
         self_play: The self-play scalars every game is played with; must be
-            the D6 validate tier (:func:`validate_actor_self_play_config`).
+            one of the two D6 shapes (:func:`validate_actor_self_play_config`).
         run_id: This run's identity (constant across every actor in the run).
         actor_id: This actor's durable identifier within the run — an
             ``int`` because ``core.seeding.GameRNGs.for_actor_game`` requires
@@ -228,7 +264,8 @@ class ActorDriver:
             stops as soon as either says to.
         metrics_writer: Optional. When given, every finished game flushes
             ``games_completed`` / ``sims_run`` / ``positions_evaluated``
-            deltas to it (module docstring). ``None`` (the default) disables
+            deltas to it, plus the per-tier move counts under playout-cap
+            randomization (module docstring). ``None`` (the default) disables
             all metrics flushing — backward compatible with every existing
             caller.
         position_counter: Optional. Drained once per game to populate the
@@ -242,8 +279,8 @@ class ActorDriver:
             like ``position_counter``.
 
     Raises:
-        ValueError: If ``self_play`` is not the D6 validate tier, or
-            ``max_games`` is not positive.
+        ValueError: If ``self_play`` is neither D6 shape, or ``max_games``
+            is not positive.
     """
 
     def __init__(
@@ -395,14 +432,13 @@ class ActorDriver:
         A no-op unless ``metrics_writer`` was supplied at construction
         (module docstring: optional, off by default). ``games_completed`` is
         always exactly ``1`` -- one flush per finished game. ``sims_run`` is
-        computed directly rather than counted (``result.plies *
-        self.self_play.sims``): an actor is pinned to the D6 validate tier
-        (no playout-cap randomization), so every ply searched exactly
-        ``self.self_play.sims`` simulations, making the product exact.
-        ``positions_evaluated`` is drained from ``position_counter`` and
-        omitted entirely when none was supplied -- never a fabricated zero.
-        The inference-batch deltas are drained from ``batch_counter`` under
-        the same rule.
+        ``result.sims_run``, the exact sum of the budgets the game's plies
+        were searched at. Each playout-cap tier the game played adds its ply
+        count under that tier's series; a validate-tier game played none, so
+        it writes none. ``positions_evaluated`` is drained from
+        ``position_counter`` and omitted entirely when none was supplied --
+        never a fabricated zero. The inference-batch deltas are drained from
+        ``batch_counter`` under the same rule.
 
         Args:
             result: The just-finished game.
@@ -411,9 +447,12 @@ class ActorDriver:
             return
         now = time.time()
         self.metrics_writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=now))
-        self.metrics_writer.append(
-            delta_record(SERIES_SIMS_RUN, result.plies * self.self_play.sims, timestamp=now)
-        )
+        self.metrics_writer.append(delta_record(SERIES_SIMS_RUN, result.sims_run, timestamp=now))
+        for tier, series in _TIER_SERIES.items():
+            if tier in result.tier_counts:
+                self.metrics_writer.append(
+                    delta_record(series, result.tier_counts[tier], timestamp=now)
+                )
         if self.position_counter is not None:
             positions = self.position_counter.drain()
             self.metrics_writer.append(
