@@ -291,8 +291,9 @@ class GameResult:
         utilities: Terminal utility per player id, zero-sum in v1.
         sims_run: Simulations searched over the whole game: the exact sum of
             every ply's drawn budget.
-        tier_counts: Plies played per tier name; only tiers the game actually
-            played appear, and the counts sum to :attr:`plies`.
+        tier_counts: Plies played per tier, as ``(tier name, count)`` pairs
+            sorted by name; only tiers the game actually played appear, and
+            the counts sum to :attr:`plies`.
     """
 
     samples: tuple[Sample, ...]
@@ -300,7 +301,7 @@ class GameResult:
     terminal_state: State
     utilities: tuple[float, ...]
     sims_run: int = 0
-    tier_counts: Mapping[str, int] = field(default_factory=dict)
+    tier_counts: tuple[tuple[str, int], ...] = ()
 
     @property
     def plies(self) -> int:
@@ -444,7 +445,7 @@ def play_game(
         terminal_state=state,
         utilities=tuple(game.terminal_utility(state, p) for p in range(game.num_players)),
         sims_run=sims_run,
-        tier_counts=tier_counts,
+        tier_counts=tuple(sorted(tier_counts.items())),
     )
 
 

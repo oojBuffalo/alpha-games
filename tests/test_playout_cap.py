@@ -205,8 +205,10 @@ def test_each_ply_is_searched_at_its_drawn_tier_and_the_sims_are_counted_exactly
     assert searched[:2] == [512, 512]
     assert result.sims_run == sum(searched)
     assert result.sims_run != result.plies * cfg.sims  # the old product is wrong under PCR
-    assert result.tier_counts == Counter(tier.name for tier in drawn)
-    assert sum(result.tier_counts.values()) == result.plies
+    assert dict(result.tier_counts) == Counter(tier.name for tier in drawn)
+    assert [name for name, _ in result.tier_counts] == ["fast", "full", "mid"]
+    assert sum(count for _, count in result.tier_counts) == result.plies
+    hash(result)  # a frozen result stays hashable, as it was before the tier fields
 
 
 def test_the_tier_reaches_the_sample_and_every_ply_is_still_stored(searched):
@@ -350,5 +352,5 @@ def test_pcr_off_is_bit_identical_to_the_fixed_budget_loop(searched, leaf_batch_
     plies = sum(result.plies for result in results)
     assert searched == [64] * plies
     assert [result.sims_run for result in results] == [64 * r.plies for r in results]
-    assert all(result.tier_counts == {"fixed": result.plies} for result in results)
+    assert all(result.tier_counts == (("fixed", result.plies),) for result in results)
     assert {sample.tier for result in results for sample in result.samples} == {"fixed"}

@@ -701,7 +701,7 @@ def test_a_d6_actor_flushes_the_real_sims_and_its_tier_mix(tmp_path):
         play_game(TTT, None, d6_cfg(), GameRNGs.for_actor_game(11, 2, index))
         for index in range(games)
     ]
-    assert {name for r in replayed for name in r.tier_counts} == set(TIER_SERIES)
+    assert {name for r in replayed for name, _ in r.tier_counts} == set(TIER_SERIES)
 
     flushed = _series_values(tmp_path, "actor-2")
     assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1] * games
@@ -709,7 +709,7 @@ def test_a_d6_actor_flushes_the_real_sims_and_its_tier_mix(tmp_path):
     assert any(r.sims_run != r.plies * 512 for r in replayed)
     for tier, series in TIER_SERIES.items():
         # Written per game, only when that game played the tier.
-        expected = [r.tier_counts[tier] for r in replayed if tier in r.tier_counts]
+        expected = [count for r in replayed for name, count in r.tier_counts if name == tier]
         assert [v for s, v in flushed if s == series] == expected
 
     total = lambda series: sum(v for s, v in flushed if s == series)  # noqa: E731

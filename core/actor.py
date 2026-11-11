@@ -448,11 +448,10 @@ class ActorDriver:
         now = time.time()
         self.metrics_writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=now))
         self.metrics_writer.append(delta_record(SERIES_SIMS_RUN, result.sims_run, timestamp=now))
+        tier_counts = dict(result.tier_counts)
         for tier, series in _TIER_SERIES.items():
-            if tier in result.tier_counts:
-                self.metrics_writer.append(
-                    delta_record(series, result.tier_counts[tier], timestamp=now)
-                )
+            if tier in tier_counts:
+                self.metrics_writer.append(delta_record(series, tier_counts[tier], timestamp=now))
         if self.position_counter is not None:
             positions = self.position_counter.drain()
             self.metrics_writer.append(
