@@ -21,9 +21,23 @@ name and aggregation rule below is frozen, not an implementation detail.
   restart is relative to zero, not to whatever the dead process last held in
   memory. :data:`SERIES_GAMES_COMPLETED`, :data:`SERIES_POSITIONS_EVALUATED`,
   and :data:`SERIES_SIMS_RUN` are the pinned delta series (actor-owned).
+  The *inference-batch accounting* series (§12 M5) are further actor-owned
+  deltas, flushed with them at every game boundary but not among the series
+  an M3 run is required to carry: :data:`SERIES_INFERENCE_BATCHES` counts
+  network forward passes, and one ``inference_batch_size_*`` series per
+  size bucket (:func:`inference_batch_size_series`: ``1``, ``2_3``, ``4_7``,
+  ``8_15``, ``16_31``, ``32_63``, ``64_plus``) counts the forward passes whose
+  leaf count fell in that bucket. A bucket series is written only when its
+  count is non-zero, so an absent one reads as zero. The buckets sum to
+  ``inference_batches``; mean batch fill is ``positions_evaluated /
+  inference_batches`` exactly, and the buckets bound any percentile of it.
 * ``"gauge"`` -- a latest-value observation, never summed: loss components,
-  the D5 replay ratio. Only the most recent record in run time order matters
-  (learner-owned).
+  the D5 replay ratio (learner-owned). Only the most recent record in run
+  time order matters. :data:`SERIES_ACTOR_AMP_ACTIVE` is the one actor-owned
+  gauge: ``1.0`` iff inference autocast was *observed* live inside the context
+  an actor's leaf evaluations run under, ``0.0`` otherwise -- written once per
+  actor epoch, at that actor's first evaluation (``core.ipc``), so every
+  actor's own metrics file states what its forwards ran under.
 * ``"total"`` -- a coordinator-owned exact cumulative that must never be
   summed across records (summing an already-cumulative value overcounts).
   :data:`SERIES_LEARNER_STEP` is the pinned total series: exactly one writer
@@ -78,6 +92,23 @@ SERIES_GAMES_COMPLETED = "games_completed"
 SERIES_POSITIONS_EVALUATED = "positions_evaluated"
 SERIES_SIMS_RUN = "sims_run"
 SERIES_LEARNER_STEP = "learner_step"
+
+# Actor-owned gauge (module docstring): the observed inference-autocast state.
+SERIES_ACTOR_AMP_ACTIVE = "actor_amp_active"
+
+# Inference-batch accounting (module docstring): forward passes run, plus one
+# delta series per leaf-count bucket. Bucket ``i`` holds sizes in
+# ``[2**i, 2**(i+1))``; the last is open-ended.
+SERIES_INFERENCE_BATCHES = "inference_batches"
+_INFERENCE_BATCH_SIZE_SERIES = (
+    "inference_batch_size_1",
+    "inference_batch_size_2_3",
+    "inference_batch_size_4_7",
+    "inference_batch_size_8_15",
+    "inference_batch_size_16_31",
+    "inference_batch_size_32_63",
+    "inference_batch_size_64_plus",
+)
 
 RATE_GAMES_PER_HOUR = "games_per_hour"
 RATE_SIMS_PER_SEC = "sims_per_sec"
@@ -255,9 +286,73 @@ class PositionCounter:
         return n
 
 
+def inference_batch_size_series(size: int) -> str:
+    """Return the size-bucket series a forward pass over ``size`` leaves counts toward.
+
+    Args:
+        size: The number of leaves evaluated in one forward pass.
+
+    Returns:
+        The bucket's series name: ``inference_batch_size_1``, ``_2_3``,
+        ``_4_7``, ``_8_15``, ``_16_31``, ``_32_63`` or ``_64_plus``.
+
+    Raises:
+        ValueError: If ``size`` is not positive.
+    """
+    if size < 1:
+        raise ValueError(f"inference batch size must be >= 1, got {size}")
+    last = len(_INFERENCE_BATCH_SIZE_SERIES) - 1
+    return _INFERENCE_BATCH_SIZE_SERIES[min(size.bit_length() - 1, last)]
+
+
+class InferenceBatchCounter:
+    """Counts network forward passes and how full each one was (§12 M5).
+
+    The companion of :class:`PositionCounter` for the same evaluator calls:
+    that one sums the leaves, this one counts the calls and buckets their
+    sizes. Not thread-safe, for the same reason.
+    """
+
+    def __init__(self) -> None:
+        """Start with no forward passes recorded."""
+        self._batches = 0
+        self._by_series: dict[str, int] = {}
+
+    def add(self, n: int) -> None:
+        """Record one evaluator call that evaluated ``n`` leaves.
+
+        Args:
+            n: The call's leaf count. ``0`` records nothing: an empty call ran
+                no forward pass.
+
+        Raises:
+            ValueError: If ``n`` is negative.
+        """
+        if n < 0:
+            raise ValueError(f"inference batch size must be >= 0, got {n}")
+        if n == 0:
+            return
+        series = inference_batch_size_series(n)
+        self._batches += 1
+        self._by_series[series] = self._by_series.get(series, 0) + 1
+
+    def drain(self) -> dict[str, int]:
+        """Return the deltas accumulated since the last drain, resetting to zero.
+
+        Returns:
+            ``{series: delta}``: always :data:`SERIES_INFERENCE_BATCHES` (``0``
+            if no forward pass ran), plus each size-bucket series with a
+            non-zero count.
+        """
+        drained = {SERIES_INFERENCE_BATCHES: self._batches, **self._by_series}
+        self._batches = 0
+        self._by_series = {}
+        return drained
+
+
 def count_positions(
     fn: Callable[..., Any],
-    counter: PositionCounter,
+    counter: PositionCounter | InferenceBatchCounter,
     *,
     batch_size: Callable[..., int] | None = None,
 ) -> Callable[..., Any]:
@@ -279,7 +374,9 @@ def count_positions(
         fn: The callable to wrap -- ``core.mcts.Evaluator``'s
             ``(game, state) -> (value, priors)`` shape by default, or any
             other call shape when ``batch_size`` is supplied to match it.
-        counter: Accumulates every call's position count.
+        counter: Receives every call's position count through ``add``: a
+            :class:`PositionCounter` sums them, an
+            :class:`InferenceBatchCounter` records each as one batch.
         batch_size: Given the exact ``(*args, **kwargs)`` a call passed to
             the wrapped function, returns how many positions that call
             represents. Defaults to an unconditional ``1``.

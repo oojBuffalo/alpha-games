@@ -39,12 +39,15 @@ from core.observability import (
     KIND_SEGMENT_END,
     KIND_SEGMENT_START,
     KIND_TOTAL,
+    SERIES_INFERENCE_BATCHES,
+    InferenceBatchCounter,
     PositionCounter,
     ReducedRun,
     _ordered_records,  # white-box: the pinned tie-break rule
     count_positions,
     delta_record,
     gauge_record,
+    inference_batch_size_series,
     is_real_cuda,
     reduce_run,
     segment_end_record,
@@ -130,6 +133,80 @@ def test_position_counter_rejects_negative_additions():
     counter = PositionCounter()
     with pytest.raises(ValueError, match="position count"):
         counter.add(-1)
+
+
+def test_inference_batch_size_buckets_are_powers_of_two_with_an_open_top():
+    expected = {
+        1: "inference_batch_size_1",
+        2: "inference_batch_size_2_3",
+        3: "inference_batch_size_2_3",
+        4: "inference_batch_size_4_7",
+        7: "inference_batch_size_4_7",
+        8: "inference_batch_size_8_15",
+        15: "inference_batch_size_8_15",
+        16: "inference_batch_size_16_31",
+        31: "inference_batch_size_16_31",
+        32: "inference_batch_size_32_63",
+        63: "inference_batch_size_32_63",
+        64: "inference_batch_size_64_plus",
+        4096: "inference_batch_size_64_plus",
+    }
+    assert {size: inference_batch_size_series(size) for size in expected} == expected
+    with pytest.raises(ValueError, match="batch size"):
+        inference_batch_size_series(0)
+
+
+def test_inference_batch_counter_drains_batches_and_nonzero_buckets_then_resets():
+    counter = InferenceBatchCounter()
+    assert counter.drain() == {SERIES_INFERENCE_BATCHES: 0}  # an honest zero, no buckets
+    for size in (1, 1, 3, 8, 8, 8, 64):
+        counter.add(size)
+    counter.add(0)  # an empty call ran no forward: not a batch
+    assert counter.drain() == {
+        SERIES_INFERENCE_BATCHES: 7,
+        "inference_batch_size_1": 2,
+        "inference_batch_size_2_3": 1,
+        "inference_batch_size_8_15": 3,
+        "inference_batch_size_64_plus": 1,
+    }
+    assert counter.drain() == {SERIES_INFERENCE_BATCHES: 0}
+    with pytest.raises(ValueError, match="batch size"):
+        counter.add(-1)
+
+
+def test_count_positions_feeds_a_batch_counter_one_batch_per_call():
+    """One wrapper, two counters: positions sum the cardinalities, batches count the calls."""
+    positions, batches = PositionCounter(), InferenceBatchCounter()
+
+    def stub_batched_evaluate(game, states):
+        return [(0.0, None)] * len(states)
+
+    def size(game, states):
+        return len(states)
+
+    wrapped = count_positions(stub_batched_evaluate, positions, batch_size=size)
+    wrapped = count_positions(wrapped, batches, batch_size=size)
+    for states in (["a"], ["a", "b", "a"], ["a", "b", "c", "d", "e"]):
+        assert wrapped("g", states) == [(0.0, None)] * len(states)
+    drained = batches.drain()
+    assert positions.total == 9 and drained[SERIES_INFERENCE_BATCHES] == 3
+    # Mean fill is recoverable from the two totals: 9 leaves / 3 batches.
+    assert sum(v for k, v in drained.items() if k != SERIES_INFERENCE_BATCHES) == 3
+
+
+def test_reduce_run_sums_the_inference_batch_series_like_any_delta(tmp_path):
+    for proc, games in (("actor-0", [(5, {1: 2, 4: 3}), (2, {1: 2})]), ("actor-1", [(1, {64: 1})])):
+        writer = EpochMetricsWriter(tmp_path, proc)
+        for batches, sizes in games:
+            writer.append(delta_record(SERIES_INFERENCE_BATCHES, batches))
+            for size, count in sizes.items():
+                writer.append(delta_record(inference_batch_size_series(size), count))
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_INFERENCE_BATCHES] == 8
+    assert totals["inference_batch_size_1"] == 4
+    assert totals["inference_batch_size_4_7"] == 3
+    assert totals["inference_batch_size_64_plus"] == 1
+    assert "inference_batch_size_2_3" not in totals  # never observed => absent, i.e. zero
 
 
 def test_count_positions_batch_one_counts_one_per_call_and_preserves_the_result():

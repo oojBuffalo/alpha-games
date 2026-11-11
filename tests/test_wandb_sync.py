@@ -32,6 +32,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,11 +53,14 @@ from core.run_identity import (
     LAUNCH_SCHEMA_VERSION,
     LaunchConfig,
     RunRecord,
+    compute_config_hash,
     iso_now,
+    read_stored_config,
     run_root,
     write_provenance,
 )
 from core.runconfig import MICRO_RUN_CONFIG_PATH
+from tests.test_run_identity import V1_CONFIG_FIXTURE, V1_LAUNCH_TIME_HASH
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "wandb_sync.py"
@@ -503,6 +507,56 @@ class _FakeRun:
 
     def define_metric(self, name, *, step_metric=None):
         self.metric_defines[name] = step_metric
+
+
+def _v1_run_dir(tmp_path) -> tuple[Path, str]:
+    """A run dir carrying the genuine schema-v1 ``config.json``, byte for byte.
+
+    Returns:
+        ``(run_dir, run_id)`` -- the id ends in the launch-time config digest.
+    """
+    run_id = f"blokus_duo-20260825T000000000000-{V1_LAUNCH_TIME_HASH[:12]}"
+    root = tmp_path / run_id
+    root.mkdir()
+    (root / "config.json").write_bytes(V1_CONFIG_FIXTURE.read_bytes())
+    record = RunRecord(run_id=run_id, created_at=iso_now(0.0), entry_condition=ENTRY_CONDITION)
+    (root / "run_record.json").write_text(json.dumps(record.to_dict()))
+    return root, run_id
+
+
+def test_summary_config_hash_is_the_stored_documents_and_matches_the_run_id(tmp_path):
+    """A v1 run dir migrates on read; its provenance hash must not."""
+    root, run_id = _v1_run_dir(tmp_path)
+    launch_config = read_stored_config(root)
+    assert launch_config.schema_version == LAUNCH_SCHEMA_VERSION > 1  # it did migrate
+
+    summary = ws._summary_seed(root, launch_config, run_id)
+
+    assert summary["config_hash"] == V1_LAUNCH_TIME_HASH
+    assert run_id.endswith(f"-{summary['config_hash'][:12]}")
+    assert summary["config_hash"] != compute_config_hash(launch_config)
+
+    # A live-version run dir: stored document and parsed object hash alike.
+    live_root = _write_run(tmp_path, run_id="live-run")
+    live = read_stored_config(live_root)
+    assert ws._summary_seed(live_root, live, "live-run")["config_hash"] == compute_config_hash(live)
+
+
+def test_init_uploads_the_stored_config_document_not_the_migrated_one(tmp_path):
+    root, run_id = _v1_run_dir(tmp_path)
+    captured = {}
+
+    def init(**kwargs):
+        captured.update(kwargs)
+        return _FakeRun()
+
+    run = ws._init_wandb_run(SimpleNamespace(init=init), root, project="p")
+
+    stored = json.loads(V1_CONFIG_FIXTURE.read_text())
+    assert captured["id"] == run_id and captured["resume"] == "allow"
+    assert captured["config"] == stored  # schema_version 1, no leaf_batch_size: as launched
+    assert captured["tags"] == ["game:blokus_duo", "game_config:FULL_CONFIG"]
+    assert run.summary["config_hash"] == V1_LAUNCH_TIME_HASH
 
 
 def test_write_ahead_plan_reviewer_scenario_new_record_becomes_eligible_before_retry(tmp_path):

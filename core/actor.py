@@ -43,7 +43,9 @@ played at that index.
 strictly before the game it pins is played, and its returned
 ``model_version`` is stamped onto every sample of that game
 (``core.selfplay.play_game``'s new optional parameter) and never changes
-until the next call. ``pacing``, when supplied, is polled the same way,
+until the next call -- within-search leaf batching (``self_play.leaf_batch_size``, §12
+M5) never crosses a game boundary, so a batch is always evaluated by the one
+version its game is pinned to. ``pacing``, when supplied, is polled the same way,
 before ``refresh`` — a "hold" response defers to an injectable ``wait``
 strategy (real backoff in production; instrumented and sleep-free in tests)
 until it clears. Neither hook's cadence depends on this module knowing
@@ -63,7 +65,11 @@ every ply searches exactly ``self_play.sims`` simulations), and
 caller is responsible for wiring into the actual evaluator via
 ``core.observability.count_positions`` -- this module never constructs an
 evaluator itself). ``positions_evaluated`` is omitted entirely when no
-``position_counter`` was supplied, never written as a fabricated zero.
+``position_counter`` was supplied, never written as a fabricated zero. An
+optional ``batch_counter``, wired into the evaluator the same way, adds the
+inference-batch accounting deltas to the same flush (``inference_batches``
+plus the non-zero size buckets -- ``core.observability``), under the same
+omitted-when-absent rule.
 """
 
 from __future__ import annotations
@@ -73,12 +79,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from core.game import Game
-from core.mcts import Evaluator
+from core.mcts import BatchEvaluator, Evaluator
 from core.metrics import EpochMetricsWriter
 from core.observability import (
     SERIES_GAMES_COMPLETED,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
+    InferenceBatchCounter,
     PositionCounter,
     delta_record,
 )
@@ -99,8 +106,11 @@ VALIDATE_TIER_SIMS = 128
 _PCR_ATTR = "playout_cap_randomization"
 
 # One weight refresh: the evaluator to search with (None = the M0 uniform/zero
-# path) and the model version pinned for every sample of the next game.
-RefreshResult = tuple[Evaluator | None, int]
+# path), the model version pinned for every sample of the next game, and --
+# optionally -- the same weights as a batched evaluator, which the driver
+# searches with when ``self_play.leaf_batch_size > 1``. A refresh that has no
+# batched evaluator returns the two-element form.
+RefreshResult = tuple[Evaluator | None, int] | tuple[Evaluator | None, int, BatchEvaluator | None]
 RefreshFn = Callable[[], RefreshResult]
 
 # True = hold production (the learner is behind the replay-ratio floor,
@@ -199,7 +209,10 @@ class ActorDriver:
         refresh: Called once per game, strictly before that game is played,
             never while a search is in flight. Returns the evaluator to
             search with and the model version pinned for every sample of the
-            next game.
+            next game, plus optionally a batched evaluator over the same
+            weights (:data:`RefreshResult`). The batched one is used only
+            when ``self_play.leaf_batch_size > 1``: at ``1`` the search is the
+            serial one through the scalar evaluator, exactly as before.
         pacing: Optional. Polled the same way as ``refresh``, before it, on
             every iteration of :meth:`run`'s loop; while it returns ``True``
             the driver calls ``wait`` and polls again rather than starting a
@@ -223,6 +236,10 @@ class ActorDriver:
             ``metrics_writer`` is also given. The caller wires this counter
             into the actual evaluator (``core.observability.count_positions``)
             — this module only drains it.
+        batch_counter: Optional. Drained once per game to populate the
+            inference-batch accounting deltas; only consulted when
+            ``metrics_writer`` is also given, and wired by the caller exactly
+            like ``position_counter``.
 
     Raises:
         ValueError: If ``self_play`` is not the D6 validate tier, or
@@ -245,6 +262,7 @@ class ActorDriver:
         should_stop: StopFn | None = None,
         metrics_writer: EpochMetricsWriter | None = None,
         position_counter: PositionCounter | None = None,
+        batch_counter: InferenceBatchCounter | None = None,
     ) -> None:
         validate_actor_self_play_config(self_play)
         if max_games is not None and max_games <= 0:
@@ -262,6 +280,7 @@ class ActorDriver:
         self.should_stop = should_stop
         self.metrics_writer = metrics_writer
         self.position_counter = position_counter
+        self.batch_counter = batch_counter
         self.writer = ShardWriter(Path(out_dir), game, run_id, str(actor_id))
 
     def run(self) -> list[Path]:
@@ -289,8 +308,11 @@ class ActorDriver:
             # iteration for no behavioral gain.
             if self.pacing is not None and self._stop_requested(len(published)):
                 break
-            evaluator, model_version = self.refresh()
-            published.append(self._play_and_publish_one_game(evaluator, model_version))
+            evaluator, model_version, *batched = self.refresh()
+            evaluate_batch = batched[0] if batched and self.self_play.leaf_batch_size > 1 else None
+            published.append(
+                self._play_and_publish_one_game(evaluator, model_version, evaluate_batch)
+            )
         return published
 
     def _stop_requested(self, games_this_call: int) -> bool:
@@ -324,7 +346,12 @@ class ActorDriver:
                 return
             self.wait()
 
-    def _play_and_publish_one_game(self, evaluator: Evaluator | None, model_version: int) -> Path:
+    def _play_and_publish_one_game(
+        self,
+        evaluator: Evaluator | None,
+        model_version: int,
+        evaluate_batch: BatchEvaluator | None = None,
+    ) -> Path:
         """Play one game at the pinned version and publish it as its own shard.
 
         The durable game index is read from the writer's persisted state
@@ -336,6 +363,8 @@ class ActorDriver:
         Args:
             evaluator: This game's leaf evaluator, from ``refresh``.
             model_version: This game's pinned model version, from ``refresh``.
+            evaluate_batch: This game's batched leaf evaluator, or ``None`` to
+                evaluate leaves one at a time through ``evaluator``.
 
         Returns:
             The published shard's path.
@@ -350,6 +379,7 @@ class ActorDriver:
             rngs,
             model_version=model_version,
             game_id=game_id,
+            evaluate_batch=evaluate_batch,
         )
         pending = [_to_pending_sample(sample) for sample in result.samples]
         path = self.writer.write_shard([pending])
@@ -371,6 +401,8 @@ class ActorDriver:
         ``self.self_play.sims`` simulations, making the product exact.
         ``positions_evaluated`` is drained from ``position_counter`` and
         omitted entirely when none was supplied -- never a fabricated zero.
+        The inference-batch deltas are drained from ``batch_counter`` under
+        the same rule.
 
         Args:
             result: The just-finished game.
@@ -387,3 +419,6 @@ class ActorDriver:
             self.metrics_writer.append(
                 delta_record(SERIES_POSITIONS_EVALUATED, positions, timestamp=now)
             )
+        if self.batch_counter is not None:
+            for series, value in self.batch_counter.drain().items():
+                self.metrics_writer.append(delta_record(series, value, timestamp=now))

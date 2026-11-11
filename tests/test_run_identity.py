@@ -24,6 +24,7 @@ Four layers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -39,12 +40,14 @@ from core.run_identity import (
     RuntimeConfig,
     UnclassifiedFieldError,
     compute_config_hash,
+    compute_document_hash,
     device_kind,
     diff_launch_configs,
     generate_run_id,
     load_launch_config,
     read_run_record,
     read_stored_config,
+    read_stored_config_document,
     resolve_fork,
     resolve_resume,
     run_root,
@@ -53,6 +56,16 @@ from core.run_identity import (
 from core.runconfig import MICRO_RUN_CONFIG_PATH, RunConfig
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# A genuine schema-v1 stored ``config.json``: ``configs/blokus_duo.json`` as the
+# M3-era code (main at 2026-08-24, the acceptance-run tree) parsed and wrote it
+# through ``write_provenance`` -- no ``self_play.leaf_batch_size``, and no
+# evaluation-protocol stamps either (those arrived with M4).
+V1_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v1.json"
+
+# ``compute_config_hash`` of that config as the same M3-era code computed it at
+# launch -- the digest whose first 12 hex chars a real run id of that era ends in.
+V1_LAUNCH_TIME_HASH = "1f18e71e6f6b73f649e2d2c05107aca832773dd88d56de9a6e8964ad8ff536a3"
 
 
 def _base_raw():
@@ -196,6 +209,7 @@ MATERIAL_FIELDS = (
     "self_play.dirichlet_eps",
     "self_play.dirichlet_alpha_numerator",
     "self_play.root_noise",
+    "self_play.leaf_batch_size",
     "training.games",
     "training.learner_steps",
     "training.steps_per_game",
@@ -501,6 +515,103 @@ def test_read_stored_config_missing_directory_raises(tmp_path):
 
 
 # ==============================================================================
+# 3b. The versioned stored-config reader (schema v1 -> live)
+# ==============================================================================
+
+
+def _v1_run_dir(tmp_path, run_id="blokus_duo-20260825T000000000000-1f18e71e6f6b") -> Path:
+    """A run directory carrying the genuine v1 ``config.json``, byte for byte."""
+    root = tmp_path / run_id
+    root.mkdir(parents=True)
+    (root / "config.json").write_bytes(V1_CONFIG_FIXTURE.read_bytes())
+    (root / "run_record.json").write_text(
+        json.dumps(
+            RunRecord(
+                run_id=run_id, created_at="2026-08-25T00:00:00Z", entry_condition={}
+            ).to_dict()
+        )
+    )
+    return root
+
+
+def test_the_v1_fixture_is_a_genuine_v1_document():
+    raw = json.loads(V1_CONFIG_FIXTURE.read_text())
+    assert raw["schema_version"] == 1 < LAUNCH_SCHEMA_VERSION
+    assert "leaf_batch_size" not in raw["self_play"]
+
+
+def test_versioned_reader_migrates_a_v1_document_and_returns_it_untouched(tmp_path):
+    root = _v1_run_dir(tmp_path)
+    raw, lc = read_stored_config_document(root)
+
+    assert raw == json.loads(V1_CONFIG_FIXTURE.read_text())  # as stored, not migrated
+    assert lc.schema_version == LAUNCH_SCHEMA_VERSION
+    assert lc.run.self_play.leaf_batch_size == 1  # the recorded batch-1 baseline
+    assert lc.run.self_play.sims == raw["self_play"]["sims"]
+    assert read_stored_config(root) == lc  # the one read path
+    # Reading never rewrites the stored document.
+    assert (root / "config.json").read_bytes() == V1_CONFIG_FIXTURE.read_bytes()
+
+
+def test_strict_launch_loader_rejects_the_same_v1_document():
+    """The split: a stored v1 document migrates; a v1 *launch* JSON is refused."""
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        load_launch_config(V1_CONFIG_FIXTURE)
+
+
+def test_a_live_version_document_reads_identically_through_both_paths(tmp_path):
+    root, lc = _write_run(tmp_path)
+    raw, stored = read_stored_config_document(root)
+    assert stored == lc == load_launch_config(root / "config.json")
+    assert raw == lc.to_dict()
+
+
+@pytest.mark.parametrize("version", [LAUNCH_SCHEMA_VERSION + 1, 0, True, "1", None])
+def test_versioned_reader_rejects_a_version_it_has_no_migration_for(tmp_path, version):
+    root, lc = _write_run(tmp_path)
+    doc = lc.to_dict()
+    doc["schema_version"] = version
+    (root / "config.json").write_text(json.dumps(doc))
+    # The strict parser's own two errors, and nothing else: a ``true`` that looked
+    # up the v1 migration step would fail (or pass) for an unrelated reason.
+    expected = "schema_version mismatch|schema_version: expected an int"
+    with pytest.raises((ValueError, TypeError), match=expected):
+        read_stored_config_document(root)
+
+
+@pytest.mark.parametrize("value", [8, 1])
+def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwritten(
+    tmp_path, value
+):
+    """The migration fills what v1 could not say; the key's presence is the error.
+
+    Rejected whatever the value -- including ``1``, the value the migration
+    itself would fill: a v1 document cannot carry the key at all.
+    """
+    root = _v1_run_dir(tmp_path)
+    doc = json.loads(V1_CONFIG_FIXTURE.read_text())
+    doc["self_play"]["leaf_batch_size"] = value
+    (root / "config.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="leaf_batch_size"):
+        read_stored_config_document(root)
+
+
+def test_a_v1_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
+    """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
+    root = _v1_run_dir(tmp_path)
+    live = load_launch_config(ROOT / "configs" / "blokus_duo.json")
+    assert live.run.self_play.leaf_batch_size == 1
+
+    assert resolve_resume(root, live).effective_config == live
+
+    batched_raw = live.to_dict()
+    batched_raw["self_play"]["leaf_batch_size"] = 4
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, LaunchConfig.from_dict(batched_raw))
+    assert set(excinfo.value.material) == {"self_play.leaf_batch_size"}
+
+
+# ==============================================================================
 # 4. Resume / fork resolution
 # ==============================================================================
 
@@ -586,6 +697,30 @@ def test_resolve_fork_never_diffs_and_gets_a_fresh_identity(tmp_path):
     assert resolution.lineage.parent_config_hash == compute_config_hash(lc)
     assert resolution.lineage.parent_run_dir == str(root)
     assert resolution.lineage.imported_weights_version is None
+
+
+def test_document_hash_of_a_stored_config_is_its_launch_time_config_hash(tmp_path):
+    """``write_provenance`` stores ``to_dict()`` verbatim, so the two hashes agree."""
+    root, lc = _write_run(tmp_path)
+    raw, _ = read_stored_config_document(root)
+    assert compute_document_hash(raw) == compute_config_hash(lc)
+    assert compute_document_hash(lc.to_dict()) == compute_config_hash(lc)
+
+
+def test_fork_from_a_v1_parent_records_the_hash_of_the_document_as_stored(tmp_path):
+    """Lineage hashes the parent's file as persisted, never the migrated object."""
+    parent = _v1_run_dir(tmp_path)
+    stored_bytes = (parent / "config.json").read_bytes()
+
+    resolution = resolve_fork(parent, _launch_config(), now=1_700_000_500.0)
+    recorded = resolution.lineage.parent_config_hash
+
+    canonical = json.dumps(json.loads(stored_bytes), sort_keys=True).encode("utf-8")
+    assert recorded == hashlib.sha256(canonical).hexdigest()  # the unchanged parent file
+    assert recorded == V1_LAUNCH_TIME_HASH  # what the launching code computed
+    assert read_run_record(parent).run_id.endswith(f"-{recorded[:12]}")  # the run id's digest
+    assert recorded != compute_config_hash(read_stored_config(parent))  # not the migration
+    assert (parent / "config.json").read_bytes() == stored_bytes
 
 
 def test_resolve_fork_never_writes_the_parent_directory(tmp_path):
