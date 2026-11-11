@@ -131,13 +131,6 @@ def test_validate_accepts_playout_cap_randomization_when_present_and_false():
     validate_actor_self_play_config(stub)
 
 
-def test_validate_accepts_its_absence_today():
-    """SelfPlayConfig carries no PCR field yet (D8/M5) -- absence must pass."""
-    cfg = self_play_cfg(sims=128)
-    assert not hasattr(cfg, "playout_cap_randomization")
-    validate_actor_self_play_config(cfg)
-
-
 def test_actor_driver_construction_enforces_the_same_gate(tmp_path):
     with pytest.raises(ValueError, match="128"):
         make_driver(tmp_path, sims=64)

@@ -72,6 +72,13 @@ EXPECTED: dict[str, Any] = {
         # "batch-1 leaf inference (the known M2.5/M3 configuration — recorded
         # explicitly as the M5 lever, not optimized here)".
         "leaf_batch_size": 1,
+        # "fixed — no PCR at M2.5": the flag is off, so the four D6 schedule
+        # scalars below are inert here and ``sims`` is the fixed budget.
+        "playout_cap_randomization": False,
+        "pcr_mid_sims": 256,
+        "pcr_fast_sims": 64,
+        "pcr_mid_probability": 0.25,
+        "pcr_full_plies": 2,
     },
     # "2,000 self-play games; batch 32; replay window 3,000 samples; pacing 1
     # learner step per completed game → 2,000 learner steps; base LR 0.02 with
@@ -215,6 +222,11 @@ def test_loader_parses_the_pinned_file():
         dirichlet_alpha_numerator=10.8,
         root_noise=True,
         leaf_batch_size=1,
+        playout_cap_randomization=False,
+        pcr_mid_sims=256,
+        pcr_fast_sims=64,
+        pcr_mid_probability=0.25,
+        pcr_full_plies=2,
     )
 
     assert cfg.training.games == 2000
@@ -604,3 +616,109 @@ def test_leaf_batch_size_is_required_and_unrelated_to_the_sim_budget():
         sims=64, k_temp=4, dirichlet_eps=0.25, dirichlet_alpha_numerator=10.8, root_noise=True
     )
     assert default.leaf_batch_size == 1
+
+
+# --- playout-cap randomization (D6) -----------------------------------------
+
+PCR_KEYS = (
+    "playout_cap_randomization",
+    "pcr_mid_sims",
+    "pcr_fast_sims",
+    "pcr_mid_probability",
+    "pcr_full_plies",
+)
+
+
+def _pcr_on(**self_play_overrides):
+    """The micro config switched to the D6 schedule, with optional overrides.
+
+    Args:
+        **self_play_overrides: ``self_play`` keys to replace after the switch.
+
+    Returns:
+        A fresh mutable config dict: ``sims`` 512, PCR on, mid 256, fast 64,
+        mid probability 0.25, always-full boundary 2.
+    """
+    raw = _mutated()
+    raw["self_play"].update(sims=512, playout_cap_randomization=True)
+    raw["self_play"].update(self_play_overrides)
+    return raw
+
+
+@pytest.mark.parametrize("key", PCR_KEYS)
+def test_every_pcr_key_is_required_in_json(key):
+    raw = _mutated()
+    del raw["self_play"][key]
+    with pytest.raises(ValueError, match=rf"missing config keys \['{key}'\]"):
+        RunConfig.from_dict(raw)
+
+
+def test_sims_is_the_always_full_budget_when_pcr_is_on():
+    """``sims`` keeps one meaning: PCR on, it is the plies-0-1 tier (512)."""
+    cfg = RunConfig.from_dict(_pcr_on()).self_play
+    assert cfg.playout_cap_randomization is True
+    assert (cfg.sims, cfg.pcr_mid_sims, cfg.pcr_fast_sims) == (512, 256, 64)
+    assert (cfg.pcr_mid_probability, cfg.pcr_full_plies) == (0.25, 2)
+    assert RunConfig.from_dict(RunConfig.from_dict(_pcr_on()).to_dict()).self_play == cfg
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"sims": 256}, "sims > pcr_mid_sims > pcr_fast_sims"),  # sims == mid
+        ({"sims": 128}, "sims > pcr_mid_sims > pcr_fast_sims"),  # sims < mid
+        ({"pcr_fast_sims": 256}, "sims > pcr_mid_sims > pcr_fast_sims"),  # mid == fast
+        ({"pcr_mid_sims": 32}, "sims > pcr_mid_sims > pcr_fast_sims"),  # mid < fast
+        ({"pcr_fast_sims": 0}, "self_play.pcr_fast_sims must be > 0"),
+        ({"pcr_mid_probability": 0.0}, r"pcr_mid_probability must be in \(0, 1\)"),
+        ({"pcr_mid_probability": 1.0}, r"pcr_mid_probability must be in \(0, 1\)"),
+        ({"pcr_mid_probability": 1.5}, r"pcr_mid_probability must be in \(0, 1\)"),
+        ({"pcr_full_plies": -1}, "self_play.pcr_full_plies must be >= 0"),
+    ],
+)
+def test_pcr_on_rejects_a_schedule_outside_the_pinned_rule(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        RunConfig.from_dict(_pcr_on(**overrides))
+
+
+def test_pcr_off_range_checks_the_inert_scalars_but_not_their_order():
+    """Off, ``sims`` is the fixed budget and need not exceed the unused tiers."""
+    cfg = RunConfig.from_dict(_mutated()).self_play
+    assert cfg.playout_cap_randomization is False
+    assert cfg.sims == 64 < cfg.pcr_mid_sims  # micro: fixed 64, tiers inert
+
+    for key, bad, message in (
+        ("pcr_mid_sims", 0, "self_play.pcr_mid_sims must be > 0"),
+        ("pcr_fast_sims", 0, "self_play.pcr_fast_sims must be > 0"),
+        ("pcr_mid_probability", 1.0, r"pcr_mid_probability must be in \(0, 1\)"),
+        ("pcr_full_plies", -1, "self_play.pcr_full_plies must be >= 0"),
+    ):
+        raw = _mutated()
+        raw["self_play"][key] = bad
+        with pytest.raises(ValueError, match=message):
+            RunConfig.from_dict(raw)
+
+
+def test_pcr_key_types_are_strict():
+    raw = _pcr_on(playout_cap_randomization=1)
+    with pytest.raises(TypeError, match="expected a bool"):
+        RunConfig.from_dict(raw)
+    raw = _pcr_on(pcr_mid_sims=256.0)
+    with pytest.raises(TypeError, match="expected an int"):
+        RunConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("leaf_batch_size", [1, 64, 65, 4096])
+def test_leaf_batch_size_is_not_cross_validated_against_the_tier_budgets(leaf_batch_size):
+    """A batch larger than the fast tier just never fills at that tier."""
+    cfg = RunConfig.from_dict(_pcr_on(leaf_batch_size=leaf_batch_size)).self_play
+    assert cfg.leaf_batch_size == leaf_batch_size
+
+
+def test_python_construction_defaults_to_pcr_off():
+    default = SelfPlayConfig(
+        sims=64, k_temp=4, dirichlet_eps=0.25, dirichlet_alpha_numerator=10.8, root_noise=True
+    )
+    assert default.playout_cap_randomization is False
+    assert (default.pcr_mid_sims, default.pcr_fast_sims) == (256, 64)
+    assert (default.pcr_mid_probability, default.pcr_full_plies) == (0.25, 2)

@@ -67,6 +67,22 @@ V1_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v1.js
 # launch -- the digest whose first 12 hex chars a real run id of that era ends in.
 V1_LAUNCH_TIME_HASH = "1f18e71e6f6b73f649e2d2c05107aca832773dd88d56de9a6e8964ad8ff536a3"
 
+# A genuine schema-v2 stored ``config.json``: ``configs/blokus_duo.json`` as the
+# batched-leaf-inference tree (commit c77fd68) parsed and wrote it through
+# ``write_provenance`` -- ``self_play.leaf_batch_size`` present, no
+# playout-cap-randomization keys.
+V2_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v2.json"
+
+# The five ``self_play`` keys schema v3 adds, and the values a document of an
+# older schema migrates to: PCR off, the D6 scalars as inert defaults.
+PCR_OFF_DEFAULTS = {
+    "playout_cap_randomization": False,
+    "pcr_mid_sims": 256,
+    "pcr_fast_sims": 64,
+    "pcr_mid_probability": 0.25,
+    "pcr_full_plies": 2,
+}
+
 
 def _base_raw():
     """The pinned micro config, doc keys stripped, as a fresh mutable dict."""
@@ -210,6 +226,11 @@ MATERIAL_FIELDS = (
     "self_play.dirichlet_alpha_numerator",
     "self_play.root_noise",
     "self_play.leaf_batch_size",
+    "self_play.playout_cap_randomization",
+    "self_play.pcr_mid_sims",
+    "self_play.pcr_fast_sims",
+    "self_play.pcr_mid_probability",
+    "self_play.pcr_full_plies",
     "training.games",
     "training.learner_steps",
     "training.steps_per_game",
@@ -275,6 +296,13 @@ def _bump(value):
     raise TypeError(f"cannot bump {value!r}")
 
 
+def _override_pcr_on(raw: dict) -> None:
+    # The flag alone is not schema-valid on the micro base: PCR on needs
+    # ``sims`` above the mid tier, so the always-full budget moves with it.
+    raw["self_play"]["playout_cap_randomization"] = True
+    raw["self_play"]["sims"] = 512
+
+
 def _override_training_games(raw: dict) -> None:
     raw["training"]["games"] += 1
     raw["training"]["learner_steps"] = raw["training"]["games"] * raw["training"]["steps_per_game"]
@@ -298,6 +326,10 @@ def _override_training_steps_per_game(raw: dict) -> None:
 FIELD_OVERRIDES = {
     "game_config": lambda raw: _set_dotted(raw, "game_config", "FULL_CONFIG"),
     "self_play.dirichlet_eps": lambda raw: _set_dotted(raw, "self_play.dirichlet_eps", 0.5),
+    "self_play.playout_cap_randomization": _override_pcr_on,
+    "self_play.pcr_mid_probability": lambda raw: _set_dotted(
+        raw, "self_play.pcr_mid_probability", 0.5
+    ),
     "training.games": _override_training_games,
     "training.learner_steps": _override_training_learner_steps,
     "training.steps_per_game": _override_training_steps_per_game,
@@ -519,11 +551,13 @@ def test_read_stored_config_missing_directory_raises(tmp_path):
 # ==============================================================================
 
 
-def _v1_run_dir(tmp_path, run_id="blokus_duo-20260825T000000000000-1f18e71e6f6b") -> Path:
-    """A run directory carrying the genuine v1 ``config.json``, byte for byte."""
+def _v1_run_dir(
+    tmp_path, run_id="blokus_duo-20260825T000000000000-1f18e71e6f6b", fixture=V1_CONFIG_FIXTURE
+) -> Path:
+    """A run directory carrying a genuine older ``config.json``, byte for byte."""
     root = tmp_path / run_id
     root.mkdir(parents=True)
-    (root / "config.json").write_bytes(V1_CONFIG_FIXTURE.read_bytes())
+    (root / "config.json").write_bytes(fixture.read_bytes())
     (root / "run_record.json").write_text(
         json.dumps(
             RunRecord(
@@ -609,6 +643,76 @@ def test_a_v1_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_pa
     with pytest.raises(MaterialConfigDiffError) as excinfo:
         resolve_resume(root, LaunchConfig.from_dict(batched_raw))
     assert set(excinfo.value.material) == {"self_play.leaf_batch_size"}
+
+
+def test_the_v2_fixture_is_a_genuine_v2_document():
+    raw = json.loads(V2_CONFIG_FIXTURE.read_text())
+    assert raw["schema_version"] == 2 < LAUNCH_SCHEMA_VERSION
+    assert raw["self_play"]["leaf_batch_size"] == 1
+    assert not set(PCR_OFF_DEFAULTS) & set(raw["self_play"])
+
+
+@pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
+def test_an_older_document_migrates_to_pcr_off_with_sims_carried_through(tmp_path, fixture):
+    """Every run before schema v3 searched each ply at the fixed ``sims``."""
+    root = _v1_run_dir(tmp_path, fixture=fixture)
+    raw, lc = read_stored_config_document(root)
+
+    assert raw == json.loads(fixture.read_text())  # as stored, not migrated
+    assert lc.schema_version == LAUNCH_SCHEMA_VERSION == 3
+    migrated = lc.run.self_play
+    assert {key: getattr(migrated, key) for key in PCR_OFF_DEFAULTS} == PCR_OFF_DEFAULTS
+    assert migrated.sims == raw["self_play"]["sims"] == 128
+    assert migrated.leaf_batch_size == 1
+    assert (root / "config.json").read_bytes() == fixture.read_bytes()
+
+
+def test_strict_launch_loader_rejects_the_v2_document():
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        load_launch_config(V2_CONFIG_FIXTURE)
+
+
+@pytest.mark.parametrize("key", sorted(PCR_OFF_DEFAULTS))
+def test_a_v2_document_already_carrying_a_pcr_key_is_rejected_not_overwritten(tmp_path, key):
+    root = _v1_run_dir(tmp_path, fixture=V2_CONFIG_FIXTURE)
+    doc = json.loads(V2_CONFIG_FIXTURE.read_text())
+    doc["self_play"][key] = PCR_OFF_DEFAULTS[key]
+    (root / "config.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match=key):
+        read_stored_config_document(root)
+
+
+@pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
+def test_a_fixed_sim_run_resumes_under_the_live_config_and_refuses_a_pcr_one(tmp_path, fixture):
+    """An old fixed-sim run dir never continues under the D6 schedule."""
+    root = _v1_run_dir(tmp_path, fixture=fixture)
+    live = load_launch_config(ROOT / "configs" / "blokus_duo.json")
+    assert live.run.self_play.playout_cap_randomization is False
+
+    assert resolve_resume(root, live).effective_config == live
+
+    pcr_raw = live.to_dict()
+    pcr_raw["self_play"].update(sims=512, playout_cap_randomization=True)
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, LaunchConfig.from_dict(pcr_raw))
+    assert set(excinfo.value.material) == {
+        "self_play.sims",
+        "self_play.playout_cap_randomization",
+    }
+
+    # The schedule scalars are material on their own, PCR on or off.
+    scalars_raw = live.to_dict()
+    scalars_raw["self_play"].update(
+        pcr_mid_sims=200, pcr_fast_sims=32, pcr_mid_probability=0.5, pcr_full_plies=4
+    )
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, LaunchConfig.from_dict(scalars_raw))
+    assert set(excinfo.value.material) == {
+        "self_play.pcr_mid_sims",
+        "self_play.pcr_fast_sims",
+        "self_play.pcr_mid_probability",
+        "self_play.pcr_full_plies",
+    }
 
 
 # ==============================================================================
