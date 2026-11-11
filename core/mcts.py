@@ -162,8 +162,15 @@ class MCTS:
             raise ValueError("no root set; pass root_state or call set_root first")
         for _ in range(num_simulations):
             self._maybe_noise_root()
-            path, leaf, leaf_value = self._descend(apply_vloss=True)
-            ref_player, value = self._leaf_value(leaf, path, leaf_value)
+            path, leaf, _ = self._descend(apply_vloss=True)
+            expanded_value = None
+            if not leaf.is_terminal:
+                if self.evaluate is None:
+                    result = (0.0, None)
+                else:
+                    result = self.evaluate(self.game, leaf.state)
+                expanded_value = self._fill_expand(leaf, *result)
+            ref_player, value = self._leaf_value(leaf, path, expanded_value)
             self._backup(path, ref_player, value)
             leaf.in_flight = False
             self.completed_simulations += 1
@@ -267,20 +274,38 @@ class MCTS:
         to_play = None if terminal else self.game.current_player(state)
         return _Node(state, terminal, to_play)
 
-    def _expand(self, node: _Node) -> float:
-        """Attach sparse edges + priors to ``node``; return its value (mover's perspective).
+    def _defer_expand(self, node: _Node) -> None:
+        """Reserve a fresh non-terminal leaf for evaluation (the defer half of expansion).
 
-        In M0 the value is ``0.0``; with an evaluator it is the network's value estimate
-        for ``node.state`` from ``node.to_play``'s perspective.
+        Stores the legal actions and marks the node in flight, with priors and value still
+        pending. The node stays unexpanded, so a descent that reaches it again before
+        :meth:`_fill_expand` stops there and reports a collision instead of re-expanding it.
+
+        Args:
+            node: A non-terminal node that has not been expanded.
         """
-        actions = list(self.game.legal_moves(node.state))
-        node.actions = actions
-        n = len(actions)
-        if self.evaluate is None:
-            value, raw_priors = 0.0, None
-        else:
-            value, raw_priors = self.evaluate(self.game, node.state)
-        node.P = self._priors(actions, raw_priors)
+        node.actions = list(self.game.legal_moves(node.state))
+        node.in_flight = True
+
+    def _fill_expand(
+        self, node: _Node, value: float, raw_priors: dict[Action, float] | None
+    ) -> float:
+        """Install an evaluation on a deferred leaf (the fill half of expansion).
+
+        Completes the sparse ``{N, W, Q, P}`` expansion over the legal actions stored by
+        :meth:`_defer_expand`.
+
+        Args:
+            node: A node previously passed to :meth:`_defer_expand`.
+            value: The evaluation of ``node.state`` from ``node.to_play``'s perspective
+                (``0.0`` in M0, the network's value estimate with an evaluator).
+            raw_priors: Logits by action id, or ``None`` for uniform priors.
+
+        Returns:
+            ``value``, unchanged — the leaf value to back up.
+        """
+        n = len(node.actions)
+        node.P = self._priors(node.actions, raw_priors)
         node.N = [0] * n
         node.W = [0.0] * n
         node.Q = [0.0] * n
@@ -369,26 +394,32 @@ class MCTS:
         return best_i
 
     def _descend(self, apply_vloss: bool = True):
-        """Select from the root to a leaf, expanding it if it is a fresh non-terminal.
+        """Select from the root to a leaf: a terminal node or an unexpanded one.
 
-        Applies virtual loss to each traversed edge (removed on backup) and marks the
-        returned leaf in flight (cleared by :meth:`run` once the path is backed up).
-        Returns ``(path, leaf, leaf_value)`` where ``path`` is a list of
-        ``(node, edge_index)`` and ``leaf_value`` is the freshly-expanded leaf's value
-        (mover's perspective), or ``None`` if the leaf is terminal (value comes from
-        ``terminal_utility``).
+        Applies virtual loss to each traversed edge (removed on backup). A leaf that is
+        not already in flight is marked so — a non-terminal one through
+        :meth:`_defer_expand`, which leaves its evaluation pending — and :meth:`run` clears
+        the mark once the path is backed up.
+
+        Args:
+            apply_vloss: Whether to add virtual loss to the traversed edges.
+
+        Returns:
+            ``(path, leaf, collided)``: ``path`` is the list of ``(node, edge_index)``
+            traversed, and ``collided`` is True iff ``leaf`` was already in flight when
+            this descent reached it (the descent then left the leaf untouched).
         """
         path: list[tuple[_Node, int]] = []
         node = self.root
         assert node is not None
         while True:
-            if node.is_terminal:
-                node.in_flight = True
-                return path, node, None
-            if not node.is_expanded:
-                node.in_flight = True
-                value = self._expand(node)
-                return path, node, value
+            if node.is_terminal or not node.is_expanded:
+                collided = node.in_flight
+                if node.is_terminal:
+                    node.in_flight = True
+                elif not collided:
+                    self._defer_expand(node)
+                return path, node, collided
             i = self._select_edge(node)
             if apply_vloss:
                 node.vloss[i] += self.virtual_loss

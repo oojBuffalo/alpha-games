@@ -131,3 +131,40 @@ def test_run_counts_completed_simulations_and_leaves_nothing_in_flight(make_game
     m.run(30)
     assert m.completed_simulations == 150
     assert not any(node.in_flight for node in _all_nodes(m.root))
+
+
+# --- expansion split: defer (reserve the leaf) then fill (install the evaluation) ------
+
+
+def test_deferred_leaf_is_a_collision_target_until_it_is_filled():
+    game = TicTacToe()
+    m = MCTS(game)
+    m.set_root(game.initial_state())
+    node = m.root
+
+    m._defer_expand(node)
+    # Reserved, not expanded: a second descent reaching it must see a collision, never
+    # re-expand it or select through edges that have no priors yet.
+    assert node.in_flight and not node.is_expanded
+    assert node.actions == list(game.legal_moves(node.state))
+    assert node.P == []
+
+    assert m._fill_expand(node, 0.25, {4: 3.0}) == 0.25
+    n = len(node.actions)
+    assert node.is_expanded
+    assert abs(sum(node.P) - 1.0) < 1e-12
+    assert max(node.P) == node.P[node.actions.index(4)]  # the one raised logit
+    assert node.N == [0] * n and node.W == [0.0] * n and node.Q == [0.0] * n
+    assert node.vloss == [0] * n and node.children == [None] * n
+
+
+def test_descent_reports_a_collision_at_a_leaf_that_is_already_in_flight():
+    game = TicTacToe()
+    m = MCTS(game)
+    m.set_root(game.initial_state())
+
+    path, leaf, collided = m._descend(apply_vloss=True)
+    assert (path, leaf, collided) == ([], m.root, False)
+    assert leaf.in_flight and not leaf.is_expanded  # deferred: no evaluation yet
+
+    assert m._descend(apply_vloss=True) == ([], m.root, True)
