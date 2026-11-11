@@ -882,7 +882,17 @@ def test_a_game_whose_shard_is_not_published_is_counted_by_no_series(tmp_path):
         driver.run()
 
     flushed = _series_values(tmp_path)
-    assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1]  # the published game
+    # One record of each series: the published game's, and nothing of the other's.
+    assert sorted(s for s, _ in flushed) == sorted(
+        [
+            SERIES_GAMES_COMPLETED,
+            SERIES_SIMS_RUN,
+            SERIES_POSITIONS_PLAYED,
+            SERIES_POSITIONS_STORED,
+            SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
+        ]
+    )
+    assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1]
     (shard,) = sorted((tmp_path / "shards").glob("shard-*.npz"))
     stored = [v for s, v in flushed if s == SERIES_POSITIONS_STORED]
     assert stored == [len(read_shard(shard, TTT).records)]
