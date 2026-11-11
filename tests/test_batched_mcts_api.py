@@ -215,6 +215,7 @@ class _Recorder:
         in_flight: The states of every in-flight node, as seen inside each call.
         pending: The states of the in-flight *non-terminal* nodes, as seen inside each
             call. The tree walk yields each node once, so this lists one state per node.
+        root_priors: The root's priors as seen inside each call.
     """
 
     def __init__(self, value: float = 0.0):
@@ -224,6 +225,7 @@ class _Recorder:
         self.root_vloss: list[list[int]] = []
         self.in_flight: list[list] = []
         self.pending: list[list] = []
+        self.root_priors: list[list[float]] = []
 
     def __call__(self, game, states):
         nodes = [n for n in _all_nodes(self.mcts.root) if n.in_flight]
@@ -231,6 +233,7 @@ class _Recorder:
         self.root_vloss.append(list(self.mcts.root.vloss))
         self.in_flight.append([n.state for n in nodes])
         self.pending.append([n.state for n in nodes if not n.is_terminal])
+        self.root_priors.append(list(self.mcts.root.P))
         return [(self.value, None)] * len(states)
 
 
@@ -453,7 +456,7 @@ def test_batched_evaluator_takes_precedence_over_the_single_leaf_one():
 
 
 # What the third evaluate_batch call does, and the error (type, message) run() must
-# surface. The last four spoil only the *final* result, behind a well-formed prefix.
+# surface. The last five spoil only the *final* result, behind a well-formed prefix.
 COUNT = r"evaluate_batch returned \d+ results for \d+ states"
 EVALUATION_FAILURES = {
     "raises": (None, RuntimeError, "evaluator down"),
@@ -461,6 +464,7 @@ EVALUATION_FAILURES = {
     "long": (lambda good: [*good, (0.0, None)], ValueError, COUNT),
     "value-none": (lambda good: [*good[:-1], (None, None)], TypeError, "real number"),
     "value-not-a-number": (lambda good: [*good[:-1], ("0.5", None)], TypeError, "real number"),
+    "value-overflows": (lambda good: [*good[:-1], (10**400, None)], OverflowError, None),
     "priors-not-logits": (lambda good: [*good[:-1], (0.0, {0: "high"})], TypeError, None),
     "result-not-a-pair": (lambda good: [*good[:-1], (0.0,)], ValueError, "unpack"),
 }
@@ -494,6 +498,49 @@ def test_a_failed_evaluation_abandons_the_batch_and_leaves_the_tree_clean(failur
     m.run(40, batch_size=4)  # the tree is still searchable
     assert m.completed_simulations == calls[0] + calls[1] + 40
     _assert_no_residue(m.root)
+
+
+class _FlakyUtilityConnect4(Connect4):
+    """Connect 4 whose first ``terminal_utility`` call misbehaves once.
+
+    Args:
+        bad: ``"raises"`` to raise from that call, ``"not-a-number"`` to return ``None``.
+    """
+
+    def __init__(self, bad: str):
+        super().__init__()
+        self.bad = bad
+        self.calls = 0
+
+    def terminal_utility(self, state, player_id):
+        self.calls += 1
+        if self.calls == 1:
+            if self.bad == "raises":
+                raise RuntimeError("adapter hiccup")
+            return None
+        return super().terminal_utility(state, player_id)
+
+
+@pytest.mark.parametrize("batch_size", [1, 7])
+@pytest.mark.parametrize("bad", ["raises", "not-a-number"])
+def test_a_failed_terminal_utility_abandons_the_batch_and_leaves_the_tree_clean(bad, batch_size):
+    game = _FlakyUtilityConnect4(bad)
+    state = game.from_moves([0, 1, 0, 1, 0, 1])  # column 0 wins at once: a terminal child
+    m = MCTS(game)
+
+    # The batch after the root's holds that terminal leaf — alone at batch_size 1, with
+    # six evaluated non-terminal leaves at batch_size 7.
+    with pytest.raises(RuntimeError if bad == "raises" else TypeError):
+        m.run(60, root_state=state, batch_size=batch_size)
+
+    assert game.calls == 1
+    assert m.completed_simulations == 1 and sum(m.root.N) == 0  # only the root's batch
+    _assert_no_residue(m.root)
+
+    m.run(60, batch_size=batch_size)  # the tree is still searchable
+    assert m.completed_simulations == 61
+    _assert_no_residue(m.root)
+    assert m.best_action() == 0
 
 
 def test_a_stale_in_flight_mark_fails_loudly_instead_of_spinning():
@@ -533,7 +580,10 @@ def test_batched_search_draws_root_noise_once_per_root_incarnation():
     m.run(60, batch_size=8)
     assert m.root.P == mixed
 
-    m.advance(m.best_action())  # a new incarnation draws again
+    m.advance(m.best_action())  # a new incarnation draws again...
     clean = list(m.root.P)
+    seen = len(rec.calls)
     m.run(20, batch_size=8)
     assert m.root.P != clean
+    # ...before its first batch selects: that batch's evaluation already sees the new mix.
+    assert rec.root_priors[seen] == m.root.P

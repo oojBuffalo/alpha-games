@@ -114,7 +114,10 @@ class MCTS:
         c_base: PUCT growth constant ``c_base`` (D11; default 19,652).
         evaluate: Optional leaf evaluator ``(game, state) -> (value, priors)`` used at
             non-terminal leaves. ``None`` (M0) means value ``0.0`` and uniform priors.
-            The network plugs in here at M2 — the same seam, no new abstraction.
+            The network plugs in here at M2 — the same seam, no new abstraction. The
+            value must be a real scalar (a ``numbers.Real``: a Python number or a NumPy
+            scalar). Arrays and tensors are rejected, 0-d and one-element ones included,
+            so an evaluator hands over ``.item()``; this holds for ``evaluate_batch`` too.
         evaluate_batch: Optional batched leaf evaluator ``(game, states) -> results``,
             returning one ``(value, priors)`` per state in order. When supplied it
             evaluates every batch (of any size) in one call and ``evaluate`` is not
@@ -204,14 +207,16 @@ class MCTS:
         completes at least one simulation. With ``batch_size = 1`` this is the serial
         search, bit for bit.
 
-        A batch whose evaluation fails is abandoned whole. If the evaluator raises, or
-        returns anything the engine cannot use (see Raises), every descent of that batch
-        is rolled back before the error propagates: no virtual loss or in-flight mark is
-        left, no leaf of the batch is expanded, and none of it is counted. Every result is
-        checked before the first leaf is filled, so one bad result discards the batch's
-        well-formed ones too. This covers the evaluator only: an exception raised by the
-        game adapter itself (``apply`` / ``legal_moves`` during a descent,
-        ``terminal_utility`` during backup) can still leave virtual loss behind.
+        A batch that fails is abandoned whole. If the evaluator or ``terminal_utility``
+        raises, or returns anything the engine cannot use (see Raises), every descent of
+        that batch is rolled back before the error propagates: no virtual loss or
+        in-flight mark is left, no leaf of the batch is expanded, and none of it is
+        counted. Every evaluation result and every terminal utility is obtained and
+        checked before the first leaf is filled, so one failure discards the batch's
+        well-formed results too, and filling and backing up then only assign and add.
+        What remains uncovered is an exception raised inside a descent (by the adapter's
+        ``apply`` / ``legal_moves`` / ``is_terminal`` / ``current_player``): the batch is
+        still abandoned, but that one descent's own path keeps its virtual loss.
 
         Args:
             num_simulations: Number of simulations (backed-up leaf visits) to perform.
@@ -226,11 +231,13 @@ class MCTS:
         Raises:
             ValueError: If ``batch_size < 1``, if no root is set, if ``evaluate_batch``
                 returns a different number of results than it was given states, or if a
-                result is not a ``(value, priors)`` pair.
-            TypeError: If an evaluated value is not a real number. Malformed priors raise
+                result is an iterable of the wrong length for a ``(value, priors)`` pair.
+            TypeError: If a leaf value — evaluated, or from ``terminal_utility`` — is not
+                a real number, or a result is not iterable at all. Malformed priors raise
                 whatever the softmax over them raises (typically also ``TypeError``).
+            OverflowError: If a leaf value is a real number too large for a float.
             RuntimeError: If a batch opens onto a leaf that is already in flight — a
-                stale mark, which no completed run and no failed evaluation leaves behind.
+                stale mark, which neither a completed nor an abandoned batch leaves behind.
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1; got {batch_size}")
@@ -256,6 +263,11 @@ class MCTS:
                 results = iter(
                     self._evaluate_leaves([leaf for _, leaf in batch if not leaf.is_terminal])
                 )
+                # terminal_utility is the batch's last adapter call: make it in here too.
+                terminal = [
+                    self._leaf_value(leaf, path, None) if leaf.is_terminal else None
+                    for path, leaf in batch
+                ]
             except BaseException:
                 # Nothing is filled yet, so abandoning the batch is exact: no virtual
                 # loss, no in-flight mark, no simulation counted.
@@ -264,13 +276,11 @@ class MCTS:
                     leaf.in_flight = False
                     leaf.actions = []  # undo the deferral: a fresh node again
                 raise
-            # Every result is already checked, so nothing below fails on the evaluator.
-            for path, leaf in batch:
-                expanded_value = (
-                    None if leaf.is_terminal else self._fill_expand(leaf, *next(results))
-                )
-                ref_player, value = self._leaf_value(leaf, path, expanded_value)
-                self._backup(path, ref_player, value)
+            # Every value is in hand and checked: the rest only assigns and adds floats.
+            for (path, leaf), resolved in zip(batch, terminal, strict=True):
+                if resolved is None:
+                    resolved = self._leaf_value(leaf, path, self._fill_expand(leaf, *next(results)))
+                self._backup(path, *resolved)
                 leaf.in_flight = False
                 self.completed_simulations += 1
             remaining -= len(batch)
@@ -381,7 +391,7 @@ class MCTS:
         from ``evaluate`` mapped over the leaves, else it is the M0 default of value
         ``0.0`` and uniform priors. Everything that can fail on what the evaluator
         returned fails here, before any leaf is touched — which is what lets
-        :meth:`run` abandon a batch whole. Values are checked, never coerced.
+        :meth:`run` abandon a batch whole.
 
         Args:
             leaves: The batch's deferred (non-terminal) leaves, in collection order.
@@ -392,8 +402,9 @@ class MCTS:
 
         Raises:
             ValueError: If ``evaluate_batch`` returns the wrong number of results, or a
-                result is not a ``(value, priors)`` pair.
-            TypeError: If a value is not a real number.
+                result is an iterable of the wrong length for a ``(value, priors)`` pair.
+            TypeError: If a value is not a real number, or a result is not iterable.
+            OverflowError: If a value is a real number too large for a float.
         """
         if self.evaluate_batch is None:
             if self.evaluate is None:
@@ -409,12 +420,34 @@ class MCTS:
                 raise ValueError(
                     f"evaluate_batch returned {len(results)} results for {len(leaves)} states"
                 )
-        checked = []
-        for leaf, (value, raw_priors) in zip(leaves, results, strict=True):
-            if not isinstance(value, numbers.Real):
-                raise TypeError(f"evaluated value must be a real number; got {value!r}")
-            checked.append((value, self._priors(leaf.actions, raw_priors)))
-        return checked
+        return [
+            (self._checked(value), self._priors(leaf.actions, raw_priors))
+            for leaf, (value, raw_priors) in zip(leaves, results, strict=True)
+        ]
+
+    @staticmethod
+    def _checked(value: float) -> float:
+        """Return a leaf value unchanged once it is known to back up without failing.
+
+        Backup negates the value and adds it to a float; this is where a value that
+        cannot do that is rejected, while no statistic has been touched yet. The value is
+        checked, never coerced, so what is backed up is exactly what was returned.
+
+        Args:
+            value: A leaf value from the evaluator or from ``terminal_utility``.
+
+        Returns:
+            ``value`` itself.
+
+        Raises:
+            TypeError: If ``value`` is not a ``numbers.Real`` (an array or a tensor is
+                not, even a 0-d one).
+            OverflowError: If ``value`` is too large to be added to a float.
+        """
+        if not isinstance(value, numbers.Real):
+            raise TypeError(f"a leaf value must be a real number; got {value!r}")
+        value + 0.0  # discard-only probe: a huge int or Fraction overflows here
+        return value
 
     def _defer_expand(self, node: _Node) -> None:
         """Reserve a fresh non-terminal leaf for evaluation (the defer half of expansion).
@@ -594,7 +627,7 @@ class MCTS:
                 return None, 0.0
             parent, _ = path[-1]
             ref = parent.to_play
-            return ref, self.game.terminal_utility(leaf.state, ref)
+            return ref, self._checked(self.game.terminal_utility(leaf.state, ref))
         return leaf.to_play, expanded_value
 
     def _backup(self, path, ref_player: PlayerId | None, leaf_value: float) -> None:
