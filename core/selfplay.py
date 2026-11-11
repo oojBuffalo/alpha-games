@@ -62,6 +62,7 @@ import json
 import random
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +299,12 @@ class GameResult:
         tier_counts: Plies played per tier, as ``(tier name, count)`` pairs
             sorted by name; only tiers the game actually played appear, and
             the counts sum to :attr:`plies`.
+        consecutive_mover_transitions: Plies whose mover also made the ply
+            before — a player moving again because the adapter skipped an
+            opponent with no legal action (a blocked skip). Counted over
+            every ply played, so it does not depend on which plies were
+            stored; ``0`` for a strictly alternating game, which includes one
+            whose passes are explicit actions.
     """
 
     samples: tuple[Sample, ...]
@@ -306,6 +313,7 @@ class GameResult:
     utilities: tuple[float, ...]
     sims_run: int = 0
     tier_counts: tuple[tuple[str, int], ...] = ()
+    consecutive_mover_transitions: int = 0
 
     @property
     def plies(self) -> int:
@@ -380,6 +388,10 @@ def play_game(
     subtree it inherited. With playout-cap randomization off there is no fast
     tier and every ply is stored.
 
+    The mover of every ply is recorded before that filter, so the game's
+    consecutive-mover transition count is taken from the complete played
+    sequence — the stored samples alone cannot give it once plies are dropped.
+
     Each search collects up to ``cfg.leaf_batch_size`` leaves per evaluation
     (§6.2 batched parallel selection). ``1`` is the serial search, bit for bit.
     Above ``1`` the trajectory legitimately differs from the serial one —
@@ -422,7 +434,8 @@ def play_game(
 
     Returns:
         The finished :class:`GameResult`, its stored samples already
-        backfilled and its simulation and per-tier ply counts filled.
+        backfilled and its simulation, per-tier ply and consecutive-mover
+        transition counts filled.
     """
     root_noise = None
     if cfg.root_noise:
@@ -433,6 +446,7 @@ def play_game(
 
     samples: list[Sample] = []
     moves: list[Action] = []
+    movers: list[PlayerId] = []
     ply = 0
     sims_run = 0
     tier_counts: dict[str, int] = {}
@@ -442,13 +456,15 @@ def play_game(
         sims_run += tier.sims
         tier_counts[tier.name] = tier_counts.get(tier.name, 0) + 1
         visits = search.action_visit_counts()
+        mover = game.current_player(state)
+        movers.append(mover)
         if tier.stored:  # D12: a fast-tier position is dropped entirely
             samples.append(
                 Sample(
                     planes=game.encode_state(state),
                     sparse_pi=tuple(policy_target(visits)),
                     ply=ply,
-                    mover=game.current_player(state),
+                    mover=mover,
                     model_version=model_version,
                     game_id=game_id,
                     tier=tier.name,
@@ -467,6 +483,7 @@ def play_game(
         utilities=tuple(game.terminal_utility(state, p) for p in range(game.num_players)),
         sims_run=sims_run,
         tier_counts=tuple(sorted(tier_counts.items())),
+        consecutive_mover_transitions=sum(a == b for a, b in pairwise(movers)),
     )
 
 

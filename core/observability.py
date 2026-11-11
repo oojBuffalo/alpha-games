@@ -48,6 +48,14 @@ name and aggregation rule below is frozen, not an implementation detail.
   game put in its shard. With playout-cap randomization off the two are
   equal; with it on, ``positions_stored = moves_full_512 + moves_mid_256``
   and ``positions_played = positions_stored + moves_fast_64``.
+  :data:`SERIES_CONSECUTIVE_MOVER_TRANSITIONS` is written with them, once
+  per game and zero included: the plies of that game whose mover also made
+  the ply before (a blocked skip: the adapter skipped an opponent with no
+  legal action; an explicit pass action alternates and adds none). It is
+  counted over every ply played, before any position is dropped, because
+  the stored samples of a game with dropped plies no longer show it -- two
+  adjacent stored samples sharing a mover may only have lost the ply
+  between them.
 * ``"gauge"`` -- a latest-value observation, never summed: loss components,
   the D5 replay ratio (learner-owned). Only the most recent record in run
   time order matters. :data:`SERIES_ACTOR_AMP_ACTIVE` is the one actor-owned
@@ -138,6 +146,10 @@ SERIES_MOVES_FAST_64 = "moves_fast_64"
 # ones it stored as training samples.
 SERIES_POSITIONS_PLAYED = "positions_played"
 SERIES_POSITIONS_STORED = "positions_stored"
+
+# Plies whose mover also made the previous ply (module docstring), counted
+# over the complete played sequence.
+SERIES_CONSECUTIVE_MOVER_TRANSITIONS = "consecutive_mover_transitions"
 
 RATE_GAMES_PER_HOUR = "games_per_hour"
 RATE_SIMS_PER_SEC = "sims_per_sec"

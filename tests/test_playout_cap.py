@@ -15,6 +15,8 @@ Two layers of ``core.selfplay``:
    each still carrying sparse π + z + aux; the plies below the always-full
    boundary can never be dropped; and the played and stored position counts
    reconcile with the per-tier counts game by game.
+4. The consecutive-mover transition count -- taken from the complete played
+   sequence, so it is the same whichever plies were dropped.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from core.selfplay import Tier, draw_tier, play_game, select_move
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.config import MICRO_CONFIG
 from games.tictactoe import TicTacToe
+from tests.fixtures.pass_game import PassGame, Scenario, consecutive_trap_game
 
 TTT = TicTacToe()
 MICRO = BlokusDuo(config=MICRO_CONFIG)
@@ -397,6 +400,7 @@ def test_pcr_off_is_bit_identical_to_the_fixed_budget_loop(searched, leaf_batch_
     for result in results:
         assert [sample.ply for sample in result.samples] == list(range(result.plies))
         assert result.positions_stored == result.positions_played == result.plies
+        assert result.consecutive_mover_transitions == 0  # Tic-Tac-Toe strictly alternates
 
 
 # ==============================================================================
@@ -564,3 +568,70 @@ def test_played_and_stored_positions_reconcile_with_the_tier_counts_per_game():
         assert result.positions_played == result.plies == result.positions_stored + counts["fast"]
     assert all(result.positions_stored < result.positions_played for result in results)
     assert {name for result in results for name, _ in result.tier_counts} == set(BUDGET)
+
+
+# ==============================================================================
+# 4. The consecutive-mover transition count
+# ==============================================================================
+
+# The mover at each ply of a scripted game with one legal action per state, so
+# the sequence is this one whatever the search does. A player moves again
+# straight after their own move at plies 3, 7 and 8.
+CHAIN_MOVERS = (0, 1, 0, 0, 1, 0, 1, 1, 1, 0)
+CHAIN_TRANSITIONS = 3
+
+
+def _chain_game() -> PassGame:
+    """Build the scripted game whose movers are :data:`CHAIN_MOVERS`.
+
+    Returns:
+        A single-line game: state ``i`` has the one action ``0`` leading to
+        state ``i + 1``, and the state after the last ply is terminal.
+    """
+    plies = len(CHAIN_MOVERS)
+    return PassGame(
+        Scenario(
+            start=0,
+            to_play=dict(enumerate(CHAIN_MOVERS)),
+            edges={state: [(0, state + 1)] for state in range(plies)},
+            terminal={plies: (1.0, -1.0)},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "tiers,stored_pairs",
+    [
+        (None, 3),  # playout-cap randomization off: every ply stored
+        (["mid"] * 8, 3),  # on, nothing dropped
+        (["fast"] * 8, 0),  # only plies 0-1 stored
+        (["mid", "fast"] * 4, 2),  # plies 0, 1, 2, 4, 6, 8 stored
+        (["fast", "mid"] * 4, 1),  # plies 0, 1, 3, 5, 7, 9 stored
+    ],
+    ids=["pcr-off", "all-mid", "all-fast", "mid-fast", "fast-mid"],
+)
+def test_transitions_are_counted_over_the_played_sequence_whatever_was_dropped(tiers, stored_pairs):
+    game = _chain_game()
+    if tiers is None:
+        result = play_game(game, None, fixed_cfg(), GameRNGs.for_actor_game(*D6_GAME))
+    else:
+        result = play_game(game, None, d6_cfg(), _scripted(tiers))
+
+    assert result.plies == len(CHAIN_MOVERS)
+    assert result.consecutive_mover_transitions == CHAIN_TRANSITIONS
+    # The stored samples alone would say something else once plies are dropped:
+    # adjacent stored samples sharing a mover is not a consecutive move.
+    movers = [sample.mover for sample in result.samples]
+    assert sum(a == b for a, b in zip(movers, movers[1:], strict=False)) == stored_pairs
+
+
+def test_a_forced_consecutive_move_is_one_transition():
+    result = play_game(consecutive_trap_game(), None, d6_cfg(), GameRNGs.for_actor_game(*D6_GAME))
+    assert [sample.mover for sample in result.samples] == [0, 0]
+    assert result.consecutive_mover_transitions == 1
+
+
+def test_a_strictly_alternating_game_has_no_transitions():
+    results = _d6_golden_games(1)
+    assert all(result.positions_stored < result.positions_played for result in results)
+    assert [result.consecutive_mover_transitions for result in results] == [0] * len(results)

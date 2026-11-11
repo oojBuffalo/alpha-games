@@ -78,7 +78,11 @@ flushes its per-tier move counts (``moves_full_512`` / ``moves_mid_256`` /
 Every game, in either shape, flushes ``positions_played`` and
 ``positions_stored``: the positions it searched and played, and the ones it
 published. They differ only under playout-cap randomization, where the fast
-tier's positions are dropped (D12).
+tier's positions are dropped (D12). With them goes
+``consecutive_mover_transitions``, the game's count of plies whose mover
+also made the ply before: the actor persists no move sequence, and a shard
+with dropped plies cannot show a blocked skip, so this counter is the only
+durable record of one.
 
 **The shard is published before the metrics are flushed.** A crash between
 the two leaves a durable game that no counter records, so the counters can
@@ -96,6 +100,7 @@ from core.game import Game
 from core.mcts import BatchEvaluator, Evaluator
 from core.metrics import EpochMetricsWriter
 from core.observability import (
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_MOVES_FAST_64,
     SERIES_MOVES_FULL_512,
@@ -275,9 +280,10 @@ class ActorDriver:
             stops as soon as either says to.
         metrics_writer: Optional. When given, every finished game flushes
             ``games_completed`` / ``sims_run`` / ``positions_evaluated``
-            deltas to it, the played and stored position counts, and the
-            per-tier move counts under playout-cap randomization (module
-            docstring). ``None`` (the default) disables
+            deltas to it, the played and stored position counts, the
+            consecutive-mover transition count, and the per-tier move counts
+            under playout-cap randomization (module docstring). ``None`` (the
+            default) disables
             all metrics flushing — backward compatible with every existing
             caller.
         position_counter: Optional. Drained once per game to populate the
@@ -447,12 +453,14 @@ class ActorDriver:
         ``result.sims_run``, the exact sum of the budgets the game's plies
         were searched at. ``positions_played`` and ``positions_stored`` are
         the game's played and stored position counts, the second exactly the
-        number of samples its shard holds. Each playout-cap tier the game
-        played adds its ply count under that tier's series; a validate-tier
-        game played none, so it writes none. ``positions_evaluated`` is
-        drained from ``position_counter`` and omitted entirely when none was
-        supplied -- never a fabricated zero. The inference-batch deltas are drained from
-        ``batch_counter`` under the same rule.
+        number of samples its shard holds; ``consecutive_mover_transitions``
+        is ``result.consecutive_mover_transitions``, written even when zero.
+        Each playout-cap tier the game played adds its ply count under that
+        tier's series; a validate-tier game played none, so it writes none.
+        ``positions_evaluated`` is drained from ``position_counter`` and
+        omitted entirely when none was supplied -- never a fabricated zero.
+        The inference-batch deltas are drained from ``batch_counter`` under
+        the same rule.
 
         Args:
             result: The just-finished game.
@@ -467,6 +475,13 @@ class ActorDriver:
         )
         self.metrics_writer.append(
             delta_record(SERIES_POSITIONS_STORED, result.positions_stored, timestamp=now)
+        )
+        self.metrics_writer.append(
+            delta_record(
+                SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
+                result.consecutive_mover_transitions,
+                timestamp=now,
+            )
         )
         tier_counts = dict(result.tier_counts)
         for tier, series in _TIER_SERIES.items():

@@ -30,6 +30,7 @@ from core.actor import (
 )
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.observability import (
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_MOVES_FAST_64,
@@ -50,6 +51,7 @@ from core.runconfig import load_run_config
 from core.seeding import GameRNGs
 from core.selfplay import play_game
 from games.tictactoe import TicTacToe
+from tests.fixtures.pass_game import PassGame, Scenario
 
 TTT = TicTacToe()
 ROOT = Path(__file__).resolve().parent.parent
@@ -741,12 +743,15 @@ def test_a_validate_tier_actor_writes_no_tier_series(tmp_path):
         SERIES_SIMS_RUN,
         SERIES_POSITIONS_PLAYED,
         SERIES_POSITIONS_STORED,
+        SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     }
     # ...so the acceptance checklist of such a run must never require them.
     assert not set(TIER_SERIES.values()) & set(_REQUIRED_POSITIVE_SERIES)
     assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [p * 128 for p in plies]
     assert [v for s, v in flushed if s == SERIES_POSITIONS_PLAYED] == plies
     assert [v for s, v in flushed if s == SERIES_POSITIONS_STORED] == plies
+    # Tic-Tac-Toe strictly alternates: a zero is written, not left out.
+    assert [v for s, v in flushed if s == SERIES_CONSECUTIVE_MOVER_TRANSITIONS] == [0, 0]
 
 
 # --- the D12 drop: only stored positions are published, and both are counted ---
@@ -807,3 +812,47 @@ def test_a_d6_actor_publishes_exactly_the_stored_positions_and_counts_them(tmp_p
     )
     # An M3 run carries neither, so its checklist must never require them.
     assert not {SERIES_POSITIONS_PLAYED, SERIES_POSITIONS_STORED} & set(_REQUIRED_POSITIVE_SERIES)
+
+
+# --- the consecutive-mover transition count survives the drop -----------------
+
+
+def test_a_d6_actor_flushes_the_transitions_its_dropped_plies_would_hide(tmp_path):
+    """The count comes from the played sequence; the shard no longer holds it."""
+    # One legal action per state, so every game is this mover sequence: a
+    # player moves again straight after their own move at plies 3, 7 and 8.
+    movers = (0, 1, 0, 0, 1, 0, 1, 1, 1, 0)
+    chain = PassGame(
+        Scenario(
+            start=0,
+            to_play=dict(enumerate(movers)),
+            edges={state: [(0, state + 1)] for state in range(len(movers))},
+            terminal={len(movers): (1.0, -1.0)},
+        )
+    )
+    games = 4
+    paths = ActorDriver(
+        game=chain,
+        self_play=d6_cfg(),
+        run_id="run",
+        actor_id=0,
+        out_dir=tmp_path / "shards",
+        run_seed=5,
+        refresh=refresh_sequence([1] * games),
+        max_games=games,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+
+    flushed = _series_values(tmp_path)
+    assert [v for s, v in flushed if s == SERIES_CONSECUTIVE_MOVER_TRANSITIONS] == [3] * games
+    assert reduce_run(tmp_path).totals[SERIES_CONSECUTIVE_MOVER_TRANSITIONS] == 3 * games
+    assert SERIES_CONSECUTIVE_MOVER_TRANSITIONS not in _REQUIRED_POSITIVE_SERIES
+
+    # The shards cannot stand in for it: with plies dropped, adjacent stored
+    # samples sharing a mover no longer count consecutive moves.
+    stored_pairs = []
+    for path in paths:
+        stored = [record.mover for record in read_shard(path, chain).records]
+        assert len(stored) < len(movers)
+        stored_pairs.append(sum(a == b for a, b in zip(stored, stored[1:], strict=False)))
+    assert stored_pairs != [3] * games
