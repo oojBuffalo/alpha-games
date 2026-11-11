@@ -675,23 +675,32 @@ class LaunchedRun:
     ) -> None:
         """Block until the run ends, then shut it down.
 
-        The run ends when every process has exited on its own, when the
-        caller is interrupted (``KeyboardInterrupt``), or -- with
-        :attr:`spike_games` set -- when the run-wide completed-game total
-        reaches that target or can no longer reach it. The target is checked
-        by this, the orchestrating process, against the run's durable metrics
+        The run ends when every process has exited on its own, or when the
+        caller is interrupted (``KeyboardInterrupt``). With
+        :attr:`spike_games` set it also ends when the run-wide completed-game
+        total reaches that target, or when the total is below it and either
+        every actor or the learner is gone. The target is checked by this,
+        the orchestrating process, against the run's durable metrics
         (:meth:`games_completed`); no child is told about it. On reaching it
         one ``spike_stop`` record (``core.observability.spike_stop_record``)
         is appended before the shutdown it triggers.
 
-        Each poll reads the actors' liveness first and the total second.
+        Each poll reads every process's liveness first and the total second.
         Only actors complete games, so a total read after every actor was
         seen gone is final: at or above the target the stop is recorded, even
-        if the last game landed as its actor exited; below it the target is
-        out of reach (every actor hit its own cap, or died) and the run is
-        shut down with **no** ``spike_stop`` -- the record's absence is the
-        durable sign the target was not reached. :meth:`shutdown` always
-        runs.
+        if the last game landed as its actor exited. Below the target, two
+        states end the run with **no** ``spike_stop`` -- the record's absence
+        is the durable sign the target was not reached:
+
+        - every actor is gone (each at its own cap, or dead): no game can
+          complete;
+        - the learner is gone (its own cap, or dead): what remains is not
+          the actor-and-learner loop the target bounds, and actors a
+          departed learner left paced at hold would wait forever.
+
+        Nothing else is detected: a run whose processes are all alive but
+        completing no games is polled until interrupted. :meth:`shutdown`
+        always runs.
 
         With :attr:`spike_games` unset this reads no metrics and writes no
         record of its own.
@@ -709,6 +718,7 @@ class LaunchedRun:
         try:
             while True:
                 actors_alive = any(actor.is_alive() for actor in self.actors.values())
+                learner_alive = self.learner.is_alive()
                 if self.spike_games is not None:
                     completed = self.games_completed()
                     if completed >= self.spike_games:
@@ -716,9 +726,9 @@ class LaunchedRun:
                             spike_stop_record(target=self.spike_games, games_completed=completed)
                         )
                         break
-                    if not actors_alive:
+                    if not (actors_alive and learner_alive):
                         break
-                if not (actors_alive or self.learner.is_alive()):
+                if not (actors_alive or learner_alive):
                     break
                 time.sleep(poll_interval)
         except KeyboardInterrupt:

@@ -854,7 +854,10 @@ def _orchestrator_kinds(run_dir):
     return [rec["kind"] for rec in iter_epoch_records(run_dir, "orchestrator")]
 
 
-def test_wait_records_one_spike_stop_when_the_run_wide_total_reaches_the_target(tmp_path):
+def test_wait_records_one_spike_stop_when_the_run_wide_total_reaches_the_target(
+    tmp_path, monkeypatch
+):
+    _bound_polls(monkeypatch)
     _write_completed_games(tmp_path, [2, 1])  # 3 run-wide: no single actor reaches 3
     launched = _exited_run(tmp_path, spike_games=3)
     assert launched.games_completed() == 3
@@ -868,13 +871,15 @@ def test_wait_records_one_spike_stop_when_the_run_wide_total_reaches_the_target(
     assert stop["timestamp"] <= records[1]["timestamp"]
 
 
-def test_wait_below_the_spike_target_records_no_stop(tmp_path):
+def test_wait_below_the_spike_target_records_no_stop(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
     _write_completed_games(tmp_path, [1, 1])
     _exited_run(tmp_path, spike_games=3).wait(poll_interval=0.0)
     assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
 
 
-def test_wait_without_a_spike_target_records_no_stop(tmp_path):
+def test_wait_without_a_spike_target_records_no_stop(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
     _write_completed_games(tmp_path, [5, 5])
     _exited_run(tmp_path).wait(poll_interval=0.0)
     assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
@@ -916,7 +921,11 @@ class _HeldProcess:
 
 
 def _bound_polls(monkeypatch, limit=20):
-    """Make a ``wait`` that keeps polling fail, instead of spinning forever."""
+    """Make a ``wait`` that keeps polling fail, instead of spinning forever.
+
+    Returns:
+        The list every poll's sleep is appended to.
+    """
     polls = []
 
     def sleep(seconds):
@@ -925,6 +934,7 @@ def _bound_polls(monkeypatch, limit=20):
             raise AssertionError(f"wait() was still polling after {limit} polls")
 
     monkeypatch.setattr(ipc.time, "sleep", sleep)
+    return polls
 
 
 def test_wait_ends_a_run_whose_actors_have_all_exited_below_the_target(tmp_path, monkeypatch):
@@ -945,6 +955,61 @@ def test_wait_ends_a_run_whose_actors_have_all_exited_below_the_target(tmp_path,
     kinds = _orchestrator_kinds(tmp_path)
     assert KIND_SPIKE_STOP not in kinds  # its absence is the sign the target was not reached
     assert kinds[-1] == KIND_SEGMENT_END
+
+
+def test_wait_ends_a_spike_run_whose_learner_has_exited_below_the_target(tmp_path, monkeypatch):
+    """Without its learner the run is not the loop the target bounds: stop, record no stop.
+
+    The actors here are alive and would wait forever on a pacing file a
+    departed learner left at hold.
+    """
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1, 1])
+    actors = [_HeldProcess(), _HeldProcess()]
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors=dict(enumerate(actors)),
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=3,
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=1.0)
+
+    assert [actor.calls[0] for actor in actors] == ["terminate", "terminate"]
+    kinds = _orchestrator_kinds(tmp_path)
+    assert KIND_SPIKE_STOP not in kinds
+    assert kinds[-1] == KIND_SEGMENT_END
+
+
+class _ExpiringProcess(_ExitedProcess):
+    """A stand-in child that is alive for its first ``alive_for`` liveness reads."""
+
+    def __init__(self, alive_for):
+        self.alive_for = alive_for
+
+    def is_alive(self):
+        self.alive_for -= 1
+        return self.alive_for >= 0
+
+
+@pytest.mark.parametrize("survivor", ["learner", "actor"])
+def test_wait_without_a_spike_target_polls_until_the_last_process_has_exited(
+    tmp_path, monkeypatch, survivor
+):
+    """With no target, neither side's exit ends the wait while the other is alive."""
+    polls = _bound_polls(monkeypatch)
+    learner = _ExpiringProcess(3) if survivor == "learner" else _ExitedProcess()
+    actor = _ExpiringProcess(3) if survivor == "actor" else _ExitedProcess()
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=learner,
+        actors={0: actor},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    launched.wait(poll_interval=0.0)
+
+    assert len(polls) == 3  # one per poll that still saw the survivor alive
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
 
 
 class _FinishingProcess(_ExitedProcess):
@@ -1004,7 +1069,7 @@ def test_wait_shuts_the_run_down_when_interrupted(tmp_path, monkeypatch):
 def test_a_grace_period_that_is_not_finite_and_non_negative_is_refused_before_any_signal(
     tmp_path, monkeypatch, method, grace
 ):
-    _bound_polls(monkeypatch)
+    polls = _bound_polls(monkeypatch)
     held = _HeldProcess()
     launched = ipc.LaunchedRun(
         ctx=None,
@@ -1017,6 +1082,7 @@ def test_a_grace_period_that_is_not_finite_and_non_negative_is_refused_before_an
             launched.wait(poll_interval=0.0, shutdown_grace=grace)
         else:
             launched.shutdown(grace)
+    assert polls == []  # refused before the first poll, not after the run's whole course
     assert held.calls == []  # nothing signaled, nothing killed
     assert not (tmp_path / "metrics").exists() or _orchestrator_kinds(tmp_path) == []
 
