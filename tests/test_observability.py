@@ -38,6 +38,7 @@ from core.observability import (
     KIND_GAUGE,
     KIND_SEGMENT_END,
     KIND_SEGMENT_START,
+    KIND_SHUTDOWN_FORCED,
     KIND_SPIKE_STOP,
     KIND_TOTAL,
     SERIES_INFERENCE_BATCHES,
@@ -53,6 +54,7 @@ from core.observability import (
     reduce_run,
     segment_end_record,
     segment_start_record,
+    shutdown_forced_record,
     spike_stop_record,
     total_record,
 )
@@ -114,6 +116,37 @@ def test_spike_stop_record_carries_the_target_and_the_observed_total():
     assert rec == {"kind": KIND_SPIKE_STOP, "target": 6, "games_completed": 7, "timestamp": 3.0}
     before = time.time()
     assert spike_stop_record(target=1, games_completed=1)["timestamp"] >= before
+
+
+def test_shutdown_forced_record_names_the_escalated_process():
+    rec = shutdown_forced_record(process="actor-2", pid=4242, timestamp=5.0)
+    assert rec == {
+        "kind": KIND_SHUTDOWN_FORCED,
+        "process": "actor-2",
+        "pid": 4242,
+        "timestamp": 5.0,
+    }
+    before = time.time()
+    assert shutdown_forced_record(process="learner", pid=1)["timestamp"] >= before
+
+
+def test_reduce_run_ignores_the_orchestrator_marker_records(tmp_path):
+    orch = EpochMetricsWriter(tmp_path, "orchestrator")
+    orch.append(segment_start_record(device="cpu", timestamp=0.0))
+    orch.append(spike_stop_record(target=6, games_completed=6, timestamp=1800.0))
+    orch.append(shutdown_forced_record(process="actor-0", pid=1, timestamp=3000.0))
+    orch.append(segment_end_record(timestamp=3600.0))
+
+    result = reduce_run(tmp_path)
+
+    assert result.gpu_hours == 1.0
+    assert result.totals == {
+        "games_completed": 0.0,
+        "positions_evaluated": 0.0,
+        "sims_run": 0.0,
+        "learner_step": 0.0,
+    }
+    assert result.gauges == {} and result.checkpoints == {}
 
 
 def test_records_round_trip_through_an_epoch_writer(tmp_path):

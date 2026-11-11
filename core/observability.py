@@ -79,6 +79,12 @@ name and aggregation rule below is frozen, not an implementation detail.
   ``games_completed`` is the total observed at the stop: a signaled actor
   still finishes its in-flight game, and the run's final total may be higher.
   :func:`reduce_run` ignores it, like every kind it does not name.
+* ``"shutdown_forced"`` -- the orchestrator's record that a child outlived
+  the shutdown grace period and was killed (:func:`shutdown_forced_record`;
+  ``core.ipc.LaunchedRun.shutdown``), one per killed process. A killed child
+  ran no clean path -- an in-flight game or step was lost, its last flush
+  may be missing -- so a run directory carrying one says its own evidence
+  may be incomplete. :func:`reduce_run` ignores it too.
 
 Every record additionally carries a ``timestamp`` (``time.time()``,
 informational for equality purposes elsewhere but load-bearing for the
@@ -112,6 +118,7 @@ KIND_TOTAL = "total"
 KIND_SEGMENT_START = "segment_start"
 KIND_SEGMENT_END = "segment_end"
 KIND_SPIKE_STOP = "spike_stop"
+KIND_SHUTDOWN_FORCED = "shutdown_forced"
 
 # Owned by core.learner (issue #60); defined here so both core.learner (the
 # writer) and this module (the reducer) share one literal with no drift.
@@ -304,6 +311,27 @@ def spike_stop_record(
         "kind": KIND_SPIKE_STOP,
         "target": target,
         "games_completed": games_completed,
+        "timestamp": timestamp if timestamp is not None else time.time(),
+    }
+
+
+def shutdown_forced_record(
+    *, process: str, pid: int | None, timestamp: float | None = None
+) -> dict[str, Any]:
+    """Build the orchestrator's record of one child killed at shutdown.
+
+    Args:
+        process: The killed process's name (``"learner"``, ``"actor-<id>"``).
+        pid: Its OS process id.
+        timestamp: Wall-clock seconds. Defaults to ``time.time()``.
+
+    Returns:
+        ``{"kind": "shutdown_forced", "process", "pid", "timestamp"}``.
+    """
+    return {
+        "kind": KIND_SHUTDOWN_FORCED,
+        "process": process,
+        "pid": pid,
         "timestamp": timestamp if timestamp is not None else time.time(),
     }
 

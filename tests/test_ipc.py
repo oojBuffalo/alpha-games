@@ -26,6 +26,7 @@ import dataclasses
 import os
 import signal
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +60,7 @@ from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
 from core.observability import (
     KIND_SEGMENT_END,
+    KIND_SHUTDOWN_FORCED,
     KIND_SPIKE_STOP,
     SERIES_ACTOR_AMP_ACTIVE,
     SERIES_GAMES_COMPLETED,
@@ -897,3 +899,176 @@ def test_launch_run_refuses_a_non_positive_spike_target_before_starting_anything
             spike_games=spike_games,
         )
     assert not (tmp_path / "run").exists()  # no segment opened, no process started
+
+
+# ==============================================================================
+# 7. LaunchedRun.shutdown: every child gone before the GPU-hour segment closes
+# ==============================================================================
+
+
+def _lingering_child(ready_path, exit_path, linger):
+    """A child that, once signaled, takes ``linger`` seconds to finish and exit.
+
+    Stands in for an actor finishing its in-flight game. Module-level, so it
+    is a valid spawn-context target.
+
+    Args:
+        ready_path: Touched once the signal handler is installed.
+        exit_path: Written with ``time.time()`` as the child's last act.
+        linger: Seconds of work left to do after the signal.
+    """
+    stop = ShutdownFlag().install()
+    Path(ready_path).touch()
+    deadline = time.monotonic() + 60.0  # never outlive a failed test
+    while not stop() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(linger)
+    Path(exit_path).write_text(repr(time.time()))
+
+
+def _stubborn_child(ready_path):
+    """A child that ignores SIGTERM: only SIGKILL (or its own bound) ends it.
+
+    Args:
+        ready_path: Touched once SIGTERM is being ignored.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    Path(ready_path).touch()
+    time.sleep(60.0)  # never outlive a failed test
+
+
+def _start_double(ctx, target, name, tmp_path, *args):
+    """Start one child double and wait until it reports its handler installed."""
+    ready = tmp_path / f"{name}.ready"
+    process = ctx.Process(target=target, args=(str(ready), *args), name=name)
+    process.start()
+    assert _wait_until(ready.exists, timeout=60.0, interval=0.01), f"{name} never started"
+    return process
+
+
+class _LivenessSpyWriter(EpochMetricsWriter):
+    """An orchestrator writer that notes which children are alive at each append."""
+
+    def __init__(self, run_dir):
+        super().__init__(run_dir, "orchestrator")
+        self.processes = ()
+        self.alive_at_append = []
+
+    def append(self, record):
+        alive = sorted(p.name for p in self.processes if p.is_alive())
+        self.alive_at_append.append((record["kind"], alive))
+        super().append(record)
+
+
+def _launched_doubles(tmp_path, learner, actors):
+    """Wrap already-started child doubles in a :class:`~core.ipc.LaunchedRun`."""
+    writer = _LivenessSpyWriter(tmp_path / "run")
+    launched = ipc.LaunchedRun(
+        ctx=ipc.new_spawn_context(), learner=learner, actors=actors, metrics_writer=writer
+    )
+    writer.processes = launched.all_processes()
+    return launched, writer
+
+
+def _kill_leftovers(processes):
+    """Never leave a child double behind, whatever the test concluded."""
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+            process.join(10.0)
+
+
+def test_shutdown_closes_the_segment_only_after_the_last_child_has_exited(tmp_path):
+    ctx = ipc.new_spawn_context()
+    last_exit = tmp_path / "actor-0.exit"
+    learner = _start_double(ctx, _lingering_child, "learner", tmp_path, str(tmp_path / "l"), 0.0)
+    actor = _start_double(ctx, _lingering_child, "actor-0", tmp_path, str(last_exit), 1.0)
+    launched, writer = _launched_doubles(tmp_path, learner, {0: actor})
+    try:
+        launched.shutdown(timeout=60.0)
+
+        assert [p.exitcode for p in launched.all_processes()] == [0, 0]  # nobody was killed
+        (end,) = iter_epoch_records(tmp_path / "run", "orchestrator")
+        assert end["kind"] == KIND_SEGMENT_END
+        assert writer.alive_at_append == [(KIND_SEGMENT_END, [])]
+        assert end["timestamp"] >= float(last_exit.read_text())  # after its in-flight work
+    finally:
+        _kill_leftovers(launched.all_processes())
+
+
+def test_shutdown_escalates_a_child_that_outlives_the_grace_period_and_records_it(tmp_path):
+    ctx = ipc.new_spawn_context()
+    learner = _start_double(ctx, _lingering_child, "learner", tmp_path, str(tmp_path / "l"), 0.0)
+    stubborn = _start_double(ctx, _stubborn_child, "actor-7", tmp_path)
+    launched, writer = _launched_doubles(tmp_path, learner, {7: stubborn})
+    try:
+        started = time.monotonic()
+        launched.shutdown(timeout=0.5)
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 0.5  # the grace period was given before escalating
+        assert not any(p.is_alive() for p in launched.all_processes())  # returns with all gone
+        assert learner.exitcode == 0
+        assert stubborn.exitcode == -signal.SIGKILL
+        forced, end = iter_epoch_records(tmp_path / "run", "orchestrator")
+        assert forced == {
+            "kind": KIND_SHUTDOWN_FORCED,
+            "process": "actor-7",
+            "pid": stubborn.pid,
+            "timestamp": forced["timestamp"],
+        }
+        assert end["kind"] == KIND_SEGMENT_END
+        assert forced["timestamp"] <= end["timestamp"]
+        # Neither record was written while the stubborn child was still alive.
+        assert writer.alive_at_append == [(KIND_SHUTDOWN_FORCED, []), (KIND_SEGMENT_END, [])]
+    finally:
+        _kill_leftovers(launched.all_processes())
+
+
+class _HeldProcess:
+    """A stand-in handle that stays alive through any signal or join until killed."""
+
+    name = "actor-0"
+    pid = 4242
+
+    def __init__(self):
+        self.alive = True
+        self.calls = []
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def join(self, timeout=None):
+        self.calls.append(("join", timeout))
+
+    def kill(self):
+        self.calls.append("kill")
+        self.alive = False
+
+
+def test_wait_gives_shutdown_its_grace_period_as_one_deadline(tmp_path):
+    held = [_HeldProcess(), _HeldProcess()]
+    _write_completed_games(tmp_path, [1])
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors=dict(enumerate(held)),
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=1,
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=5.0)
+
+    for process in held:
+        terminate, (_, grace), kill, final_join = process.calls
+        assert (terminate, kill, final_join) == ("terminate", "kill", ("join", None))
+        assert 0.0 <= grace <= 5.0  # the caller's grace, not the default
+    assert held[0].calls[1][1] > 4.0  # the first join gets (nearly) all of it
+    assert _orchestrator_kinds(tmp_path) == [
+        KIND_SPIKE_STOP,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SEGMENT_END,
+    ]

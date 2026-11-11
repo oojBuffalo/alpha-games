@@ -75,8 +75,12 @@ backward-compatible, default-``None``-preserving extensions):
    rather than assuming a caller always seeds the window first.
 
 ``LaunchedRun.shutdown`` sends ``SIGTERM`` (``Process.terminate()``) to every
-live process and joins them -- never ``SIGKILL``, so every process always
-runs its own clean path.
+live process and waits for all of them, under one grace period sized for a
+whole in-flight game (:data:`DEFAULT_SHUTDOWN_GRACE_SECONDS`), so every
+process normally runs its own clean path. A child still alive when the grace
+period ends is killed (``SIGKILL``) and a ``shutdown_forced`` record names
+it; ``segment_end`` is written only once no child is alive, so the GPU-hour
+segment never closes over a process that still holds the device.
 
 **GPU memory envelope (documented, not engineered around -- issue #61's own
 constraint).** The D5 trunk is 8 residual blocks × 128 channels; the
@@ -127,6 +131,7 @@ from core.observability import (
     reduce_run,
     segment_end_record,
     segment_start_record,
+    shutdown_forced_record,
     spike_stop_record,
 )
 from core.runconfig import RunConfig, SelfPlayConfig
@@ -142,6 +147,13 @@ GameFactory = Callable[[], Game]
 # what LaunchedRun.shutdown sends; SIGINT covers Ctrl-C on a single process
 # run directly (e.g. under a future #63 CLI, or by hand in development).
 _DEFAULT_SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
+
+# How long LaunchedRun.shutdown waits, after signaling, before it kills a
+# child. An actor polls for stop only between games, so the wait has to cover
+# a whole in-flight game: ten minutes is several times the slowest full-game
+# time on record (128.8 s for an evaluation game at 512 sims on CPU,
+# docs/bench/m4-exit-bench.md).
+DEFAULT_SHUTDOWN_GRACE_SECONDS = 600.0
 
 
 def _leaf_count(game: Game, states: Sequence[Any]) -> int:
@@ -639,7 +651,11 @@ class LaunchedRun:
         # a long run.
         return int(reduce_run(self.metrics_writer.run_dir).totals[SERIES_GAMES_COMPLETED])
 
-    def wait(self, poll_interval: float = 1.0) -> None:
+    def wait(
+        self,
+        poll_interval: float = 1.0,
+        shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
+    ) -> None:
         """Block until the run ends, then shut it down.
 
         The run ends when every process has exited on its own, when the
@@ -659,6 +675,7 @@ class LaunchedRun:
         Args:
             poll_interval: Seconds between polls of the target and of process
                 liveness.
+            shutdown_grace: The grace period :meth:`shutdown` is given.
         """
         try:
             while True:
@@ -675,37 +692,64 @@ class LaunchedRun:
         except KeyboardInterrupt:
             pass
         finally:
-            self.shutdown()
+            self.shutdown(shutdown_grace)
 
-    def shutdown(self, timeout: float = 30.0) -> None:
-        """Send SIGTERM to every live process, join them, and close the GPU-hour segment.
+    def shutdown(self, timeout: float = DEFAULT_SHUTDOWN_GRACE_SECONDS) -> None:
+        """Stop every process, wait until all are gone, then close the GPU-hour segment.
 
-        ``Process.terminate()`` sends ``SIGTERM`` (never ``SIGKILL``) --
-        exactly the signal :class:`ShutdownFlag` catches, so every process
-        runs its own clean-shutdown path (module docstring) rather than
-        being killed mid-write. Every process is signaled before any join,
-        so they shut down concurrently rather than one at a time.
+        ``Process.terminate()`` sends ``SIGTERM`` -- exactly the signal
+        :class:`ShutdownFlag` catches, so every process runs its own
+        clean-shutdown path (module docstring) rather than being killed
+        mid-write. Every process is signaled before any join, so they shut
+        down concurrently, under one shared grace period.
 
-        The ``segment_end`` record (issue #62) is appended last, after every
-        process has been joined (or timed out) -- it marks the orchestrator's
-        own single-counted GPU-hour segment as complete, so it should not be
-        written while a process this run started might still be using the
-        device. A run whose ``shutdown`` is never called (or that crashes
-        first) simply never closes its segment -- ``core.observability
+        Postconditions, in order:
+
+        1. **A child that outlives the grace period is killed, and that is
+           recorded.** It gets ``SIGKILL`` and is joined without a timeout,
+           and one ``shutdown_forced`` record
+           (``core.observability.shutdown_forced_record``) names it. A killed
+           child ran no clean path, so the record is how the run directory
+           says its evidence may be incomplete.
+        2. **``segment_end`` is never written while any child is alive.** It
+           is appended last, after every join above, and it marks the
+           orchestrator's single-counted GPU-hour segment (issue #62) as
+           complete -- which it is not while a process this run started
+           still holds the device.
+        3. **This returns only when every child is gone.**
+
+        An exception raised while waiting (a second ``KeyboardInterrupt``)
+        propagates with the segment left open, never closed over a live
+        child. A run whose ``shutdown`` is never called (or that crashes
+        first) likewise never closes its segment -- ``core.observability
         .reduce_run``'s documented, conservative "an unterminated segment
         contributes zero" rule, not a special case here.
 
+        A child signaled while already exiting on its own reports
+        ``-SIGTERM`` as its exit code rather than ``0``: the interpreter
+        restores the default handler early in its teardown. Its work was
+        complete, it is gone, and it is not an escalation.
+
         Args:
-            timeout: Seconds to wait for each process to exit on its own
-                after being signaled. A process that outlives its timeout is
-                left running, not force-killed -- a caller wanting a hard
-                stop calls ``process.kill()`` itself.
+            timeout: The grace period, in seconds, shared by every process:
+                how long after the signal a child may still be finishing
+                before it is killed. An actor finishes its in-flight game
+                first, so this must cover a whole game.
         """
-        for process in self.all_processes():
+        processes = self.all_processes()
+        for process in processes:
             if process.is_alive():
                 process.terminate()
-        for process in self.all_processes():
-            process.join(timeout)
+        deadline = time.monotonic() + timeout
+        for process in processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+                process.join()
+                self.metrics_writer.append(
+                    shutdown_forced_record(process=process.name, pid=process.pid)
+                )
         self.metrics_writer.append(segment_end_record())
 
 

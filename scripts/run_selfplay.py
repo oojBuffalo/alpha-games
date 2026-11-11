@@ -47,7 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.acceptance import verify_acceptance  # noqa: E402
-from core.ipc import LaunchedRun, launch_run  # noqa: E402
+from core.ipc import DEFAULT_SHUTDOWN_GRACE_SECONDS, LaunchedRun, launch_run  # noqa: E402
 from core.network import NetworkConfig  # noqa: E402
 from core.run_identity import (  # noqa: E402
     ENTRY_CONDITION,
@@ -124,7 +124,9 @@ def _launch(
 
 
 def wait_for_completion(
-    launched: LaunchedRun, poll_interval: float = DEFAULT_WAIT_POLL_INTERVAL
+    launched: LaunchedRun,
+    poll_interval: float = DEFAULT_WAIT_POLL_INTERVAL,
+    shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
 ) -> None:
     """Block until the run ends, or until interrupted, then shut down.
 
@@ -134,14 +136,18 @@ def wait_for_completion(
     run launched with ``--spike-games`` is stopped once its run-wide
     completed-game total reaches that target. Either way,
     :meth:`~core.ipc.LaunchedRun.shutdown` always runs -- signaling every
-    process (a no-op for one already dead) and closing the GPU-hour segment.
-    All of it is :meth:`~core.ipc.LaunchedRun.wait`.
+    process (a no-op for one already dead), waiting until all are gone
+    (killing, and recording, any that outlive the grace period) and only then
+    closing the GPU-hour segment. All of it is
+    :meth:`~core.ipc.LaunchedRun.wait`.
 
     Args:
         launched: The live run to wait on.
         poll_interval: Seconds between polls.
+        shutdown_grace: Seconds a signaled process may take to finish its
+            in-flight game or step before it is killed.
     """
-    launched.wait(poll_interval)
+    launched.wait(poll_interval, shutdown_grace)
 
 
 def cmd_launch(
@@ -153,6 +159,7 @@ def cmd_launch(
     now: float | None = None,
     network_config: NetworkConfig | None = None,
     spike_games: int | None = None,
+    shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
 ) -> LaunchedRun:
     """Launch a brand-new run from a config file.
 
@@ -170,6 +177,8 @@ def cmd_launch(
         now: Launch timestamp override, for deterministic run ids in tests.
         network_config: See :func:`_launch`. Not exposed as a CLI flag.
         spike_games: See :func:`_launch`; ``None`` in production.
+        shutdown_grace_seconds: See :func:`wait_for_completion`; used only
+            when ``block`` is true.
 
     Returns:
         The live run.
@@ -192,7 +201,7 @@ def cmd_launch(
         spike_games=spike_games,
     )
     if block:
-        wait_for_completion(launched)
+        wait_for_completion(launched, shutdown_grace=shutdown_grace_seconds)
     return launched
 
 
@@ -205,6 +214,7 @@ def cmd_resume(
     block: bool = True,
     network_config: NetworkConfig | None = None,
     spike_games: int | None = None,
+    shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
 ) -> LaunchedRun:
     """Resume an existing run directory.
 
@@ -222,6 +232,8 @@ def cmd_resume(
         block: See :func:`cmd_launch`.
         network_config: See :func:`_launch`. Not exposed as a CLI flag.
         spike_games: See :func:`_launch`; ``None`` in production.
+        shutdown_grace_seconds: See :func:`wait_for_completion`; used only
+            when ``block`` is true.
 
     Returns:
         The live run.
@@ -244,7 +256,7 @@ def cmd_resume(
         spike_games=spike_games,
     )
     if block:
-        wait_for_completion(launched)
+        wait_for_completion(launched, shutdown_grace=shutdown_grace_seconds)
     return launched
 
 
@@ -258,6 +270,7 @@ def cmd_fork(
     now: float | None = None,
     network_config: NetworkConfig | None = None,
     spike_games: int | None = None,
+    shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
 ) -> LaunchedRun:
     """Fork a brand-new run identity from an existing run directory.
 
@@ -277,6 +290,8 @@ def cmd_fork(
         now: Fork timestamp override, for deterministic run ids in tests.
         network_config: See :func:`_launch`. Not exposed as a CLI flag.
         spike_games: See :func:`_launch`; ``None`` in production.
+        shutdown_grace_seconds: See :func:`wait_for_completion`; used only
+            when ``block`` is true.
 
     Returns:
         The live run.
@@ -303,7 +318,7 @@ def cmd_fork(
         spike_games=spike_games,
     )
     if block:
-        wait_for_completion(launched)
+        wait_for_completion(launched, shutdown_grace=shutdown_grace_seconds)
     return launched
 
 
@@ -380,6 +395,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shutdown-grace-seconds",
+        type=float,
+        default=DEFAULT_SHUTDOWN_GRACE_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "how long a signaled process may take to finish its in-flight game or "
+            "step before it is killed and the kill recorded (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--no-block",
         action="store_true",
         help="return immediately after starting processes, without waiting (test-facing)",
@@ -416,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_learner_steps=args.max_learner_steps,
                 block=block,
                 spike_games=args.spike_games,
+                shutdown_grace_seconds=args.shutdown_grace_seconds,
             )
         elif args.fork_from is not None:
             cmd_fork(
@@ -425,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_learner_steps=args.max_learner_steps,
                 block=block,
                 spike_games=args.spike_games,
+                shutdown_grace_seconds=args.shutdown_grace_seconds,
             )
         else:
             cmd_launch(
@@ -433,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_learner_steps=args.max_learner_steps,
                 block=block,
                 spike_games=args.spike_games,
+                shutdown_grace_seconds=args.shutdown_grace_seconds,
             )
     except MaterialConfigDiffError as exc:
         print(f"error: {exc}", file=sys.stderr)

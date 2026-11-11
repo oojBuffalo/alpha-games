@@ -44,7 +44,7 @@ import torch
 
 from core.actor import ActorDriver
 from core.checkpoint import load_checkpoint, resume_path
-from core.ipc import build_actor_refresh
+from core.ipc import DEFAULT_SHUTDOWN_GRACE_SECONDS, build_actor_refresh
 from core.learner import LearnerDriver
 from core.metrics import iter_epoch_records
 from core.network import NetworkConfig
@@ -470,11 +470,19 @@ def test_spike_games_stops_the_whole_run_and_records_the_stop(tmp_path):
     # the total observed at the stop; neither is below the target.
     assert 6 <= stop["games_completed"] <= total < 2 * backstop
     assert _shard_count(run_dir) == total  # every counted game's shard was published
+    # No child had to be escalated, and the segment closed after all of them.
     assert [rec["kind"] for rec in records] == [
         KIND_SEGMENT_START,
         KIND_SPIKE_STOP,
         KIND_SEGMENT_END,
     ]
+    child_timestamps = [
+        rec["timestamp"]
+        for proc in ("learner", "actor-0", "actor-1")
+        for rec in iter_epoch_records(run_dir, proc)
+    ]
+    assert records[-1]["timestamp"] >= max(child_timestamps)
+    assert reduce_run(run_dir).gpu_hours > 0  # the segment is complete
 
 
 def test_spike_games_terminates_a_run_whose_learner_has_no_stop_of_its_own(tmp_path):
@@ -519,6 +527,7 @@ def test_a_run_without_a_spike_target_records_only_its_gpu_segment(tmp_path):
         block=True,
         now=1_700_000_000.0,
         network_config=MICRO_NET_CONFIG,
+        shutdown_grace_seconds=120.0,
     )
     kinds = [rec["kind"] for rec in _orchestrator_records(_only_run_dir(tmp_path))]
     assert kinds == [KIND_SEGMENT_START, KIND_SEGMENT_END]
@@ -529,16 +538,18 @@ def test_a_run_without_a_spike_target_records_only_its_gpu_segment(tmp_path):
     [([], "cmd_launch"), (["--resume", "run"], "cmd_resume"), (["--fork-from", "run"], "cmd_fork")],
     ids=["launch", "resume", "fork"],
 )
-def test_the_cli_threads_spike_games_into_every_launch_mode(monkeypatch, mode_args, command):
+def test_the_cli_threads_the_stop_arguments_into_every_launch_mode(monkeypatch, mode_args, command):
     seen = {}
     monkeypatch.setattr(rs, command, lambda *args, **kwargs: seen.update(kwargs))
 
-    assert rs.main(["cfg.json", *mode_args, "--spike-games", "310"]) == 0
-    assert seen["spike_games"] == 310
+    flags = ["--spike-games", "310", "--shutdown-grace-seconds", "900"]
+    assert rs.main(["cfg.json", *mode_args, *flags]) == 0
+    assert (seen["spike_games"], seen["shutdown_grace_seconds"]) == (310, 900.0)
 
     seen.clear()
     assert rs.main(["cfg.json", *mode_args]) == 0
     assert seen["spike_games"] is None  # unset by default: the M3 paths are unchanged
+    assert seen["shutdown_grace_seconds"] == DEFAULT_SHUTDOWN_GRACE_SECONDS
 
 
 def test_two_fresh_single_actor_runs_from_the_same_seed_play_an_identical_first_game(tmp_path):
