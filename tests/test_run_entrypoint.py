@@ -55,6 +55,7 @@ from core.observability import (
     SERIES_GAMES_COMPLETED,
     SERIES_LEARNER_STEP,
     reduce_run,
+    reduce_window,
 )
 from core.replay_shard import read_shard
 from core.run_identity import (
@@ -483,6 +484,18 @@ def test_spike_games_stops_the_whole_run_and_records_the_stop(tmp_path):
     ]
     assert records[-1]["timestamp"] >= max(child_timestamps)
     assert reduce_run(run_dir).gpu_hours > 0  # the segment is complete
+
+    # The stopped run's own records are what the windowed reducer reads: real
+    # actor flushes group into games, and every validate-tier series is found.
+    window = reduce_window(run_dir, warmup_games=1, measure_games=3, replay_warmup_positions=1)
+    assert window.reason is None
+    assert (window.start_game_ordinal, window.end_game_ordinal, window.games_in_window) == (1, 4, 3)
+    assert window.stored_positions_per_game == window.played_positions_per_game > 0
+    assert window.inference_batches == sum(window.inference_batch_sizes.values()) > 0
+    assert window.consecutive_mover_transitions is not None
+    assert (window.actor_amp_active, window.is_cuda) == (False, False)  # a CPU run
+    tier_fields = ("moves_full_512", "moves_mid_256", "moves_fast_64", "mid_tier_fraction")
+    assert all(name in window.unavailable for name in tier_fields)  # no schedule ran
 
 
 def test_spike_games_terminates_a_run_whose_learner_has_no_stop_of_its_own(tmp_path):

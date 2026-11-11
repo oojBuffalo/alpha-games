@@ -780,6 +780,10 @@ WINDOW_ZERO_SPAN = "zero_span_window"
 # The rest are per-field (``WindowedRun.unavailable``), inside a sound window.
 WINDOW_FEWER_THAN_TWO_RECORDS = "fewer_than_two_records"
 WINDOW_NO_RECORD = "no_record"
+WINDOW_ZERO_DENOMINATOR = "zero_denominator"
+
+# The percentiles of forward-pass size ``WindowedRun.batch_fill_percentiles`` reports.
+WINDOW_BATCH_FILL_PERCENTILES = (10, 50, 90)
 
 
 @dataclass(frozen=True)
@@ -805,10 +809,12 @@ class WindowedRun:
             to :attr:`reason`. Inside a sound window, the per-field reasons:
             :data:`WINDOW_NO_RECORD` (the field's source series has no
             usable record: none in the window for a summed series, none at
-            or before the window end for a latest-value one) and
+            or before the window end for a latest-value one),
             :data:`WINDOW_FEWER_THAN_TWO_RECORDS` (the ``learner_step``
             series has no record at or before the window start, so the two
-            endpoint readings its difference needs do not exist).
+            endpoint readings its difference needs do not exist) and
+            :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose series are
+            present but whose denominator summed to zero).
         window_start: Timestamp of the start flush (:func:`reduce_window`).
         window_end: Timestamp of the end flush.
         start_game_ordinal: Run-wide cumulative ``games_completed`` through
@@ -841,6 +847,44 @@ class WindowedRun:
             gauge at or before ``window_end``. Recorded beside the rate, not
             judged here: above the D5 ceiling it means the learner took no
             paced step by the window's end.
+        moves_full_512: The window's summed ``moves_full_512`` deltas: plies
+            searched at the always-full tier.
+        moves_mid_256: The window's summed ``moves_mid_256`` deltas.
+        moves_fast_64: The window's summed ``moves_fast_64`` deltas. An actor
+            writes a tier series only when its count is non-zero, so once any
+            of the three has a record in the window an absent one is ``0``;
+            with none (a validate-tier run) all three are unavailable.
+        mid_tier_fraction: ``moves_mid_256 / (moves_mid_256 +
+            moves_fast_64)``: the empirical mid-tier fraction at plies >= 2,
+            the always-full plies being exactly the ones before them.
+        stored_positions_per_game: The window's summed ``positions_stored``
+            deltas over ``games_in_window``.
+        played_positions_per_game: The window's summed ``positions_played``
+            deltas over ``games_in_window``.
+        inference_batches: The window's summed ``inference_batches`` deltas:
+            network forward passes.
+        inference_batch_sizes: The size distribution of those forward
+            passes: ``{bucket series: summed delta}`` over every
+            ``inference_batch_size_*`` series, an absent bucket reading
+            ``0`` (it is written only when non-zero).
+        mean_batch_fill: The window's summed ``positions_evaluated`` over
+            its summed ``inference_batches``: mean leaves per forward pass,
+            exact.
+        batch_fill_percentiles: ``{percentile: (lowest size, highest size)}``
+            for each of :data:`WINDOW_BATCH_FILL_PERCENTILES`: the bounds of
+            the size bucket holding that percentile's forward pass, by
+            nearest rank over ``inference_batch_sizes``. Bounds, not an
+            interpolated estimate; the highest is ``None`` in the open-ended
+            top bucket.
+        consecutive_mover_transitions: The window's summed
+            ``consecutive_mover_transitions`` deltas.
+        actor_amp_active: Whether inference autocast was observed live:
+            ``True`` iff every ``actor_amp_active`` gauge record at or before
+            ``window_end``, from every actor epoch, reads ``1.0``. One
+            record reading otherwise makes it ``False``.
+        is_cuda: The ``is_cuda`` field of the last ``segment_start`` record
+            at or before ``window_end``: whether the launch the window ran
+            in had a real CUDA device.
     """
 
     reason: str | None
@@ -858,6 +902,19 @@ class WindowedRun:
     learner_steps_in_window: int | None = None
     learner_steps_per_sec: float | None = None
     replay_ratio_at_window_end: float | None = None
+    moves_full_512: int | None = None
+    moves_mid_256: int | None = None
+    moves_fast_64: int | None = None
+    mid_tier_fraction: float | None = None
+    stored_positions_per_game: float | None = None
+    played_positions_per_game: float | None = None
+    inference_batches: int | None = None
+    inference_batch_sizes: dict[str, int] | None = None
+    mean_batch_fill: float | None = None
+    batch_fill_percentiles: dict[int, tuple[int, int | None]] | None = None
+    consecutive_mover_transitions: int | None = None
+    actor_amp_active: bool | None = None
+    is_cuda: bool | None = None
 
 
 def _game_flushes(
@@ -956,6 +1013,50 @@ def _last_at_or_before(
         if rec.get("kind") == kind and rec.get("series") == series:
             value = rec["value"]
     return value
+
+
+def _ratio(numerator: Any, denominator: Any) -> float | None:
+    """Return ``numerator / denominator``, or ``None`` where that is undefined.
+
+    Args:
+        numerator: The numerator, or ``None`` if its series has no record.
+        denominator: The denominator, or ``None`` likewise.
+
+    Returns:
+        The quotient, or ``None`` if either is ``None`` or the denominator
+        is zero.
+    """
+    return None if numerator is None or not denominator else numerator / denominator
+
+
+def _batch_fill_percentiles(sizes: dict[str, Any]) -> dict[int, tuple[int, int | None]] | None:
+    """Return the size-bucket bounds of each reported percentile of forward-pass size.
+
+    Args:
+        sizes: Forward-pass counts keyed by every bucket series, smallest
+            bucket first (``_INFERENCE_BATCH_SIZE_SERIES`` order).
+
+    Returns:
+        ``{percentile: (lowest size, highest size)}`` over
+        :data:`WINDOW_BATCH_FILL_PERCENTILES`, by nearest rank -- bucket
+        ``i`` holds sizes ``2**i`` through ``2**(i+1) - 1`` and the top
+        bucket has no highest size (``None``) -- or ``None`` if no forward
+        pass was counted.
+    """
+    total = sum(sizes.values())
+    if not total:
+        return None
+    top = len(sizes) - 1
+    bounds: dict[int, tuple[int, int | None]] = {}
+    for percentile in WINDOW_BATCH_FILL_PERCENTILES:
+        rank = -(-percentile * total // 100)  # ceiling: the nearest-rank position
+        seen = 0
+        for i, count in enumerate(sizes.values()):
+            seen += count
+            if seen >= rank:
+                bounds[percentile] = (2**i, None if i == top else 2 ** (i + 1) - 1)
+                break
+    return bounds
 
 
 def _insufficient_window(reason: str) -> WindowedRun:
@@ -1077,6 +1178,23 @@ def reduce_window(
     step_at_end = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_end)
     learner_steps = None if step_at_start is None else step_at_end - step_at_start
 
+    tiers = (SERIES_MOVES_FULL_512, SERIES_MOVES_MID_256, SERIES_MOVES_FAST_64)
+    has_tiers = any(series in sums for series in tiers)
+    full, mid, fast = (sums.get(series, 0) if has_tiers else None for series in tiers)
+    batches = sums.get(SERIES_INFERENCE_BATCHES)
+    sizes = (
+        None
+        if batches is None
+        else {series: sums.get(series, 0) for series in _INFERENCE_BATCH_SIZE_SERIES}
+    )
+    through_end = [rec for ts, _proc, _seq, rec in ordered if ts <= window_end]
+    amp = [
+        rec["value"]
+        for rec in through_end
+        if rec.get("kind") == KIND_GAUGE and rec.get("series") == SERIES_ACTOR_AMP_ACTIVE
+    ]
+    segments = [rec for rec in through_end if rec.get("kind") == KIND_SEGMENT_START]
+
     values: dict[str, Any] = {
         "window_start": window_start,
         "window_end": window_end,
@@ -1093,10 +1211,30 @@ def reduce_window(
         "replay_ratio_at_window_end": _last_at_or_before(
             ordered, KIND_GAUGE, SERIES_REPLAY_RATIO, window_end
         ),
+        "moves_full_512": full,
+        "moves_mid_256": mid,
+        "moves_fast_64": fast,
+        "mid_tier_fraction": _ratio(mid, mid + fast) if has_tiers else None,
+        "stored_positions_per_game": _ratio(sums.get(SERIES_POSITIONS_STORED), games_in_window),
+        "played_positions_per_game": _ratio(sums.get(SERIES_POSITIONS_PLAYED), games_in_window),
+        "inference_batches": batches,
+        "inference_batch_sizes": sizes,
+        "mean_batch_fill": _ratio(sums.get(SERIES_POSITIONS_EVALUATED), batches),
+        "batch_fill_percentiles": None if sizes is None else _batch_fill_percentiles(sizes),
+        "consecutive_mover_transitions": sums.get(SERIES_CONSECUTIVE_MOVER_TRANSITIONS),
+        "actor_amp_active": all(value == 1.0 for value in amp) if amp else None,
+        "is_cuda": segments[-1].get("is_cuda") if segments else None,
     }
+    # The reason a field is None when it is not simply a series with no record.
     reasons = dict.fromkeys(
         ("learner_steps_in_window", "learner_steps_per_sec"), WINDOW_FEWER_THAN_TWO_RECORDS
     )
+    if has_tiers:
+        reasons["mid_tier_fraction"] = WINDOW_ZERO_DENOMINATOR
+    if batches is not None:
+        reasons["batch_fill_percentiles"] = WINDOW_ZERO_DENOMINATOR
+        if SERIES_POSITIONS_EVALUATED in sums:
+            reasons["mean_batch_fill"] = WINDOW_ZERO_DENOMINATOR
     unavailable = {
         name: reasons.get(name, WINDOW_NO_RECORD) for name, value in values.items() if value is None
     }

@@ -51,10 +51,12 @@ from core.observability import (
     WINDOW_NO_RECORD,
     WINDOW_REPLAY_WARMUP_NOT_REACHED,
     WINDOW_TOO_FEW_GAMES,
+    WINDOW_ZERO_DENOMINATOR,
     WINDOW_ZERO_SPAN,
     InferenceBatchCounter,
     PositionCounter,
     ReducedRun,
+    WindowedRun,
     _ordered_records,  # white-box: the pinned tie-break rule
     count_positions,
     delta_record,
@@ -1001,3 +1003,252 @@ def test_reduce_run_is_unchanged_by_the_windowed_reducer(tmp_path):
         "gpu_hours",
         "checkpoints",
     ]
+
+
+# The windowed reducer's contract, frozen: a field added, dropped, renamed or
+# reordered is a deliberate change to what the downstream reports format.
+WINDOWED_RUN_FIELDS = (
+    "reason",
+    "unavailable",
+    "window_start",
+    "window_end",
+    "start_game_ordinal",
+    "end_game_ordinal",
+    "binding_condition",
+    "games_in_window",
+    "games_per_hour",
+    "stored_positions_per_hour",
+    "sims_per_sec",
+    "net_evals_per_sec",
+    "learner_steps_in_window",
+    "learner_steps_per_sec",
+    "replay_ratio_at_window_end",
+    "moves_full_512",
+    "moves_mid_256",
+    "moves_fast_64",
+    "mid_tier_fraction",
+    "stored_positions_per_game",
+    "played_positions_per_game",
+    "inference_batches",
+    "inference_batch_sizes",
+    "mean_batch_fill",
+    "batch_fill_percentiles",
+    "consecutive_mover_transitions",
+    "actor_amp_active",
+    "is_cuda",
+)
+
+
+def test_windowed_run_field_list_is_frozen():
+    assert tuple(f.name for f in dataclasses.fields(WindowedRun)) == WINDOWED_RUN_FIELDS
+
+
+def _amp_gauge(writer, value, timestamp):
+    writer.append(gauge_record("actor_amp_active", value, timestamp=timestamp))
+
+
+def _every_series_run(tmp_path):
+    """A two-actor schedule-shaped run carrying every series the reducer reads.
+
+    Two warm-up games (t = 10, 20), then three measured ones (t = 30, 40, 50)
+    whose deltas are all distinct from the warm-up's, so a warm-up delta
+    leaking into any window sum changes it.
+    """
+    orch = EpochMetricsWriter(tmp_path, "orchestrator")
+    orch.append({"kind": "segment_start", "device": "cuda", "is_cuda": True, "timestamp": 0.0})
+    a0, a1 = EpochMetricsWriter(tmp_path, "actor-0"), EpochMetricsWriter(tmp_path, "actor-1")
+    _amp_gauge(a0, 1.0, 1.0)
+    _amp_gauge(a1, 1.0, 1.5)
+    warm_up = [
+        ("moves_full_512", 2),
+        ("moves_mid_256", 7),
+        ("moves_fast_64", 1),
+        ("consecutive_mover_transitions", 9),
+        ("inference_batches", 1000),
+        ("inference_batch_size_2_3", 1000),
+    ]
+    for writer, timestamp in ((a0, 10.0), (a1, 20.0)):
+        _flush_game(writer, timestamp, stored=9, played=10, sims=3456, evals=2500, extra=warm_up)
+    _flush_game(
+        a0,
+        30.0,
+        stored=4,
+        played=10,
+        sims=512 * 2 + 256 * 2 + 64 * 6,
+        evals=1500,
+        extra=[
+            ("consecutive_mover_transitions", 1),
+            ("moves_full_512", 2),
+            ("moves_mid_256", 2),
+            ("moves_fast_64", 6),
+            ("inference_batches", 100),
+            ("inference_batch_size_1", 10),
+            ("inference_batch_size_8_15", 60),
+            ("inference_batch_size_16_31", 30),
+        ],
+    )
+    _flush_game(
+        a1,
+        40.0,
+        stored=3,
+        played=8,
+        sims=512 * 2 + 256 * 1 + 64 * 5,
+        evals=1000,
+        extra=[
+            ("consecutive_mover_transitions", 0),
+            ("moves_full_512", 2),
+            ("moves_mid_256", 1),
+            ("moves_fast_64", 5),
+            ("inference_batches", 50),
+            ("inference_batch_size_8_15", 20),
+            ("inference_batch_size_32_63", 30),
+        ],
+    )
+    _flush_game(
+        a0,
+        50.0,
+        stored=2,
+        played=6,
+        sims=512 * 2 + 64 * 4,
+        evals=600,
+        extra=[
+            ("consecutive_mover_transitions", 2),
+            ("moves_full_512", 2),  # no mid-tier ply: that series is not written
+            ("moves_fast_64", 4),
+            ("inference_batches", 50),
+            ("inference_batch_size_1", 40),
+            ("inference_batch_size_64_plus", 10),
+        ],
+    )
+    _write_learner_steps(tmp_path, [(15.0, 4, 6.0), (35.0, 5, 4.5), (45.0, 7, 3.75)])
+    return a0, a1
+
+
+def test_window_over_a_run_carrying_every_series_reduces_field_by_field(tmp_path):
+    _every_series_run(tmp_path)
+
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=3, replay_warmup_positions=18)
+
+    sims = (512 * 2 + 256 * 2 + 64 * 6) + (512 * 2 + 256 + 64 * 5) + (512 * 2 + 64 * 4)
+    assert dataclasses.asdict(window) == {
+        "reason": None,
+        "unavailable": {},
+        "window_start": 20.0,
+        "window_end": 50.0,
+        "start_game_ordinal": 2,
+        "end_game_ordinal": 5,
+        "binding_condition": WINDOW_BOUND_BY_REPLAY_WARMUP,  # 18 stored at game 2, with (a)
+        "games_in_window": 3,
+        "games_per_hour": pytest.approx(3 * 3600 / 30),
+        "stored_positions_per_hour": pytest.approx((4 + 3 + 2) * 3600 / 30),
+        "sims_per_sec": pytest.approx(sims / 30),
+        "net_evals_per_sec": pytest.approx((1500 + 1000 + 600) / 30),
+        "learner_steps_in_window": 7 - 4,
+        "learner_steps_per_sec": pytest.approx(3 / 30),
+        "replay_ratio_at_window_end": 3.75,
+        "moves_full_512": 6,
+        "moves_mid_256": 3,
+        "moves_fast_64": 15,
+        "mid_tier_fraction": pytest.approx(3 / 18),
+        "stored_positions_per_game": pytest.approx(9 / 3),
+        "played_positions_per_game": pytest.approx(24 / 3),
+        "inference_batches": 200,
+        "inference_batch_sizes": {
+            "inference_batch_size_1": 50,
+            "inference_batch_size_2_3": 0,
+            "inference_batch_size_4_7": 0,
+            "inference_batch_size_8_15": 80,
+            "inference_batch_size_16_31": 30,
+            "inference_batch_size_32_63": 30,
+            "inference_batch_size_64_plus": 10,
+        },
+        "mean_batch_fill": pytest.approx(3100 / 200),
+        # Nearest rank over 200 forward passes: the 20th, 100th and 180th smallest.
+        "batch_fill_percentiles": {10: (1, 1), 50: (8, 15), 90: (32, 63)},
+        "consecutive_mover_transitions": 3,
+        "actor_amp_active": True,
+        "is_cuda": True,
+    }
+    # The schedule's own identity holds over the window's sums.
+    assert sims == 512 * 6 + 256 * 3 + 64 * 15
+
+
+def test_window_over_a_validate_tier_run_names_the_absent_series_never_zeroes(tmp_path):
+    """No tier, batch, transition, AMP or segment record: each field says so."""
+    _seven_games(tmp_path)  # its flushes carry only the always-written series
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.reason is None
+    assert window.stored_positions_per_game == pytest.approx(5.0)
+    assert window.played_positions_per_game == pytest.approx(5.0)
+    absent = (
+        "moves_full_512",
+        "moves_mid_256",
+        "moves_fast_64",
+        "mid_tier_fraction",
+        "inference_batches",
+        "inference_batch_sizes",
+        "mean_batch_fill",
+        "batch_fill_percentiles",
+        "consecutive_mover_transitions",
+        "actor_amp_active",
+        "is_cuda",
+    )
+    for name in absent:
+        assert getattr(window, name) is None, name
+        assert window.unavailable[name] == WINDOW_NO_RECORD, name
+    missing = {name for name, value in _measurements(window).items() if value is None}
+    assert missing == set(window.unavailable)
+
+
+def test_window_ratio_over_a_zero_denominator_is_named_never_computed(tmp_path):
+    actor = EpochMetricsWriter(tmp_path, "actor-0")
+    _flush_game(actor, 10.0)
+    for timestamp in (20.0, 30.0):  # two-ply games: full tier only, no forward pass at all
+        _flush_game(
+            actor,
+            timestamp,
+            stored=2,
+            evals=0,
+            extra=[("moves_full_512", 2), ("inference_batches", 0)],
+        )
+    window = reduce_window(tmp_path, warmup_games=1, measure_games=2, replay_warmup_positions=1)
+
+    assert (window.moves_full_512, window.moves_mid_256, window.moves_fast_64) == (4, 0, 0)
+    assert window.inference_batches == 0
+    assert set(window.inference_batch_sizes.values()) == {0}
+    for name in ("mid_tier_fraction", "mean_batch_fill", "batch_fill_percentiles"):
+        assert getattr(window, name) is None, name
+        assert window.unavailable[name] == WINDOW_ZERO_DENOMINATOR, name
+
+
+def test_window_batch_fill_percentile_in_the_open_top_bucket_has_no_upper_bound(tmp_path):
+    actor = EpochMetricsWriter(tmp_path, "actor-0")
+    _flush_game(actor, 10.0)
+    extra = [("inference_batches", 4), ("inference_batch_size_64_plus", 4)]
+    _flush_game(actor, 20.0, evals=400, extra=extra)
+    window = reduce_window(tmp_path, warmup_games=1, measure_games=1, replay_warmup_positions=1)
+
+    assert window.batch_fill_percentiles == {10: (64, None), 50: (64, None), 90: (64, None)}
+    assert window.mean_batch_fill == pytest.approx(100.0)
+
+
+def test_window_actor_amp_is_live_only_if_every_actor_record_through_the_window_end_is(
+    tmp_path,
+):
+    a0, a1 = _every_series_run(tmp_path)
+    kwargs = dict(warmup_games=2, measure_games=3, replay_warmup_positions=18)
+
+    _amp_gauge(a1, 0.0, 60.0)  # a restart after the window's end (t=50): not its evidence
+    assert reduce_window(tmp_path, **kwargs).actor_amp_active is True
+
+    _amp_gauge(a1, 0.0, 45.0)  # one actor epoch inside it ran without autocast
+    assert reduce_window(tmp_path, **kwargs).actor_amp_active is False
+
+
+def test_window_is_cuda_is_read_from_the_segment_the_window_ran_in(tmp_path):
+    _every_series_run(tmp_path)  # opens a CUDA segment at t=0
+    orch = EpochMetricsWriter(tmp_path, "orchestrator")
+    orch.append(segment_start_record(device="cpu", timestamp=25.0))  # a CPU relaunch mid-window
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=3, replay_warmup_positions=18)
+    assert window.is_cuda is False
