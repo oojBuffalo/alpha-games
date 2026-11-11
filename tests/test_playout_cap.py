@@ -28,7 +28,7 @@ import core.selfplay as selfplay
 from core.mcts import MCTS
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
-from core.selfplay import Tier, draw_tier, play_game
+from core.selfplay import Tier, draw_tier, play_game, select_move
 from games.tictactoe import TicTacToe
 
 TTT = TicTacToe()
@@ -249,6 +249,38 @@ def test_the_tier_draw_comes_from_the_pcr_tier_stream_once_per_drawn_ply():
         "mid" if twin.random() < 0.25 else "fast" for _ in range(result.plies - 2)
     ]
     assert [sample.tier for sample in result.samples] == names
+
+
+@pytest.mark.parametrize("leaf_batch_size", [1, 4])
+def test_a_d6_game_matches_a_reference_loop_on_the_public_search_api(leaf_batch_size):
+    """Only the budget varies by tier.
+
+    The reference plays the same game with the engine directly: root noise on
+    at every ply, D10 selection at every ply, the root's raw counts as the
+    target, the subtree reused after every move, and the configured leaf batch
+    size at every tier.
+    """
+    cfg = d6_cfg(leaf_batch_size=leaf_batch_size)
+    result = play_game(TTT, None, cfg, GameRNGs.for_actor_game(*D6_GAME))
+
+    rngs = GameRNGs.for_actor_game(*D6_GAME)
+    search = MCTS(TTT, evaluate=None, root_noise=(0.25, 10.8, rngs.dirichlet))
+    state = TTT.initial_state()
+    search.set_root(state)
+    moves, targets = [], []
+    while not TTT.is_terminal(state):
+        ply = len(moves)
+        budget = 512 if ply < 2 else (256 if rngs.pcr_tier.random() < 0.25 else 64)
+        search.run(budget, batch_size=leaf_batch_size)
+        visits = search.action_visit_counts()
+        targets.append(tuple(visits.items()))
+        action = select_move(visits, ply, 4, rngs.move_selection)
+        search.advance(action)
+        state = TTT.apply(state, action)
+        moves.append(action)
+
+    assert result.moves == tuple(moves)
+    assert [sample.sparse_pi for sample in result.samples] == targets
 
 
 def test_a_d6_game_is_a_pure_function_of_its_seed():
