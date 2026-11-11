@@ -836,14 +836,14 @@ def _migrate_v2_to_v3(document: Mapping[str, Any]) -> dict[str, Any]:
     schedule scalars are inert while the flag is off.
 
     Args:
-        document: A v2 document; not mutated.
+        document: A v2 document, as stored or as migrated from v1; not mutated.
 
     Returns:
         The v3-shaped copy.
 
     Raises:
         ValueError: If the document already carries any of the keys this step
-            fills -- keys the v2 schema never had, so their values cannot be
+            fills -- keys no schema before 3 had, so their values cannot be
             what the run ran with and are not silently replaced.
     """
     migrated = dict(document)
@@ -852,8 +852,8 @@ def _migrate_v2_to_v3(document: Mapping[str, Any]) -> dict[str, Any]:
         present = sorted(set(_V3_PCR_OFF_DEFAULTS) & set(self_play))
         if present:
             raise ValueError(
-                f"stored config: schema_version 2 document carries self_play keys {present}, "
-                "which that schema does not have"
+                f"stored config: a document older than schema 3 carries self_play keys "
+                f"{present}, which no schema before 3 has"
             )
         migrated["self_play"] = {**self_play, **_V3_PCR_OFF_DEFAULTS}
     migrated["schema_version"] = 3

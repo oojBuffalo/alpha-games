@@ -672,14 +672,19 @@ def test_strict_launch_loader_rejects_the_v2_document():
         load_launch_config(V2_CONFIG_FIXTURE)
 
 
+@pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
 @pytest.mark.parametrize("key", sorted(PCR_OFF_DEFAULTS))
-def test_a_v2_document_already_carrying_a_pcr_key_is_rejected_not_overwritten(tmp_path, key):
-    root = _v1_run_dir(tmp_path, fixture=V2_CONFIG_FIXTURE)
-    doc = json.loads(V2_CONFIG_FIXTURE.read_text())
+def test_an_older_document_already_carrying_a_pcr_key_is_rejected_not_overwritten(
+    tmp_path, fixture, key
+):
+    """Refused from v1 as from v2, in words that name no version the file lacks."""
+    root = _v1_run_dir(tmp_path, fixture=fixture)
+    doc = json.loads(fixture.read_text())
     doc["self_play"][key] = PCR_OFF_DEFAULTS[key]
     (root / "config.json").write_text(json.dumps(doc))
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match=f"older than schema 3 .*{key}") as raised:
         read_stored_config_document(root)
+    assert "schema_version 2" not in str(raised.value)
 
 
 @pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
