@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from core.acceptance import _REQUIRED_POSITIVE_SERIES
 from core.actor import (
     VALIDATE_TIER_SIMS,
     ActorDriver,
@@ -731,4 +732,6 @@ def test_a_validate_tier_actor_writes_no_tier_series(tmp_path):
 
     flushed = _series_values(tmp_path)
     assert {series for series, _ in flushed} == {SERIES_GAMES_COMPLETED, SERIES_SIMS_RUN}
+    # ...so the acceptance checklist of such a run must never require them.
+    assert not set(TIER_SERIES.values()) & set(_REQUIRED_POSITIVE_SERIES)
     assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [p * 128 for p in plies]
