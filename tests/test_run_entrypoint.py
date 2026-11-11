@@ -565,6 +565,22 @@ def test_the_cli_threads_the_stop_arguments_into_every_launch_mode(monkeypatch, 
     assert seen["shutdown_grace_seconds"] == DEFAULT_SHUTDOWN_GRACE_SECONDS
 
 
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [("--spike-games", "0"), ("--spike-games", "-3"), ("--shutdown-grace-seconds", "-1")],
+)
+def test_the_cli_refuses_an_out_of_range_stop_argument_before_creating_a_run(
+    tmp_path, capsys, flag, value
+):
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    caps = ["--max-games-per-actor", "1", "--max-learner-steps", "1"]  # a failure cannot hang
+    with pytest.raises(SystemExit) as exc_info:
+        rs.main([str(cfg), *caps, flag, value])
+    assert exc_info.value.code == 2
+    assert flag in capsys.readouterr().err
+    assert not (tmp_path / "runs").exists()  # refused before any provenance was written
+
+
 def test_two_fresh_single_actor_runs_from_the_same_seed_play_an_identical_first_game(tmp_path):
     """Task 2's promise, exercised end to end through the real CLI launch path.
 

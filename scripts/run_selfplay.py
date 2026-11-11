@@ -430,6 +430,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.config is None:
         parser.error("config is required unless --verify-acceptance is given")
+    # Refused here, before any mode writes a run's provenance.
+    if args.spike_games is not None and args.spike_games < 1:
+        parser.error(f"--spike-games must be >= 1, got {args.spike_games}")
+    if args.shutdown_grace_seconds < 0:
+        parser.error(f"--shutdown-grace-seconds must be >= 0, got {args.shutdown_grace_seconds}")
 
     block = not args.no_block
     try:
