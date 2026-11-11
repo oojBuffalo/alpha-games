@@ -59,9 +59,12 @@ from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
 from core.observability import (
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_INFERENCE_BATCHES,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
+    InferenceBatchCounter,
     PositionCounter,
+    inference_batch_size_series,
     reduce_run,
 )
 from core.replay_shard import SampleRecord, read_shard, shard_filename, write_shard
@@ -405,6 +408,7 @@ def _run_counted_actor(tmp_path, monkeypatch, *, leaf_batch_size):
     _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
     sizes = _spy_on_batched_factory(monkeypatch)
     counter = PositionCounter()
+    batch_counter = InferenceBatchCounter()
     writer = EpochMetricsWriter(run_dir, "actor-0")
     actor = ActorDriver(
         game=TTT,
@@ -418,11 +422,13 @@ def _run_counted_actor(tmp_path, monkeypatch, *, leaf_batch_size):
             ckpt_dir=ckpt_dir,
             network_config=TTT_NET_CONFIG,
             position_counter=counter,
+            batch_counter=batch_counter,
             metrics_writer=writer,
         ),
         max_games=2,
         metrics_writer=writer,
         position_counter=counter,
+        batch_counter=batch_counter,
     )
     assert len(actor.run()) == 2
     return reduce_run(run_dir).totals, sizes
@@ -436,12 +442,23 @@ def test_a_batched_actor_counts_leaves_evaluated_not_forward_passes(tmp_path, mo
     assert max(sizes) > 1 and all(1 <= n <= 8 for n in sizes)
     # Terminal leaves are simulations but never reach the network.
     assert 0 < totals[SERIES_POSITIONS_EVALUATED] <= totals[SERIES_SIMS_RUN]
+    # The durable batch accounting is the forward passes and their fill.
+    assert totals[SERIES_INFERENCE_BATCHES] == len(sizes)
+    histogram = {}
+    for n in sizes:
+        histogram[inference_batch_size_series(n)] = (
+            histogram.get(inference_batch_size_series(n), 0) + 1
+        )
+    assert {k: v for k, v in totals.items() if k.startswith("inference_batch_size_")} == histogram
 
 
 def test_a_serial_actor_never_touches_the_batched_evaluator(tmp_path, monkeypatch):
     totals, sizes = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=1)
     assert sizes == []
     assert 0 < totals[SERIES_POSITIONS_EVALUATED] <= totals[SERIES_SIMS_RUN]
+    # Serial inference is accounted too: every evaluation is a batch of one.
+    assert totals[SERIES_INFERENCE_BATCHES] == totals[SERIES_POSITIONS_EVALUATED]
+    assert totals["inference_batch_size_1"] == totals[SERIES_INFERENCE_BATCHES]
 
 
 def test_the_batched_evaluator_also_runs_inside_the_amp_context(tmp_path, monkeypatch):

@@ -65,7 +65,11 @@ every ply searches exactly ``self_play.sims`` simulations), and
 caller is responsible for wiring into the actual evaluator via
 ``core.observability.count_positions`` -- this module never constructs an
 evaluator itself). ``positions_evaluated`` is omitted entirely when no
-``position_counter`` was supplied, never written as a fabricated zero.
+``position_counter`` was supplied, never written as a fabricated zero. An
+optional ``batch_counter``, wired into the evaluator the same way, adds the
+inference-batch accounting deltas to the same flush (``inference_batches``
+plus the non-zero size buckets -- ``core.observability``), under the same
+omitted-when-absent rule.
 """
 
 from __future__ import annotations
@@ -81,6 +85,7 @@ from core.observability import (
     SERIES_GAMES_COMPLETED,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
+    InferenceBatchCounter,
     PositionCounter,
     delta_record,
 )
@@ -231,6 +236,10 @@ class ActorDriver:
             ``metrics_writer`` is also given. The caller wires this counter
             into the actual evaluator (``core.observability.count_positions``)
             — this module only drains it.
+        batch_counter: Optional. Drained once per game to populate the
+            inference-batch accounting deltas; only consulted when
+            ``metrics_writer`` is also given, and wired by the caller exactly
+            like ``position_counter``.
 
     Raises:
         ValueError: If ``self_play`` is not the D6 validate tier, or
@@ -253,6 +262,7 @@ class ActorDriver:
         should_stop: StopFn | None = None,
         metrics_writer: EpochMetricsWriter | None = None,
         position_counter: PositionCounter | None = None,
+        batch_counter: InferenceBatchCounter | None = None,
     ) -> None:
         validate_actor_self_play_config(self_play)
         if max_games is not None and max_games <= 0:
@@ -270,6 +280,7 @@ class ActorDriver:
         self.should_stop = should_stop
         self.metrics_writer = metrics_writer
         self.position_counter = position_counter
+        self.batch_counter = batch_counter
         self.writer = ShardWriter(Path(out_dir), game, run_id, str(actor_id))
 
     def run(self) -> list[Path]:
@@ -390,6 +401,8 @@ class ActorDriver:
         ``self.self_play.sims`` simulations, making the product exact.
         ``positions_evaluated`` is drained from ``position_counter`` and
         omitted entirely when none was supplied -- never a fabricated zero.
+        The inference-batch deltas are drained from ``batch_counter`` under
+        the same rule.
 
         Args:
             result: The just-finished game.
@@ -406,3 +419,6 @@ class ActorDriver:
             self.metrics_writer.append(
                 delta_record(SERIES_POSITIONS_EVALUATED, positions, timestamp=now)
             )
+        if self.batch_counter is not None:
+            for series, value in self.batch_counter.drain().items():
+                self.metrics_writer.append(delta_record(series, value, timestamp=now))

@@ -13,11 +13,13 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from core.acceptance import MIN_COMPLETED_GAMES, verify_acceptance
+from core.acceptance import _REQUIRED_POSITIVE_SERIES, MIN_COMPLETED_GAMES, verify_acceptance
 from core.metrics import EpochMetricsWriter
 from core.observability import (
     CHECKPOINT_PUBLISHED_KIND,
+    SERIES_ACTOR_AMP_ACTIVE,
     SERIES_GAMES_COMPLETED,
+    SERIES_INFERENCE_BATCHES,
     SERIES_LEARNER_STEP,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
@@ -169,6 +171,22 @@ def test_passing_run_reports_pass_on_every_check(tmp_path):
     assert report.passed
     for check in report.checks:
         assert check.passed, f"{check.name}: {check.detail}"
+
+
+def test_inference_batch_and_amp_series_are_not_required_of_an_m3_run(tmp_path):
+    """The M5 series are additive: absent on an M3 run dir, and never a check."""
+    assert SERIES_INFERENCE_BATCHES not in _REQUIRED_POSITIVE_SERIES
+    assert SERIES_ACTOR_AMP_ACTIVE not in _REQUIRED_POSITIVE_SERIES
+    assert not any(name.startswith("inference_batch") for name in _REQUIRED_POSITIVE_SERIES)
+
+    root = _build_passing_run(tmp_path)  # carries none of them
+    before = verify_acceptance(root, TTT, _run_config())
+    assert before.passed
+
+    writer = EpochMetricsWriter(root, "actor-0")
+    writer.append(delta_record(SERIES_INFERENCE_BATCHES, 0))  # even a zero changes nothing
+    after = verify_acceptance(root, TTT, _run_config())
+    assert [(c.name, c.passed) for c in after.checks] == [(c.name, c.passed) for c in before.checks]
 
 
 def test_render_produces_a_pass_fail_checklist(tmp_path):

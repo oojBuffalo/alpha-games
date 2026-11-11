@@ -119,6 +119,7 @@ from core.network import (
 )
 from core.observability import (
     SERIES_ACTOR_AMP_ACTIVE,
+    InferenceBatchCounter,
     PositionCounter,
     count_positions,
     gauge_record,
@@ -235,6 +236,7 @@ def build_actor_refresh(
     poll_interval: float = 1.0,
     wait: WaitFn | None = None,
     position_counter: PositionCounter | None = None,
+    batch_counter: InferenceBatchCounter | None = None,
     metrics_writer: EpochMetricsWriter | None = None,
 ) -> RefreshFn:
     """Build the real ``refresh`` seam: the learner's ``latest`` pointer, live.
@@ -294,6 +296,10 @@ def build_actor_refresh(
             through the batched one. ``None`` (the default) counts nothing.
             Wrapped once per newly-built version, never re-wrapped on a
             cache hit.
+        batch_counter: Optional. When given, the same calls are recorded as
+            inference batches (``core.observability.InferenceBatchCounter``):
+            every scalar call is a batch of one, every batched call a batch
+            of its leaf count. ``None`` (the default) records nothing.
         metrics_writer: Optional. When given, the *observed* autocast state
             -- read from inside the context at this closure's first leaf
             evaluation, not inferred from ``device`` -- is appended to it as
@@ -334,11 +340,12 @@ def build_actor_refresh(
             net.load_state_dict(bundle.model_state_dict)
             evaluator = make_network_evaluator(net, game, device=device)
             evaluate_batch = make_batched_network_evaluator(net, game, device=device)
-            if position_counter is not None:
-                evaluator = count_positions(evaluator, position_counter)
-                evaluate_batch = count_positions(
-                    evaluate_batch, position_counter, batch_size=_leaf_count
-                )
+            for counter in (position_counter, batch_counter):
+                if counter is not None:
+                    evaluator = count_positions(evaluator, counter)
+                    evaluate_batch = count_positions(
+                        evaluate_batch, counter, batch_size=_leaf_count
+                    )
             cache["evaluator"] = amp_evaluator(evaluator, amp, observe=record_amp)
             cache["evaluate_batch"] = amp_evaluator(evaluate_batch, amp, observe=record_amp)
             cache["version"] = version
@@ -409,9 +416,11 @@ def run_actor_process(
     stay optional/``None``-default so a driver built directly (most of
     ``tests/test_actor.py``) is unaffected. This process entrypoint opens this
     actor's ``run_dir/metrics/actor-<actor_id>-<epoch>.jsonl`` writer, a fresh
-    :class:`~core.observability.PositionCounter`, and wires both into
-    :func:`build_actor_refresh` so every leaf-inference call this actor makes
-    is counted and the autocast state its forwards ran under is recorded.
+    :class:`~core.observability.PositionCounter` and
+    :class:`~core.observability.InferenceBatchCounter`, and wires all three
+    into :func:`build_actor_refresh` so every leaf-inference call this actor
+    makes is counted, its batch size recorded, and the autocast state its
+    forwards ran under persisted.
 
     Args:
         game_factory: Builds this process's adapter instance.
@@ -440,6 +449,7 @@ def run_actor_process(
     stop = ShutdownFlag().install()
     metrics_writer = EpochMetricsWriter(run_dir, f"actor-{actor_id}")
     position_counter = PositionCounter()
+    batch_counter = InferenceBatchCounter()
     refresh = build_actor_refresh(
         game=game,
         ckpt_dir=ckpt_dir,
@@ -447,6 +457,7 @@ def run_actor_process(
         network_config=network_config,
         poll_interval=refresh_poll_interval,
         position_counter=position_counter,
+        batch_counter=batch_counter,
         metrics_writer=metrics_writer,
     )
     pacing = build_actor_pacing(run_dir)
@@ -464,6 +475,7 @@ def run_actor_process(
         should_stop=stop,
         metrics_writer=metrics_writer,
         position_counter=position_counter,
+        batch_counter=batch_counter,
     )
     driver.run()
 

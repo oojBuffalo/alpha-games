@@ -27,6 +27,14 @@ from core.actor import (
     ActorDriver,
     validate_actor_self_play_config,
 )
+from core.metrics import EpochMetricsWriter, iter_epoch_records
+from core.observability import (
+    SERIES_INFERENCE_BATCHES,
+    SERIES_POSITIONS_EVALUATED,
+    InferenceBatchCounter,
+    PositionCounter,
+    count_positions,
+)
 from core.replay_shard import read_shard, shard_filename
 from core.runconfig import load_run_config
 from games.tictactoe import TicTacToe
@@ -543,3 +551,70 @@ def test_a_batched_game_is_reproducible_from_its_durable_coordinates(tmp_path):
     for a, b in zip(shards[0], shards[1], strict=True):
         assert np.array_equal(np.asarray(a.planes), np.asarray(b.planes))
         assert (a.sparse_pi, a.z, a.mover, a.ply) == (b.sparse_pi, b.z, b.mover, b.ply)
+
+
+def _counted_spy_refresh(positions, batches):
+    """A spy refresh whose evaluators feed both counters, as ``core.ipc`` wires them.
+
+    Args:
+        positions: The position counter.
+        batches: The inference-batch counter.
+
+    Returns:
+        ``(refresh, batch_sizes)`` -- the leaf count of every batched call.
+    """
+    inner, _, batch_sizes = _spy_refresh()
+    scalar, version, batched = inner()
+
+    def size(game, states):
+        return len(states)
+
+    for counter in (positions, batches):
+        scalar = count_positions(scalar, counter)
+        batched = count_positions(batched, counter, batch_size=size)
+    return (lambda: (scalar, version, batched)), batch_sizes
+
+
+def _series_values(run_dir, proc="actor-0"):
+    """Every delta record one process wrote, as ``(series, value)`` in append order."""
+    return [(r["series"], r["value"]) for r in iter_epoch_records(run_dir, proc)]
+
+
+@pytest.mark.parametrize("leaf_batch_size", [1, 8])
+def test_every_game_flushes_its_inference_batch_accounting(tmp_path, leaf_batch_size):
+    positions, batches = PositionCounter(), InferenceBatchCounter()
+    refresh, batch_sizes = _counted_spy_refresh(positions, batches)
+    make_driver(
+        tmp_path / "shards",
+        refresh=refresh,
+        max_games=1,
+        leaf_batch_size=leaf_batch_size,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+        position_counter=positions,
+        batch_counter=batches,
+    ).run()
+
+    flushed = dict(_series_values(tmp_path))
+    buckets = {k: v for k, v in flushed.items() if k.startswith("inference_batch_size_")}
+    assert sum(buckets.values()) == flushed[SERIES_INFERENCE_BATCHES] > 0
+    assert all(v > 0 for v in buckets.values())  # only observed buckets are written
+    if leaf_batch_size == 1:
+        # Serial: every evaluation is its own batch of one.
+        assert flushed[SERIES_INFERENCE_BATCHES] == flushed[SERIES_POSITIONS_EVALUATED]
+        assert buckets == {"inference_batch_size_1": flushed[SERIES_INFERENCE_BATCHES]}
+    else:
+        assert flushed[SERIES_INFERENCE_BATCHES] == len(batch_sizes)
+        assert flushed[SERIES_POSITIONS_EVALUATED] == sum(batch_sizes)
+        assert flushed[SERIES_INFERENCE_BATCHES] < flushed[SERIES_POSITIONS_EVALUATED]
+        assert set(buckets) - {"inference_batch_size_1"}  # some batch held several leaves
+    assert batches.drain() == {SERIES_INFERENCE_BATCHES: 0}  # drained at the game boundary
+
+
+def test_no_batch_counter_means_no_inference_batch_series(tmp_path):
+    """Omitted, never a fabricated zero -- the position counter's own convention."""
+    make_driver(
+        tmp_path / "shards",
+        max_games=1,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+    assert not any(series.startswith("inference_batch") for series, _ in _series_values(tmp_path))
