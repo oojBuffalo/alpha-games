@@ -485,6 +485,21 @@ def test_a_scripted_tier_sequence_stores_exactly_the_stored_tier_plies(game, sea
     assert sum(count for _, count in after_a_drop.sparse_pi) > BUDGET["mid"]
 
 
+def test_targets_come_from_each_samples_own_mover_across_a_dropped_gap():
+    """Stored plies 1 and 4 have different movers and, in a decisive game, opposite z."""
+    script = ("fast", "fast", "mid", "fast", "fast", "mid", "fast")  # plies 2-3 dropped
+    result = play_game(MICRO, None, d6_cfg(), _scripted(script))
+
+    before, after = result.samples[1], result.samples[2]
+    assert (before.ply, after.ply) == (1, 4)
+    assert before.mover != after.mover
+    assert before.z == -after.z != 0  # decisive: the other mover's targets would be wrong
+    for sample in result.samples:
+        z, aux = MICRO.training_targets(result.terminal_state, sample.mover)
+        assert (sample.z, sample.aux) == (z, tuple(aux))
+    assert before.aux != after.aux
+
+
 @pytest.mark.parametrize("full_plies", [2, 4])
 def test_plies_below_the_always_full_boundary_can_never_be_dropped(full_plies):
     """Structural, not statistical: the worst tier stream still drops none of them."""
