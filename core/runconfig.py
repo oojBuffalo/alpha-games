@@ -379,6 +379,13 @@ class SelfPlayConfig:
             is ``dirichlet_alpha_numerator / len(legal_moves)``.
         root_noise: Whether root Dirichlet noise is applied at all (D7:
             root-only, self-play-only — evaluation sets this ``False``).
+        leaf_batch_size: Maximum leaves per network evaluation within one
+            search (§6.2 batched parallel selection, §12 M5). ``1`` — the
+            default, and the recorded M2.5/M3 configuration — is the serial
+            search. It is only an upper bound: the engine caps a batch by the
+            remaining simulation budget and closes it on the first collision,
+            so any value ``>= 1`` is valid whatever ``sims`` is. A JSON config
+            must state it explicitly; the default serves Python construction.
     """
 
     sims: int
@@ -386,15 +393,18 @@ class SelfPlayConfig:
     dirichlet_eps: float
     dirichlet_alpha_numerator: float
     root_noise: bool
+    leaf_batch_size: int = 1
 
     def __post_init__(self) -> None:
         """Validate the search scalars.
 
         Raises:
             ValueError: If ``sims`` is not positive, ``k_temp`` is negative,
-                ``dirichlet_eps`` is outside ``[0, 1]``, or
-                ``dirichlet_alpha_numerator`` is not positive.
+                ``dirichlet_eps`` is outside ``[0, 1]``,
+                ``dirichlet_alpha_numerator`` is not positive, or
+                ``leaf_batch_size`` is not positive.
         """
+        _positive(self.leaf_batch_size, "self_play.leaf_batch_size")
         _positive(self.sims, "self_play.sims")
         _non_negative(self.k_temp, "self_play.k_temp")
         _unit_interval(self.dirichlet_eps, "self_play.dirichlet_eps")
@@ -783,7 +793,16 @@ def _self_play_from_dict(raw: Mapping[str, Any]) -> SelfPlayConfig:
     """
     where = "self_play"
     _check_keys(
-        raw, ("sims", "k_temp", "dirichlet_eps", "dirichlet_alpha_numerator", "root_noise"), where
+        raw,
+        (
+            "sims",
+            "k_temp",
+            "dirichlet_eps",
+            "dirichlet_alpha_numerator",
+            "root_noise",
+            "leaf_batch_size",
+        ),
+        where,
     )
     return SelfPlayConfig(
         sims=_int(raw, "sims", where),
@@ -791,6 +810,7 @@ def _self_play_from_dict(raw: Mapping[str, Any]) -> SelfPlayConfig:
         dirichlet_eps=_float(raw, "dirichlet_eps", where),
         dirichlet_alpha_numerator=_float(raw, "dirichlet_alpha_numerator", where),
         root_noise=_bool(raw, "root_noise", where),
+        leaf_batch_size=_int(raw, "leaf_batch_size", where),
     )
 
 

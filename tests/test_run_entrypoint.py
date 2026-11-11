@@ -48,6 +48,7 @@ from core.learner import LearnerDriver
 from core.network import NetworkConfig
 from core.replay_shard import read_shard
 from core.run_identity import (
+    LAUNCH_SCHEMA_VERSION,
     LaunchConfig,
     MaterialConfigDiffError,
     RunRecord,
@@ -120,7 +121,7 @@ def _base_raw(tmp_path: Path, **training_overrides) -> dict:
     raw["run_dir"] = str(tmp_path / "runs")
     raw["num_actors"] = 1
     raw["device"] = "cpu"
-    raw["schema_version"] = 1
+    raw["schema_version"] = LAUNCH_SCHEMA_VERSION
     raw["runtime"] = {
         "refresh_poll_interval": 0.02,
         "pacing_poll_interval": 0.02,
