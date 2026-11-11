@@ -576,6 +576,16 @@ def test_versioned_reader_rejects_a_version_it_has_no_migration_for(tmp_path, ve
         read_stored_config_document(root)
 
 
+def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwritten(tmp_path):
+    """The migration fills what v1 could not say; it never replaces what a file does say."""
+    root = _v1_run_dir(tmp_path)
+    doc = json.loads(V1_CONFIG_FIXTURE.read_text())
+    doc["self_play"]["leaf_batch_size"] = 8
+    (root / "config.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="leaf_batch_size"):
+        read_stored_config_document(root)
+
+
 def test_a_v1_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
     """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
     root = _v1_run_dir(tmp_path)

@@ -784,10 +784,21 @@ def _migrate_v1_to_v2(document: Mapping[str, Any]) -> dict[str, Any]:
 
     Returns:
         The v2-shaped copy.
+
+    Raises:
+        ValueError: If the document already carries
+            ``self_play.leaf_batch_size`` -- a key the v1 schema never had, so
+            its value cannot be what the run ran with and is not silently
+            replaced.
     """
     migrated = dict(document)
     self_play = migrated.get("self_play")
     if isinstance(self_play, Mapping):  # anything else is from_dict's error to raise
+        if "leaf_batch_size" in self_play:
+            raise ValueError(
+                "stored config: schema_version 1 document carries self_play.leaf_batch_size, "
+                "a key that schema does not have"
+            )
         migrated["self_play"] = {**self_play, "leaf_batch_size": 1}
     migrated["schema_version"] = 2
     return migrated
