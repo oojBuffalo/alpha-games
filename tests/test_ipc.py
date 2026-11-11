@@ -343,7 +343,9 @@ def test_refresh_on_cuda_persists_a_live_amp_record(tmp_path):
         network_config=TTT_NET_CONFIG,
         metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
     )
-    evaluator, _, _ = refresh()
+    evaluator, _, batched = refresh()
+    batched(TTT, [TTT.initial_state()])  # the batched path first: it must be live on its own
+    assert _amp_records(run_dir) == [1.0]
     evaluator(TTT, TTT.initial_state())
     assert _amp_records(run_dir) == [1.0]
     assert reduce_run(run_dir).gauges[SERIES_ACTOR_AMP_ACTIVE] == 1.0
@@ -475,6 +477,7 @@ def test_the_batched_evaluator_also_runs_inside_the_amp_context(tmp_path, monkey
     )
     scalar, _, batched = refresh()
     batched(TTT, [TTT.initial_state()])
+    assert _amp_records(run_dir) == [1.0]  # recorded by the batched call itself
     scalar(TTT, TTT.initial_state())  # the second evaluator's first call records nothing
     assert _amp_records(run_dir) == [1.0]
 

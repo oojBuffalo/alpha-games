@@ -99,6 +99,17 @@ def test_observe_reports_the_live_state_once_from_inside_the_context():
     assert seen == [False]  # a disabled context is observed as not live
 
 
+@pytest.mark.skipif(torch.cuda.is_available(), reason="needs a host without CUDA")
+@pytest.mark.filterwarnings("ignore:CUDA is not available")
+def test_observe_reports_torchs_state_not_the_modes_own_flag():
+    """A CUDA mode on a CUDA-less host: the flag says on, torch disables the context."""
+    seen = []
+    claimed = AmpMode(device_type="cuda", enabled=True)
+    amp_evaluator(lambda game, state: (0.0, None), claimed, observe=seen.append)(None, "s")
+    assert claimed.enabled is True
+    assert seen == [False]  # what happened, not what was asked for
+
+
 def test_the_wrapper_passes_a_batch_of_states_through_untouched():
     """One wrapper serves both engine seams: the second argument is opaque to it."""
     calls = []

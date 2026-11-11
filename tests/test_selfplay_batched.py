@@ -112,22 +112,6 @@ def test_without_a_batched_evaluator_a_batch_maps_the_scalar_one_over_its_leaves
     assert game.is_terminal(play_game(game, None, _cfg(4), GameRNGs.for_game(3, 0)).terminal_state)
 
 
-def test_leaf_batch_size_one_is_the_serial_search():
-    """The default is the pre-batching loop: the scalar evaluator, one leaf per call."""
-    game = GAMES["tictactoe"]
-    scalar, _ = _evaluators(game)
-    serial = play_game(game, scalar, _cfg(1), GameRNGs.for_game(5, 0))
-    default = play_game(
-        game,
-        scalar,
-        SelfPlayConfig(
-            sims=48, k_temp=4, dirichlet_eps=0.25, dirichlet_alpha_numerator=10.8, root_noise=True
-        ),
-        GameRNGs.for_game(5, 0),
-    )
-    assert serial == default
-
-
 # --- D10: stored π is raw N, with no virtual-loss residue ------------------------------
 
 
@@ -217,3 +201,26 @@ class _LeakyMCTS(MCTS):
 def test_the_guard_fails_on_an_engine_that_does_not_back_virtual_loss_out(monkeypatch):
     with pytest.raises(AssertionError, match="virtual loss"):
         _assert_stored_pi_is_raw_n(monkeypatch, engine=_LeakyMCTS)
+
+
+# --- leaf_batch_size = 1 is the serial search ------------------------------------------
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit-1", "default"])
+def test_leaf_batch_size_one_searches_serially_through_the_scalar_evaluator(monkeypatch, explicit):
+    """Every search is handed ``batch_size == 1``, whether ``1`` is stated or defaulted."""
+    game = GAMES["tictactoe"]
+    scalar, _ = _evaluators(game)
+    cfg = _cfg(1)
+    if not explicit:
+        cfg = SelfPlayConfig(
+            sims=48, k_temp=4, dirichlet_eps=0.25, dirichlet_alpha_numerator=10.8, root_noise=True
+        )
+    log = []
+    monkeypatch.setattr(selfplay, "MCTS", _recording(MCTS, log))
+
+    result = play_game(game, scalar, cfg, GameRNGs.for_game(5, 0))
+
+    assert game.is_terminal(result.terminal_state)
+    assert len(log) == result.plies > 0
+    assert {search["batch_size"] for search in log} == {1}
