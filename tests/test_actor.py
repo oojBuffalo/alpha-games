@@ -36,10 +36,13 @@ from core.observability import (
     SERIES_MOVES_FULL_512,
     SERIES_MOVES_MID_256,
     SERIES_POSITIONS_EVALUATED,
+    SERIES_POSITIONS_PLAYED,
+    SERIES_POSITIONS_STORED,
     SERIES_SIMS_RUN,
     InferenceBatchCounter,
     PositionCounter,
     count_positions,
+    reduce_run,
 )
 from core.replay_shard import read_shard, shard_filename
 from core.run_identity import load_launch_config
@@ -234,7 +237,7 @@ def test_samples_carry_mover_pinned_version_and_durable_game_id(tmp_path):
 
 
 def test_every_ply_is_stored_no_d12_dropping(tmp_path):
-    """M3 stores every position (M5 owns the fast-tier drop policy)."""
+    """The validate tier stores every position: it has no fast tier to drop."""
     driver = make_driver(tmp_path, max_games=4)
     for path in driver.run():
         plies = [r.ply for r in read_shard(path, TTT).records]
@@ -724,7 +727,7 @@ def test_a_d6_actor_flushes_the_real_sims_and_its_tier_mix(tmp_path):
 
 
 def test_a_validate_tier_actor_writes_no_tier_series(tmp_path):
-    """PCR off, the flush is exactly what it was: ``plies * 128`` and no tier mix."""
+    """PCR off: ``plies * 128`` sims, no tier mix, every position played is stored."""
     paths = make_driver(
         tmp_path / "shards",
         max_games=2,
@@ -733,7 +736,74 @@ def test_a_validate_tier_actor_writes_no_tier_series(tmp_path):
     plies = [len(read_shard(path, TTT).records) for path in paths]
 
     flushed = _series_values(tmp_path)
-    assert {series for series, _ in flushed} == {SERIES_GAMES_COMPLETED, SERIES_SIMS_RUN}
+    assert {series for series, _ in flushed} == {
+        SERIES_GAMES_COMPLETED,
+        SERIES_SIMS_RUN,
+        SERIES_POSITIONS_PLAYED,
+        SERIES_POSITIONS_STORED,
+    }
     # ...so the acceptance checklist of such a run must never require them.
     assert not set(TIER_SERIES.values()) & set(_REQUIRED_POSITIVE_SERIES)
     assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [p * 128 for p in plies]
+    assert [v for s, v in flushed if s == SERIES_POSITIONS_PLAYED] == plies
+    assert [v for s, v in flushed if s == SERIES_POSITIONS_STORED] == plies
+
+
+# --- the D12 drop: only stored positions are published, and both are counted ---
+
+
+def test_a_d6_actor_publishes_exactly_the_stored_positions_and_counts_them(tmp_path):
+    """The shard holds a game's non-fast plies; the counters say so exactly, per game."""
+    games = 6
+    paths = make_driver(
+        tmp_path / "shards",
+        run_seed=11,
+        actor_id=2,
+        self_play=d6_cfg(),
+        max_games=games,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-2"),
+    ).run()
+    replayed = [
+        play_game(TTT, None, d6_cfg(), GameRNGs.for_actor_game(11, 2, index), model_version=1)
+        for index in range(games)
+    ]
+    shards = [read_shard(path, TTT).records for path in paths]
+
+    # The shard round trip of a game with dropped plies: every stored sample
+    # comes back whole, in ply order, and nothing else does.
+    for records, result in zip(shards, replayed, strict=True):
+        assert [r.ply for r in records][:2] == [0, 1]  # never dropped
+        assert len(records) < result.plies  # ...but something was
+        assert len(records) == len(result.samples)
+        for record, sample in zip(records, result.samples, strict=True):
+            assert np.array_equal(np.asarray(record.planes), np.asarray(sample.planes))
+            assert (record.sparse_pi, record.z, record.aux) == (
+                sample.sparse_pi,
+                sample.z,
+                sample.aux,
+            )
+            assert (record.ply, record.mover, record.model_version) == (
+                sample.ply,
+                sample.mover,
+                sample.model_version,
+            )
+
+    # One exact record per game of each: what was played, and what a reader
+    # of that game's shard will find.
+    flushed = _series_values(tmp_path, "actor-2")
+    played = [v for s, v in flushed if s == SERIES_POSITIONS_PLAYED]
+    stored = [v for s, v in flushed if s == SERIES_POSITIONS_STORED]
+    assert played == [result.plies for result in replayed]
+    assert stored == [len(records) for records in shards]
+
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_POSITIONS_PLAYED] == sum(played)
+    assert totals[SERIES_POSITIONS_STORED] == sum(stored)
+    assert totals[SERIES_POSITIONS_STORED] == (
+        totals[SERIES_MOVES_FULL_512] + totals[SERIES_MOVES_MID_256]
+    )
+    assert totals[SERIES_POSITIONS_PLAYED] == (
+        totals[SERIES_POSITIONS_STORED] + totals[SERIES_MOVES_FAST_64]
+    )
+    # An M3 run carries neither, so its checklist must never require them.
+    assert not {SERIES_POSITIONS_PLAYED, SERIES_POSITIONS_STORED} & set(_REQUIRED_POSITIVE_SERIES)

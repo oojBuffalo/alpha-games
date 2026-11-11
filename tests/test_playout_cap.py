@@ -10,9 +10,11 @@ Two layers of ``core.selfplay``:
    budget, carries the tier to the stored sample, and accounts for the
    simulations run exactly. With playout-cap randomization off it is
    bit-identical to the fixed-budget loop it replaced (the frozen golden below).
-
-Every position is still stored here whatever its tier: dropping the fast tier
-(D12) is a separate change that filters at the same append site.
+3. The D12 drop (design doc §7, §10 D12) -- a fast-tier ply is searched and
+   played but never stored. The stored samples are exactly the non-fast plies,
+   each still carrying sparse π + z + aux; the plies below the always-full
+   boundary can never be dropped; and the played and stored position counts
+   reconcile with the per-tier counts game by game.
 """
 
 from __future__ import annotations
@@ -29,9 +31,12 @@ from core.mcts import MCTS
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
 from core.selfplay import Tier, draw_tier, play_game, select_move
+from games.blokus_duo import BlokusDuo
+from games.blokus_duo.config import MICRO_CONFIG
 from games.tictactoe import TicTacToe
 
 TTT = TicTacToe()
+MICRO = BlokusDuo(config=MICRO_CONFIG)
 
 FULL = Tier(sims=512, stored=True, name="full")
 MID = Tier(sims=256, stored=True, name="mid")
@@ -211,15 +216,16 @@ def test_each_ply_is_searched_at_its_drawn_tier_and_the_sims_are_counted_exactly
     hash(result)  # a frozen result stays hashable, as it was before the tier fields
 
 
-def test_the_tier_reaches_the_sample_and_every_ply_is_still_stored(searched):
+def test_the_tier_reaches_the_sample_and_fast_plies_are_searched_but_not_stored(searched):
     cfg = d6_cfg()
     result = play_game(TTT, None, cfg, GameRNGs.for_actor_game(*D6_GAME))
 
     twin = GameRNGs.for_actor_game(*D6_GAME).pcr_tier
     names = [draw_tier(cfg, ply, twin).name for ply in range(result.plies)]
-    assert [sample.tier for sample in result.samples] == names
-    assert [sample.ply for sample in result.samples] == list(range(result.plies))
-    assert "fast" in names  # ...and it is stored: no drop-policy here
+    kept = [(ply, name) for ply, name in enumerate(names) if name != "fast"]
+    assert [(sample.ply, sample.tier) for sample in result.samples] == kept
+    assert 0 < len(kept) < result.plies  # something was dropped, something was not
+    assert len(searched) == len(result.moves) == len(names)  # ...and it was still played
 
 
 class _CountingRandom(random.Random):
@@ -250,43 +256,71 @@ def test_the_tier_draw_comes_from_the_pcr_tier_stream_once_per_drawn_ply():
     names = ["full", "full"] + [
         "mid" if twin.random() < 0.25 else "fast" for _ in range(result.plies - 2)
     ]
-    assert [sample.tier for sample in result.samples] == names
+    assert dict(result.tier_counts) == Counter(names)
+    assert [sample.tier for sample in result.samples] == [n for n in names if n != "fast"]
+
+
+def _reference_game(game, rngs, leaf_batch_size=1, k_temp=4):
+    """Play one D6 game with the engine directly, keeping every ply.
+
+    Root noise on at every ply, D10 selection at every ply, the root's raw
+    counts as the target, the subtree reused after every move, and one leaf
+    batch size at every tier. Nothing here knows about storage.
+
+    Args:
+        game: The adapter to play.
+        rngs: The game's stream bundle; ``pcr_tier`` is drawn once per ply
+            from ply 2.
+        leaf_batch_size: Maximum leaves per evaluation.
+        k_temp: The D10 temperature cutoff ply.
+
+    Returns:
+        ``(moves, budgets, targets, states)``: the actions played and, per
+        ply, the budget searched, the root's raw ``(action, N)`` pairs after
+        that search, and the state searched.
+    """
+    search = MCTS(game, evaluate=None, root_noise=(0.25, 10.8, rngs.dirichlet))
+    state = game.initial_state()
+    search.set_root(state)
+    moves, budgets, targets, states = [], [], [], []
+    while not game.is_terminal(state):
+        ply = len(moves)
+        budget = 512 if ply < 2 else (256 if rngs.pcr_tier.random() < 0.25 else 64)
+        search.run(budget, batch_size=leaf_batch_size)
+        visits = search.action_visit_counts()
+        budgets.append(budget)
+        targets.append(tuple(visits.items()))
+        states.append(state)
+        action = select_move(visits, ply, k_temp, rngs.move_selection)
+        search.advance(action)
+        state = game.apply(state, action)
+        moves.append(action)
+    return moves, budgets, targets, states
 
 
 @pytest.mark.parametrize("k_temp", [4, 9])
 @pytest.mark.parametrize("leaf_batch_size", [1, 4])
 def test_a_d6_game_matches_a_reference_loop_on_the_public_search_api(leaf_batch_size, k_temp):
-    """Only the budget varies by tier.
+    """Only the budget varies by tier, and only the fast tier goes unstored.
 
-    The reference plays the same game with the engine directly: root noise on
-    at every ply, D10 selection at every ply, the root's raw counts as the
-    target, the subtree reused after every move, and the configured leaf batch
-    size at every tier. This game's two mid-tier plies are 4 and 7, so at
+    A dropped ply is still searched, still played and still advances the
+    reused subtree, so the reference keeps every ply and the stored samples
+    are its non-fast ones. This game's two mid-tier plies are 4 and 7, so at
     ``k_temp`` 4 they take the argmax branch and at 9 every ply -- full, mid
     and fast -- is sampled.
     """
     cfg = d6_cfg(leaf_batch_size=leaf_batch_size, k_temp=k_temp)
     result = play_game(TTT, None, cfg, GameRNGs.for_actor_game(*D6_GAME))
 
-    rngs = GameRNGs.for_actor_game(*D6_GAME)
-    search = MCTS(TTT, evaluate=None, root_noise=(0.25, 10.8, rngs.dirichlet))
-    state = TTT.initial_state()
-    search.set_root(state)
-    moves, targets = [], []
-    while not TTT.is_terminal(state):
-        ply = len(moves)
-        budget = 512 if ply < 2 else (256 if rngs.pcr_tier.random() < 0.25 else 64)
-        search.run(budget, batch_size=leaf_batch_size)
-        visits = search.action_visit_counts()
-        targets.append(tuple(visits.items()))
-        action = select_move(visits, ply, k_temp, rngs.move_selection)
-        search.advance(action)
-        state = TTT.apply(state, action)
-        moves.append(action)
+    moves, budgets, targets, _ = _reference_game(
+        TTT, GameRNGs.for_actor_game(*D6_GAME), leaf_batch_size, k_temp
+    )
+    kept = [ply for ply, budget in enumerate(budgets) if budget != 64]
 
-    assert [sample.tier for sample in result.samples][4] == "mid"
+    assert {sample.ply: sample.tier for sample in result.samples}[4] == "mid"
     assert result.moves == tuple(moves)
-    assert [sample.sparse_pi for sample in result.samples] == targets
+    assert [sample.ply for sample in result.samples] == kept
+    assert [sample.sparse_pi for sample in result.samples] == [targets[ply] for ply in kept]
 
 
 def test_a_d6_game_is_a_pure_function_of_its_seed():
@@ -359,3 +393,174 @@ def test_pcr_off_is_bit_identical_to_the_fixed_budget_loop(searched, leaf_batch_
     assert [result.sims_run for result in results] == [64 * r.plies for r in results]
     assert all(result.tier_counts == (("fixed", result.plies),) for result in results)
     assert {sample.tier for result in results for sample in result.samples} == {"fixed"}
+    # Nothing is dropped: there is no fast tier with playout-cap randomization off.
+    for result in results:
+        assert [sample.ply for sample in result.samples] == list(range(result.plies))
+        assert result.positions_stored == result.positions_played == result.plies
+
+
+# ==============================================================================
+# 3. The D12 drop
+# ==============================================================================
+
+
+class _ScriptedTiers:
+    """A stand-in ``pcr_tier`` stream that draws a scripted tier sequence.
+
+    Args:
+        tiers: The tier of each drawn ply, ``"mid"`` or ``"fast"``, in order
+            from the first ply at or past the always-full boundary.
+    """
+
+    def __init__(self, tiers):
+        self._draws = iter([0.0 if tier == "mid" else 0.99 for tier in tiers])
+
+    def random(self) -> float:
+        """Return the next scripted draw.
+
+        Returns:
+            ``0.0`` for a mid-tier ply, ``0.99`` for a fast-tier one.
+
+        Raises:
+            StopIteration: If the game outlasts the script.
+        """
+        return next(self._draws)
+
+
+def _scripted(tiers, game=D6_GAME) -> GameRNGs:
+    """Build a game's stream bundle with its tier stream scripted.
+
+    Args:
+        tiers: The tiers :class:`_ScriptedTiers` draws, in order.
+        game: The ``(run_seed, actor_id, game_index)`` every other stream is
+            derived from.
+
+    Returns:
+        The bundle, differing from the seeded one in ``pcr_tier`` only.
+    """
+    return dataclasses.replace(GameRNGs.for_actor_game(*game), pcr_tier=_ScriptedTiers(tiers))
+
+
+# Plies 2-8: ply 2 is dropped, so stored ply 3 is searched on the subtree the
+# dropped search grew.
+SCRIPT = ("fast", "mid", "fast", "mid", "fast", "fast", "mid")
+BUDGET = {"full": 512, "mid": 256, "fast": 64}
+
+
+@pytest.mark.parametrize("game", [TTT, MICRO], ids=["tictactoe-no-aux", "blokus-micro-with-aux"])
+def test_a_scripted_tier_sequence_stores_exactly_the_stored_tier_plies(game, searched):
+    result = play_game(game, None, d6_cfg(), _scripted(SCRIPT))
+
+    tiers = (("full", "full") + SCRIPT)[: result.plies]
+    assert result.plies >= 5  # plies 2 (dropped), 3 (stored) and 4 (dropped) were all played
+    assert searched == [BUDGET[tier] for tier in tiers]  # a dropped ply is still searched
+    kept = [ply for ply, tier in enumerate(tiers) if tier != "fast"]
+    assert [(sample.ply, sample.tier) for sample in result.samples] == [
+        (ply, tiers[ply]) for ply in kept
+    ]
+
+    # Every stored sample is a whole one: the position, the post-search raw N
+    # over its full legal set, and the terminal targets from its own mover.
+    moves, budgets, targets, states = _reference_game(game, _scripted(SCRIPT))
+    assert result.moves == tuple(moves)
+    assert budgets == searched
+    for sample in result.samples:
+        state = states[sample.ply]
+        assert sample.planes == game.encode_state(state)
+        assert sample.mover == game.current_player(state)
+        assert sample.sparse_pi == targets[sample.ply]
+        assert [action for action, _ in sample.sparse_pi] == list(game.legal_moves(state))
+        z, aux = game.training_targets(result.terminal_state, sample.mover)
+        assert (sample.z, sample.aux) == (z, tuple(aux))
+        assert len(sample.aux) == len(game.value_targets.aux_names)
+
+    # Stored π is not isolated from its dropped neighbour: ply 3 inherits the
+    # visits the dropped ply-2 search put under the move it then played.
+    after_a_drop = result.samples[2]
+    assert after_a_drop.ply == 3
+    assert sum(count for _, count in after_a_drop.sparse_pi) > BUDGET["mid"]
+
+
+@pytest.mark.parametrize("full_plies", [2, 4])
+def test_plies_below_the_always_full_boundary_can_never_be_dropped(full_plies):
+    """Structural, not statistical: the worst tier stream still drops none of them."""
+    cfg = d6_cfg(pcr_full_plies=full_plies)
+    result = play_game(TTT, None, cfg, _scripted(["fast"] * 9))
+
+    assert result.plies > full_plies
+    assert [(s.ply, s.tier) for s in result.samples] == [(p, "full") for p in range(full_plies)]
+    assert result.positions_stored == full_plies
+    # ...because a ply below the boundary is a stored tier before any draw.
+    for ply in range(full_plies):
+        assert draw_tier(cfg, ply, _ScriptedTiers([])).stored
+
+
+# ``play_game`` on the tree this change was built on (commit 4ca68d7), where
+# every ply was stored: Tic-Tac-Toe with the uniform evaluator on the D6
+# schedule, actor 3's games 0-7 under run seed 2026. Per ``leaf_batch_size``:
+# the plies of each game's non-fast samples, and one digest over every game's
+# moves, utilities and every field of those samples. Captured from that tree
+# before the append site filtered anything.
+D12_GOLDEN_GAMES = 8
+D12_GOLDEN = {
+    1: (
+        [(0, 1, 5, 6), (0, 1, 4, 7), (0, 1, 3, 7), (0, 1, 2), (0, 1, 3, 4), (0, 1, 3, 4)]
+        + [(0, 1), (0, 1, 3)],
+        "62bb60374973c65766c4bdc9711b28fd9d4e53e81b97bc1cdab9c78f319f663c",
+    ),
+    4: (
+        [(0, 1, 5, 6), (0, 1, 4, 7), (0, 1, 3, 7), (0, 1, 2), (0, 1, 3, 4), (0, 1, 3, 4, 5)]
+        + [(0, 1), (0, 1, 3)],
+        "1084a756c077a59501dc943c71dbcf74d99384be39585ab2d505873abd05aaae",
+    ),
+}
+
+
+def _d6_golden_games(leaf_batch_size):
+    """Play the games :data:`D12_GOLDEN` was captured from.
+
+    Args:
+        leaf_batch_size: Maximum leaves per evaluation.
+
+    Returns:
+        The finished games, in game-index order.
+    """
+    cfg = d6_cfg(leaf_batch_size=leaf_batch_size)
+    return [
+        play_game(
+            TTT,
+            None,
+            cfg,
+            GameRNGs.for_actor_game(2026, 3, index),
+            model_version=5,
+            game_id=("run", "3", index),
+        )
+        for index in range(D12_GOLDEN_GAMES)
+    ]
+
+
+@pytest.mark.parametrize("leaf_batch_size", sorted(D12_GOLDEN))
+def test_the_drop_only_filters_the_games_the_all_stored_loop_played(leaf_batch_size):
+    """Same moves, same stored samples bit for bit: dropping changes nothing else."""
+    digest = hashlib.sha256()
+    results = _d6_golden_games(leaf_batch_size)
+    for result in results:
+        rows = [
+            (s.planes, s.sparse_pi, s.ply, s.mover, s.z, s.aux, s.model_version, s.game_id, s.tier)
+            for s in result.samples
+        ]
+        digest.update(repr((result.moves, result.utilities, rows)).encode())
+
+    golden_plies, golden_digest = D12_GOLDEN[leaf_batch_size]
+    assert [tuple(s.ply for s in result.samples) for result in results] == golden_plies
+    assert digest.hexdigest() == golden_digest
+
+
+def test_played_and_stored_positions_reconcile_with_the_tier_counts_per_game():
+    results = _d6_golden_games(1)
+    for result in results:
+        counts = Counter(dict(result.tier_counts))
+        assert result.positions_stored == len(result.samples) == counts["full"] + counts["mid"]
+        assert result.positions_played == result.plies == result.positions_stored + counts["fast"]
+    assert all(result.positions_stored < result.positions_played for result in results)
+    assert {name for result in results for name, _ in result.tier_counts} == set(BUDGET)

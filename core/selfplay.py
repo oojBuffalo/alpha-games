@@ -18,12 +18,15 @@ The pinned decisions this module realizes:
 * **D7 root noise.** Wired through ``MCTS(root_noise=...)`` — the hook already in
   ``core/mcts.py`` — from the per-game Dirichlet stream, self-play only, and
   re-drawn by the engine whenever a node becomes root (subtree reuse included).
-* **D12 sample shape.** Every stored sample carries sparse ``(action_id,
-  visit_count)`` pairs (Invariant 3 — never a dense policy vector), plus ``z``
-  and the declared aux targets backfilled at game end. Every ply is stored
-  here, whatever budget it was searched at; each sample carries its tier's
-  name, and the tier is in scope where samples are appended, which is where
-  the D12 drop of fast-search positions filters.
+* **D12 sample shape and drop.** Every stored sample carries sparse
+  ``(action_id, visit_count)`` pairs (Invariant 3 — never a dense policy
+  vector), plus ``z`` and the declared aux targets backfilled at game end, and
+  its tier's name. A ply searched at the fast tier is played but **dropped
+  entirely**: :func:`play_game` appends a sample only when the ply's
+  :class:`Tier` is a stored one, so no partial or value-only sample ever
+  exists. The fast tier exists only under playout-cap randomization and only
+  at or past the always-full boundary, so with it off every ply is stored and
+  the opening plies can never be dropped.
 * **D6 search budgets.** :func:`draw_tier` picks each ply's simulation budget.
   With ``SelfPlayConfig.playout_cap_randomization`` off (the default: M2.5's
   fixed 64, M3's fixed 128) every ply is searched at ``cfg.sims``. With it on,
@@ -283,8 +286,9 @@ class GameResult:
     """One finished self-play game.
 
     Attributes:
-        samples: The backfilled per-ply samples, in play order.
-        moves: The actions played, in order.
+        samples: The backfilled samples of the stored plies, in play order —
+            every ply except those searched at the fast tier (D12).
+        moves: The actions played, in order — every ply, stored or dropped.
         terminal_state: The game's terminal state — kept so a caller can re-derive
             every target through the public ``Game`` surface (the z-consistency
             test does exactly that).
@@ -307,6 +311,16 @@ class GameResult:
     def plies(self) -> int:
         """Number of actions played from the initial state to terminal."""
         return len(self.moves)
+
+    @property
+    def positions_played(self) -> int:
+        """Positions searched and played: one per ply, stored or dropped."""
+        return len(self.moves)
+
+    @property
+    def positions_stored(self) -> int:
+        """Positions kept as training samples: the played ones minus the D12 drops."""
+        return len(self.samples)
 
 
 def backfill_targets(game: Game, terminal: State, samples: Iterable[Sample]) -> tuple[Sample, ...]:
@@ -355,9 +369,16 @@ def play_game(
     under the played move is reused (§6.2) and the D7 hook re-draws root noise on
     the promoted root. Each ply is searched at the budget :func:`draw_tier`
     gives it — the fixed ``cfg.sims`` unless ``cfg.playout_cap_randomization``
-    is on, then the D6 schedule — every ply is stored, and the targets are
-    backfilled once the game ends. Root noise, move selection and the stored
-    counts are the same at every tier.
+    is on, then the D6 schedule — and the targets are backfilled once the game
+    ends. Root noise, move selection and the stored counts are the same at
+    every tier.
+
+    A ply is stored only when its tier is a stored one (D12): a fast-tier ply
+    is searched, played and advances the reused subtree like any other, but
+    leaves no sample. A stored ply's counts are therefore still the root's raw
+    ``N``, including whatever visits a dropped neighbour's search left in the
+    subtree it inherited. With playout-cap randomization off there is no fast
+    tier and every ply is stored.
 
     Each search collects up to ``cfg.leaf_batch_size`` leaves per evaluation
     (§6.2 batched parallel selection). ``1`` is the serial search, bit for bit.
@@ -400,8 +421,8 @@ def play_game(
             batch's leaves instead.
 
     Returns:
-        The finished :class:`GameResult`, its samples already backfilled and
-        its simulation and per-tier ply counts filled.
+        The finished :class:`GameResult`, its stored samples already
+        backfilled and its simulation and per-tier ply counts filled.
     """
     root_noise = None
     if cfg.root_noise:
@@ -421,18 +442,18 @@ def play_game(
         sims_run += tier.sims
         tier_counts[tier.name] = tier_counts.get(tier.name, 0) + 1
         visits = search.action_visit_counts()
-        # Every tier is stored; ``tier.stored`` is what the D12 drop filters on.
-        samples.append(
-            Sample(
-                planes=game.encode_state(state),
-                sparse_pi=tuple(policy_target(visits)),
-                ply=ply,
-                mover=game.current_player(state),
-                model_version=model_version,
-                game_id=game_id,
-                tier=tier.name,
+        if tier.stored:  # D12: a fast-tier position is dropped entirely
+            samples.append(
+                Sample(
+                    planes=game.encode_state(state),
+                    sparse_pi=tuple(policy_target(visits)),
+                    ply=ply,
+                    mover=game.current_player(state),
+                    model_version=model_version,
+                    game_id=game_id,
+                    tier=tier.name,
+                )
             )
-        )
         action = select_move(visits, ply, cfg.k_temp, rngs.move_selection)
         search.advance(action)
         state = game.apply(state, action)

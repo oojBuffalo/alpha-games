@@ -544,7 +544,8 @@ def test_actor_driver_without_a_position_counter_omits_that_series(tmp_path):
     driver.run()
     records = list(iter_epoch_records(run_dir, "actor-0"))
     series = {r["series"] for r in records}
-    assert series == {"games_completed", "sims_run"}  # never a fabricated positions_evaluated
+    # never a fabricated positions_evaluated
+    assert series == {"games_completed", "sims_run", "positions_played", "positions_stored"}
 
 
 def test_actor_driver_without_metrics_writer_writes_nothing(tmp_path):
