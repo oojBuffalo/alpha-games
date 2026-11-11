@@ -100,6 +100,7 @@ No memory scheduler, cgroup, or MPS configuration is built here; §3's
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import signal
 import time
@@ -154,6 +155,22 @@ _DEFAULT_SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.
 # time on record (128.8 s for an evaluation game at 512 sims on CPU,
 # docs/bench/m4-exit-bench.md).
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 600.0
+
+
+def _check_grace_period(seconds: float) -> None:
+    """Refuse a shutdown grace period that is not a finite, non-negative number.
+
+    ``nan`` would compare as already expired and kill every child at once;
+    ``inf`` cannot be handed to ``Process.join``.
+
+    Args:
+        seconds: The grace period.
+
+    Raises:
+        ValueError: If ``seconds`` is negative, ``nan`` or infinite.
+    """
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"shutdown grace period must be finite and >= 0, got {seconds}")
 
 
 def _leaf_count(game: Game, states: Sequence[Any]) -> int:
@@ -646,9 +663,9 @@ class LaunchedRun:
         Returns:
             The total, as of the records durable when this was called.
         """
-        # ponytail: re-reduces the whole run dir per call; fine for a bounded
-        # run of a few hundred games, an incremental reader if one ever polls
-        # a long run.
+        # Each call re-reads every metrics record in the run directory. That
+        # is fine for a bounded run of a few hundred games; a long polled run
+        # would want an incremental reader.
         return int(reduce_run(self.metrics_writer.run_dir).totals[SERIES_GAMES_COMPLETED])
 
     def wait(
@@ -661,13 +678,20 @@ class LaunchedRun:
         The run ends when every process has exited on its own, when the
         caller is interrupted (``KeyboardInterrupt``), or -- with
         :attr:`spike_games` set -- when the run-wide completed-game total
-        reaches that target. The target is checked by this, the orchestrating
-        process, against the run's durable metrics (:meth:`games_completed`);
-        no child is told about it. On reaching it one ``spike_stop`` record
-        (``core.observability.spike_stop_record``) is appended before the
-        shutdown it triggers. The check runs before each liveness check, so a
-        run whose processes all exited at their own caps having reached the
-        target still records the stop. :meth:`shutdown` always runs.
+        reaches that target or can no longer reach it. The target is checked
+        by this, the orchestrating process, against the run's durable metrics
+        (:meth:`games_completed`); no child is told about it. On reaching it
+        one ``spike_stop`` record (``core.observability.spike_stop_record``)
+        is appended before the shutdown it triggers.
+
+        Each poll reads the actors' liveness first and the total second.
+        Only actors complete games, so a total read after every actor was
+        seen gone is final: at or above the target the stop is recorded, even
+        if the last game landed as its actor exited; below it the target is
+        out of reach (every actor hit its own cap, or died) and the run is
+        shut down with **no** ``spike_stop`` -- the record's absence is the
+        durable sign the target was not reached. :meth:`shutdown` always
+        runs.
 
         With :attr:`spike_games` unset this reads no metrics and writes no
         record of its own.
@@ -676,9 +700,15 @@ class LaunchedRun:
             poll_interval: Seconds between polls of the target and of process
                 liveness.
             shutdown_grace: The grace period :meth:`shutdown` is given.
+
+        Raises:
+            ValueError: If ``shutdown_grace`` is negative or not finite.
+                Raised before the first poll.
         """
+        _check_grace_period(shutdown_grace)
         try:
             while True:
+                actors_alive = any(actor.is_alive() for actor in self.actors.values())
                 if self.spike_games is not None:
                     completed = self.games_completed()
                     if completed >= self.spike_games:
@@ -686,7 +716,9 @@ class LaunchedRun:
                             spike_stop_record(target=self.spike_games, games_completed=completed)
                         )
                         break
-                if not any(process.is_alive() for process in self.all_processes()):
+                    if not actors_alive:
+                        break
+                if not (actors_alive or self.learner.is_alive()):
                     break
                 time.sleep(poll_interval)
         except KeyboardInterrupt:
@@ -735,7 +767,12 @@ class LaunchedRun:
                 how long after the signal a child may still be finishing
                 before it is killed. An actor finishes its in-flight game
                 first, so this must cover a whole game.
+
+        Raises:
+            ValueError: If ``timeout`` is negative or not finite. Raised
+                before any process is signaled.
         """
+        _check_grace_period(timeout)
         processes = self.all_processes()
         for process in processes:
             if process.is_alive():

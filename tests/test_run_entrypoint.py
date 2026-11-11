@@ -531,6 +531,35 @@ def test_spike_games_terminates_a_run_whose_learner_has_no_stop_of_its_own(tmp_p
     assert (stop["target"], stop["games_completed"]) == (6, 6)
 
 
+def test_spike_games_ends_a_run_whose_actors_all_exit_below_the_target(tmp_path):
+    """The target is out of reach: both actors are capped below it and the learner waits.
+
+    Nothing can complete another game, so the run is shut down rather than
+    polled forever -- and no ``spike_stop`` is recorded, since none happened.
+    """
+    raw = _base_raw(
+        tmp_path, replay_warmup_positions=1, publish_interval=1000, checkpoint_count=1000
+    )
+    raw["num_actors"] = 2
+    cfg = _write_config(tmp_path / "cfg.json", raw)
+
+    launched = rs.cmd_launch(
+        cfg,
+        spike_games=50,
+        max_games_per_actor=1,
+        block=False,
+        now=1_700_000_000.0,
+        network_config=MICRO_NET_CONFIG,
+    )
+    assert _wait_bounded(launched, 120.0), "the run polled on for a target it could not reach"
+    _assert_every_process_stopped_cleanly(launched)
+
+    run_dir = _only_run_dir(tmp_path)
+    assert reduce_run(run_dir).totals[SERIES_GAMES_COMPLETED] == 2  # the caps: 2 actors x 1
+    kinds = [rec["kind"] for rec in _orchestrator_records(run_dir)]
+    assert kinds == [KIND_SEGMENT_START, KIND_SEGMENT_END]
+
+
 def test_a_run_without_a_spike_target_records_only_its_gpu_segment(tmp_path):
     cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
     rs.cmd_launch(
@@ -566,18 +595,27 @@ def test_the_cli_threads_the_stop_arguments_into_every_launch_mode(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    ("flag", "value"),
-    [("--spike-games", "0"), ("--spike-games", "-3"), ("--shutdown-grace-seconds", "-1")],
+    "stop_args",
+    [
+        ["--spike-games", "0"],
+        ["--spike-games", "-3"],
+        ["--shutdown-grace-seconds", "-1"],
+        ["--shutdown-grace-seconds", "nan"],
+        ["--shutdown-grace-seconds", "inf"],
+        ["--spike-games", "3", "--no-block"],  # nothing would be left to enforce the target
+    ],
+    ids=" ".join,
 )
-def test_the_cli_refuses_an_out_of_range_stop_argument_before_creating_a_run(
-    tmp_path, capsys, flag, value
+def test_the_cli_refuses_an_unusable_stop_argument_before_creating_a_run(
+    tmp_path, capsys, monkeypatch, stop_args
 ):
     cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
-    caps = ["--max-games-per-actor", "1", "--max-learner-steps", "1"]  # a failure cannot hang
+    # Were one accepted, the test fails without starting a process it would leave behind.
+    monkeypatch.setattr(rs, "cmd_launch", lambda *args, **kwargs: None)
     with pytest.raises(SystemExit) as exc_info:
-        rs.main([str(cfg), *caps, flag, value])
+        rs.main([str(cfg), *stop_args])
     assert exc_info.value.code == 2
-    assert flag in capsys.readouterr().err
+    assert stop_args[0] in capsys.readouterr().err
     assert not (tmp_path / "runs").exists()  # refused before any provenance was written
 
 

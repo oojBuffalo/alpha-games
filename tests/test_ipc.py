@@ -880,24 +880,172 @@ def test_wait_without_a_spike_target_records_no_stop(tmp_path):
     assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
 
 
+class _HeldProcess:
+    """A stand-in handle that stays alive through any signal or join until killed.
+
+    Args:
+        clock: Optional one-item list holding a fake monotonic time; a join
+            advances it.
+        join_takes: Seconds a join consumes on ``clock`` (capped at its
+            timeout).
+    """
+
+    name = "actor-0"
+    pid = 4242
+
+    def __init__(self, clock=None, join_takes=0.0):
+        self.alive = True
+        self.calls = []
+        self.clock = clock
+        self.join_takes = join_takes
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def join(self, timeout=None):
+        self.calls.append(("join", timeout))
+        if self.clock is not None and timeout is not None:
+            self.clock[0] += min(timeout, self.join_takes)
+
+    def kill(self):
+        self.calls.append("kill")
+        self.alive = False
+
+
+def _bound_polls(monkeypatch, limit=20):
+    """Make a ``wait`` that keeps polling fail, instead of spinning forever."""
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        if len(polls) > limit:
+            raise AssertionError(f"wait() was still polling after {limit} polls")
+
+    monkeypatch.setattr(ipc.time, "sleep", sleep)
+
+
+def test_wait_ends_a_run_whose_actors_have_all_exited_below_the_target(tmp_path, monkeypatch):
+    """Every game writer is gone, so the target is out of reach: stop, and record no stop."""
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1, 1])
+    learner = _HeldProcess()  # e.g. waiting at its replay-ratio ceiling for shards
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=learner,
+        actors={0: _ExitedProcess(), 1: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=3,
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=1.0)
+
+    assert learner.calls[0] == "terminate"  # the run was shut down
+    kinds = _orchestrator_kinds(tmp_path)
+    assert KIND_SPIKE_STOP not in kinds  # its absence is the sign the target was not reached
+    assert kinds[-1] == KIND_SEGMENT_END
+
+
+class _FinishingProcess(_ExitedProcess):
+    """An actor whose last game lands, and which exits, as its liveness is first read."""
+
+    def __init__(self, run_dir):
+        self.run_dir = run_dir
+        self.finished = False
+
+    def is_alive(self):
+        if not self.finished:
+            self.finished = True
+            writer = EpochMetricsWriter(self.run_dir, "actor-1")
+            writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=9.0))
+        return False
+
+
+def test_wait_records_a_target_reached_by_the_game_that_ended_the_last_actor(tmp_path, monkeypatch):
+    """The total is read after the actors are seen gone, so it is the final one."""
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1])  # 1 of 2 until the last game lands
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _ExitedProcess(), 1: _FinishingProcess(tmp_path)},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=2,
+    )
+    launched.wait(poll_interval=0.0)
+
+    records = list(iter_epoch_records(tmp_path, "orchestrator"))
+    assert [rec["kind"] for rec in records] == [KIND_SPIKE_STOP, KIND_SEGMENT_END]
+    assert (records[0]["target"], records[0]["games_completed"]) == (2, 2)
+
+
+def test_wait_shuts_the_run_down_when_interrupted(tmp_path, monkeypatch):
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ipc.time, "sleep", interrupted)
+    held = _HeldProcess()
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=held,
+        actors={0: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=1.0)  # returns: the interrupt is the stop
+
+    assert held.calls[0] == "terminate"
+    assert not held.is_alive()
+    assert _orchestrator_kinds(tmp_path)[-1] == KIND_SEGMENT_END
+
+
+@pytest.mark.parametrize("grace", [float("nan"), float("inf"), -1.0])
+@pytest.mark.parametrize("method", ["wait", "shutdown"])
+def test_a_grace_period_that_is_not_finite_and_non_negative_is_refused_before_any_signal(
+    tmp_path, monkeypatch, method, grace
+):
+    _bound_polls(monkeypatch)
+    held = _HeldProcess()
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=held,
+        actors={0: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    with pytest.raises(ValueError, match="grace"):
+        if method == "wait":
+            launched.wait(poll_interval=0.0, shutdown_grace=grace)
+        else:
+            launched.shutdown(grace)
+    assert held.calls == []  # nothing signaled, nothing killed
+    assert not (tmp_path / "metrics").exists() or _orchestrator_kinds(tmp_path) == []
+
+
 @pytest.mark.parametrize("spike_games", [0, -1])
 def test_launch_run_refuses_a_non_positive_spike_target_before_starting_anything(
     tmp_path, spike_games
 ):
     run_config = _acceptance_run_config()
-    with pytest.raises(ValueError, match="spike_games"):
-        launch_run(
-            game_factory=_build_micro_game,
-            run_config=run_config,
-            self_play=run_config.self_play,
-            run_id="refused",
-            num_actors=1,
-            shard_dir=tmp_path / "shards",
-            ckpt_dir=tmp_path / "ckpt",
-            run_dir=tmp_path / "run",
-            run_seed=1,
-            spike_games=spike_games,
-        )
+    launched = None
+    try:
+        with pytest.raises(ValueError, match="spike_games"):
+            launched = launch_run(
+                game_factory=_build_micro_game,
+                run_config=run_config,
+                self_play=run_config.self_play,
+                run_id="refused",
+                num_actors=1,
+                shard_dir=tmp_path / "shards",
+                ckpt_dir=tmp_path / "ckpt",
+                run_dir=tmp_path / "run",
+                run_seed=1,
+                max_games_per_actor=1,  # were it accepted, the run would still end
+                max_learner_steps=1,
+                spike_games=spike_games,
+            )
+    finally:
+        if launched is not None:  # accepted: the test fails, and leaves no process behind
+            _kill_leftovers(launched.all_processes())
     assert not (tmp_path / "run").exists()  # no segment opened, no process started
 
 
@@ -1025,32 +1173,11 @@ def test_shutdown_escalates_a_child_that_outlives_the_grace_period_and_records_i
         _kill_leftovers(launched.all_processes())
 
 
-class _HeldProcess:
-    """A stand-in handle that stays alive through any signal or join until killed."""
-
-    name = "actor-0"
-    pid = 4242
-
-    def __init__(self):
-        self.alive = True
-        self.calls = []
-
-    def is_alive(self):
-        return self.alive
-
-    def terminate(self):
-        self.calls.append("terminate")
-
-    def join(self, timeout=None):
-        self.calls.append(("join", timeout))
-
-    def kill(self):
-        self.calls.append("kill")
-        self.alive = False
-
-
-def test_wait_gives_shutdown_its_grace_period_as_one_deadline(tmp_path):
-    held = [_HeldProcess(), _HeldProcess()]
+def test_wait_gives_shutdown_its_grace_period_as_one_deadline(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(ipc.time, "monotonic", lambda: clock[0])
+    held = [_HeldProcess(clock, join_takes=3.0), _HeldProcess(clock, join_takes=3.0)]
     _write_completed_games(tmp_path, [1])
     launched = ipc.LaunchedRun(
         ctx=None,
@@ -1062,10 +1189,11 @@ def test_wait_gives_shutdown_its_grace_period_as_one_deadline(tmp_path):
     launched.wait(poll_interval=0.0, shutdown_grace=5.0)
 
     for process in held:
-        terminate, (_, grace), kill, final_join = process.calls
+        terminate, _grace_join, kill, final_join = process.calls
         assert (terminate, kill, final_join) == ("terminate", "kill", ("join", None))
-        assert 0.0 <= grace <= 5.0  # the caller's grace, not the default
-    assert held[0].calls[1][1] > 4.0  # the first join gets (nearly) all of it
+    # One deadline shared by all: the caller's grace for the first join, and only
+    # what the first left of it for the second.
+    assert [process.calls[1] for process in held] == [("join", 5.0), ("join", 2.0)]
     assert _orchestrator_kinds(tmp_path) == [
         KIND_SPIKE_STOP,
         KIND_SHUTDOWN_FORCED,
