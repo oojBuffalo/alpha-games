@@ -386,7 +386,10 @@ def play_game(
     leaves no sample. A stored ply's counts are therefore still the root's raw
     ``N``, including whatever visits a dropped neighbour's search left in the
     subtree it inherited. With playout-cap randomization off there is no fast
-    tier and every ply is stored.
+    tier and every ply is stored. With it on and ``cfg.pcr_full_plies`` at
+    ``0`` no ply is guaranteed a stored tier, so a game whose every draw is
+    fast returns **no samples at all**; a caller that needs one per game must
+    keep the boundary above zero, as the actor's D6 pin of ``2`` does.
 
     The mover of every ply is recorded before that filter, so the game's
     consecutive-mover transition count is taken from the complete played
