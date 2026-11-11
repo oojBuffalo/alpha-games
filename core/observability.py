@@ -105,6 +105,7 @@ import functools
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, fields
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -781,6 +782,7 @@ WINDOW_ZERO_SPAN = "zero_span_window"
 WINDOW_FEWER_THAN_TWO_RECORDS = "fewer_than_two_records"
 WINDOW_NO_RECORD = "no_record"
 WINDOW_ZERO_DENOMINATOR = "zero_denominator"
+WINDOW_TOTAL_DECREASED = "total_decreased"
 
 # The percentiles of forward-pass size ``WindowedRun.batch_fill_percentiles`` reports.
 WINDOW_BATCH_FILL_PERCENTILES = (10, 50, 90)
@@ -812,9 +814,11 @@ class WindowedRun:
             or before the window end for a latest-value one),
             :data:`WINDOW_FEWER_THAN_TWO_RECORDS` (the ``learner_step``
             series has no record at or before the window start, so the two
-            endpoint readings its difference needs do not exist) and
-            :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose series are
-            present but whose denominator summed to zero).
+            endpoint readings its difference needs do not exist),
+            :data:`WINDOW_TOTAL_DECREASED` (the ``learner_step`` total went
+            backwards inside the window, so no endpoint difference counts
+            its steps) and :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose
+            series are present but whose denominator summed to zero).
         window_start: Timestamp of the start flush (:func:`reduce_window`).
         window_end: Timestamp of the end flush.
         start_game_ordinal: Run-wide cumulative ``games_completed`` through
@@ -840,7 +844,9 @@ class WindowedRun:
             last value at or before ``window_start``. Never a sum of the
             series' values, which are each already cumulative. The two
             readings may be one record: no step completed in the window, an
-            exact ``0`` (the learner writes one record per step).
+            exact ``0`` (the learner writes one record per step). Unavailable
+            if any reading in the window is below the one before it (a
+            learner restarted from an older step on a resumed run).
         learner_steps_per_sec: ``learner_steps_in_window`` per second of the
             window span.
         replay_ratio_at_window_end: The learner's last ``replay_ratio``
@@ -966,13 +972,19 @@ def _window_start(
     ``replay_warmup_positions`` -- the point from which the learner's D5
     pacing is live.
 
+    ``warmup_games = 0`` is met before any game. (b) needs at least one
+    stored position, which exists only once the first game is flushed, so
+    (b) then binds and the window opens at the first flush or later: zero
+    and one warm-up game give the same window.
+
     Args:
         cumulative_games: Run-wide cumulative ``games_completed`` through
             each flush, in run time order.
         cumulative_stored: Run-wide cumulative ``positions_stored`` through
             each flush, in the same order.
         warmup_games: Condition (a)'s game count.
-        replay_warmup_positions: Condition (b)'s stored-position count.
+        replay_warmup_positions: Condition (b)'s stored-position count,
+            at least 1.
 
     Returns:
         ``(index of the start flush, which condition bound it)`` -- (b) when
@@ -1128,12 +1140,13 @@ def reduce_window(
         The :class:`WindowedRun`.
 
     Raises:
-        ValueError: If ``warmup_games`` or ``replay_warmup_positions`` is
-            negative, or ``measure_games`` is not positive.
+        ValueError: If ``warmup_games`` is negative, or
+            ``replay_warmup_positions`` or ``measure_games`` is not positive
+            (the bounds the run config puts on the three).
     """
-    if warmup_games < 0 or replay_warmup_positions < 0 or measure_games < 1:
+    if warmup_games < 0 or replay_warmup_positions < 1 or measure_games < 1:
         raise ValueError(
-            "need warmup_games >= 0, replay_warmup_positions >= 0 and measure_games >= 1; got "
+            "need warmup_games >= 0, replay_warmup_positions >= 1 and measure_games >= 1; got "
             f"{warmup_games}, {replay_warmup_positions}, {measure_games}"
         )
     ordered = _ordered_records(run_dir)
@@ -1170,13 +1183,32 @@ def reduce_window(
             sums[series] = sums.get(series, 0) + value
 
     def per(series: str, unit_seconds: float) -> float | None:
-        """Return a summed series' rate over the window, or ``None`` if it has no record."""
+        """Return a summed series' rate over the window.
+
+        Args:
+            series: The delta series.
+            unit_seconds: Seconds in the rate's time unit.
+
+        Returns:
+            The window's sum per unit of time, or ``None`` if the series has
+            no record in the window.
+        """
         return sums[series] / (span / unit_seconds) if series in sums else None
 
     games_in_window = cumulative_games[end] - cumulative_games[start]
     step_at_start = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_start)
-    step_at_end = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_end)
-    learner_steps = None if step_at_start is None else step_at_end - step_at_start
+    # The reading at the start, then every reading inside the window, in order.
+    steps = [step_at_start] + [
+        rec["value"]
+        for ts, _proc, _seq, rec in ordered
+        if window_start < ts <= window_end
+        and rec.get("kind") == KIND_TOTAL
+        and rec.get("series") == SERIES_LEARNER_STEP
+    ]
+    steps_decreased = step_at_start is not None and any(
+        later < earlier for earlier, later in pairwise(steps)
+    )
+    learner_steps = None if step_at_start is None or steps_decreased else steps[-1] - steps[0]
 
     tiers = (SERIES_MOVES_FULL_512, SERIES_MOVES_MID_256, SERIES_MOVES_FAST_64)
     has_tiers = any(series in sums for series in tiers)
@@ -1227,7 +1259,8 @@ def reduce_window(
     }
     # The reason a field is None when it is not simply a series with no record.
     reasons = dict.fromkeys(
-        ("learner_steps_in_window", "learner_steps_per_sec"), WINDOW_FEWER_THAN_TWO_RECORDS
+        ("learner_steps_in_window", "learner_steps_per_sec"),
+        WINDOW_TOTAL_DECREASED if steps_decreased else WINDOW_FEWER_THAN_TWO_RECORDS,
     )
     if has_tiers:
         reasons["mid_tier_fraction"] = WINDOW_ZERO_DENOMINATOR

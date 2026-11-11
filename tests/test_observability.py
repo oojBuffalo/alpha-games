@@ -51,6 +51,7 @@ from core.observability import (
     WINDOW_NO_RECORD,
     WINDOW_REPLAY_WARMUP_NOT_REACHED,
     WINDOW_TOO_FEW_GAMES,
+    WINDOW_TOTAL_DECREASED,
     WINDOW_ZERO_DENOMINATOR,
     WINDOW_ZERO_SPAN,
     InferenceBatchCounter,
@@ -739,7 +740,9 @@ def test_live_path_smoke_a_real_single_process_run_reduces_to_sane_numbers(tmp_p
 # here measures throughput.
 
 
-def _flush_game(writer, timestamp, *, stored=5, played=None, sims=100, evals=None, extra=()):
+def _flush_game(
+    writer, timestamp, *, stored=5, played=None, sims=100, evals=None, extra=(), omit=()
+):
     """Append one finished game's flush: the actor's own series, on one timestamp.
 
     Args:
@@ -751,6 +754,7 @@ def _flush_game(writer, timestamp, *, stored=5, played=None, sims=100, evals=Non
         evals: The game's ``positions_evaluated`` delta, or ``None`` to omit
             the series (an actor with no position counter).
         extra: Further ``(series, value)`` deltas of the same flush.
+        omit: Series names this flush does not write at all.
     """
     played = stored if played is None else played
     deltas = [
@@ -763,7 +767,8 @@ def _flush_game(writer, timestamp, *, stored=5, played=None, sims=100, evals=Non
     if evals is not None:
         deltas.append(("positions_evaluated", evals))
     for series, value in deltas:
-        writer.append(delta_record(series, value, timestamp=timestamp))
+        if series not in omit:
+            writer.append(delta_record(series, value, timestamp=timestamp))
 
 
 def _seven_games(tmp_path, **flush_kwargs):
@@ -850,11 +855,42 @@ def test_window_start_met_by_both_conditions_at_one_game_names_the_stored_positi
     assert window.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
 
 
+def test_window_start_counts_stored_positions_not_played_ones(tmp_path):
+    """Under the drop-policy most played positions are never stored; pacing follows stored."""
+    _seven_games(tmp_path, stored=5, played=17)
+    # Played positions pass 18 at game 2; stored positions only at game 4.
+    window = reduce_window(tmp_path, warmup_games=1, measure_games=2, replay_warmup_positions=18)
+
+    assert window.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
+    assert (window.window_start, window.start_game_ordinal) == (40.0, 4)
+    assert window.stored_positions_per_game == pytest.approx(5.0)
+    assert window.played_positions_per_game == pytest.approx(17.0)
+
+
 def test_window_with_no_warm_up_games_still_waits_for_the_stored_positions(tmp_path):
     _seven_games(tmp_path)
     window = reduce_window(tmp_path, warmup_games=0, measure_games=3, replay_warmup_positions=11)
     assert window.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
     assert (window.start_game_ordinal, window.end_game_ordinal) == (3, 6)
+
+
+def test_window_with_no_warm_up_games_opens_no_earlier_than_the_first_stored_position(tmp_path):
+    """Zero warm-up games is met before any game; the stored positions then bind.
+
+    At least one stored position is always required, and the first exists
+    only once the first game is flushed, so zero and one warm-up game open
+    the same window -- and it is the stored-positions condition that bound it.
+    """
+    _seven_games(tmp_path)
+    none = reduce_window(tmp_path, warmup_games=0, measure_games=6, replay_warmup_positions=1)
+    one = reduce_window(tmp_path, warmup_games=1, measure_games=6, replay_warmup_positions=1)
+
+    assert none == one
+    assert none.binding_condition == WINDOW_BOUND_BY_REPLAY_WARMUP
+    assert (none.start_game_ordinal, none.end_game_ordinal) == (1, 7)
+    # Seven games cannot hold a seven-game window: the first only opens it.
+    short = reduce_window(tmp_path, warmup_games=0, measure_games=7, replay_warmup_positions=1)
+    _assert_insufficient(short, WINDOW_TOO_FEW_GAMES)
 
 
 @pytest.mark.parametrize(
@@ -932,6 +968,37 @@ def test_window_learner_fields_are_endpoint_readings_of_the_learner_series(tmp_p
     assert window.replay_ratio_at_window_end == 4.2  # the last gauge at or before t=60
 
 
+def test_window_learner_reading_on_a_boundary_timestamp_belongs_to_that_boundary(tmp_path):
+    _seven_games(tmp_path)
+    _write_learner_steps(tmp_path, [(40.0, 7, 5.5), (60.0, 9, 4.2)])  # exactly on [40, 60]
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.learner_steps_in_window == 2
+    assert window.replay_ratio_at_window_end == 4.2
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        [(35.0, 20, 1.0), (55.0, 11, 1.0)],  # ends below where it started
+        [(35.0, 20, 1.0), (45.0, 11, 1.0), (55.0, 25, 1.0)],  # dips, then ends above
+    ],
+    ids=["ends_lower", "dips_and_recovers"],
+)
+def test_window_over_a_learner_step_total_that_went_backwards_reports_no_step_count(
+    tmp_path, steps
+):
+    """A learner restarted from an older step inside the window: no honest difference."""
+    _seven_games(tmp_path)
+    _write_learner_steps(tmp_path, steps)
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.reason is None
+    for name in ("learner_steps_in_window", "learner_steps_per_sec"):
+        assert getattr(window, name) is None, name
+        assert window.unavailable[name] == WINDOW_TOTAL_DECREASED, name
+
+
 def test_window_with_a_parked_learner_reports_zero_steps_as_a_measurement(tmp_path):
     """No step record inside the window is an exact zero, not missing data."""
     _seven_games(tmp_path)
@@ -976,8 +1043,9 @@ def test_window_field_is_none_exactly_when_it_is_named_unavailable(tmp_path):
         dict(warmup_games=-1, measure_games=1, replay_warmup_positions=1),
         dict(warmup_games=1, measure_games=0, replay_warmup_positions=1),
         dict(warmup_games=1, measure_games=1, replay_warmup_positions=-1),
+        dict(warmup_games=1, measure_games=1, replay_warmup_positions=0),
     ],
-    ids=["negative_warmup", "zero_measure", "negative_replay_warmup"],
+    ids=["negative_warmup", "zero_measure", "negative_replay_warmup", "zero_replay_warmup"],
 )
 def test_window_rejects_an_impossible_protocol(tmp_path, kwargs):
     with pytest.raises(ValueError):
@@ -1245,6 +1313,9 @@ def test_window_actor_amp_is_live_only_if_every_actor_record_through_the_window_
     _amp_gauge(a1, 0.0, 45.0)  # one actor epoch inside it ran without autocast
     assert reduce_window(tmp_path, **kwargs).actor_amp_active is False
 
+    _amp_gauge(a1, 1.0, 46.0)  # a later live epoch does not undo that
+    assert reduce_window(tmp_path, **kwargs).actor_amp_active is False
+
 
 def test_window_is_cuda_is_read_from_the_segment_the_window_ran_in(tmp_path):
     _every_series_run(tmp_path)  # opens a CUDA segment at t=0
@@ -1252,3 +1323,46 @@ def test_window_is_cuda_is_read_from_the_segment_the_window_ran_in(tmp_path):
     orch.append(segment_start_record(device="cpu", timestamp=25.0))  # a CPU relaunch mid-window
     window = reduce_window(tmp_path, warmup_games=2, measure_games=3, replay_warmup_positions=18)
     assert window.is_cuda is False
+
+
+def test_window_per_game_field_whose_series_is_absent_is_named_never_zero(tmp_path):
+    actor = EpochMetricsWriter(tmp_path, "actor-0")
+    _flush_game(actor, 10.0, omit=("positions_played",))
+    for timestamp in (20.0, 30.0):
+        _flush_game(actor, timestamp, omit=("positions_played", "positions_stored"))
+    window = reduce_window(tmp_path, warmup_games=1, measure_games=2, replay_warmup_positions=5)
+
+    assert window.reason is None
+    fields = ("stored_positions_per_game", "played_positions_per_game", "stored_positions_per_hour")
+    for name in fields:
+        assert getattr(window, name) is None, name
+        assert window.unavailable[name] == WINDOW_NO_RECORD, name
+
+
+def test_window_ignores_a_delta_that_belongs_to_no_finished_game(tmp_path):
+    actors = _seven_games(tmp_path)
+    # Stray records inside the window [40, 60]: no games_completed opens their flush.
+    actors[1].append(delta_record("sims_run", 999, timestamp=55.0))
+    EpochMetricsWriter(tmp_path, "learner").append(delta_record("sims_run", 999, timestamp=50.0))
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.sims_per_sec == pytest.approx((100 + 100) / 20)
+
+
+def test_window_batch_fill_percentile_is_the_nearest_rank_rounded_up(tmp_path):
+    actor = EpochMetricsWriter(tmp_path, "actor-0")
+    _flush_game(actor, 10.0)
+    extra = [
+        ("inference_batches", 3),
+        ("inference_batch_size_1", 1),
+        ("inference_batch_size_2_3", 1),
+        ("inference_batch_size_4_7", 1),
+    ]
+    _flush_game(actor, 20.0, extra=extra)  # no positions_evaluated series
+    window = reduce_window(tmp_path, warmup_games=1, measure_games=1, replay_warmup_positions=1)
+
+    # Ranks ceil(0.3), ceil(1.5), ceil(2.7) of three passes: the 1st, 2nd and 3rd.
+    assert window.batch_fill_percentiles == {10: (1, 1), 50: (2, 3), 90: (4, 7)}
+    # Batches were counted but the leaves were not: missing data, not a zero denominator.
+    assert window.mean_batch_fill is None
+    assert window.unavailable["mean_batch_fill"] == WINDOW_NO_RECORD
