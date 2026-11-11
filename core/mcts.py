@@ -46,6 +46,7 @@ terminal leaves take ``terminal_utility`` inside the loop without reaching the e
 from __future__ import annotations
 
 import math
+import numbers
 import random
 from collections.abc import Callable, Sequence
 
@@ -118,7 +119,10 @@ class MCTS:
             returning one ``(value, priors)`` per state in order. When supplied it
             evaluates every batch (of any size) in one call and ``evaluate`` is not
             used; when ``None``, a batch maps ``evaluate`` over its leaves — correct,
-            unoptimized.
+            unoptimized. The states of one call belong to distinct leaves but need not
+            be distinct values: there is no transposition table, so two leaves reached
+            by different move orders can hold equal states, and an evaluator must not
+            assume otherwise.
         uniform_prior: If True, ignore any evaluator-provided priors and use uniform
             priors over legal actions (ladder rung 6). The evaluator's *value* is kept.
         virtual_loss: Virtual-loss magnitude applied per in-flight edge (default 1).
@@ -200,6 +204,15 @@ class MCTS:
         completes at least one simulation. With ``batch_size = 1`` this is the serial
         search, bit for bit.
 
+        A batch whose evaluation fails is abandoned whole. If the evaluator raises, or
+        returns anything the engine cannot use (see Raises), every descent of that batch
+        is rolled back before the error propagates: no virtual loss or in-flight mark is
+        left, no leaf of the batch is expanded, and none of it is counted. Every result is
+        checked before the first leaf is filled, so one bad result discards the batch's
+        well-formed ones too. This covers the evaluator only: an exception raised by the
+        game adapter itself (``apply`` / ``legal_moves`` during a descent,
+        ``terminal_utility`` during backup) can still leave virtual loss behind.
+
         Args:
             num_simulations: Number of simulations (backed-up leaf visits) to perform.
             root_state: If given, (re)sets the root to this state first; otherwise the
@@ -211,10 +224,13 @@ class MCTS:
             The root ``_Node`` (an opaque tree handle; read stats via the helpers below).
 
         Raises:
-            ValueError: If ``batch_size < 1``, if no root is set, or if ``evaluate_batch``
-                returns a different number of results than it was given states.
+            ValueError: If ``batch_size < 1``, if no root is set, if ``evaluate_batch``
+                returns a different number of results than it was given states, or if a
+                result is not a ``(value, priors)`` pair.
+            TypeError: If an evaluated value is not a real number. Malformed priors raise
+                whatever the softmax over them raises (typically also ``TypeError``).
             RuntimeError: If a batch opens onto a leaf that is already in flight — a
-                stale mark, which no completed or failed :meth:`run` leaves behind.
+                stale mark, which no completed run and no failed evaluation leaves behind.
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1; got {batch_size}")
@@ -228,7 +244,6 @@ class MCTS:
             # appear mid-batch: one noise check per batch is one check per descent.
             self._maybe_noise_root()
             batch: list[tuple[list[tuple[_Node, int]], _Node]] = []
-            done = 0
             try:
                 for _ in range(min(batch_size, remaining)):
                     path, leaf, collided = self._descend(apply_vloss=True)
@@ -241,25 +256,24 @@ class MCTS:
                 results = iter(
                     self._evaluate_leaves([leaf for _, leaf in batch if not leaf.is_terminal])
                 )
-                for path, leaf in batch:
-                    expanded_value = (
-                        None if leaf.is_terminal else self._fill_expand(leaf, *next(results))
-                    )
-                    ref_player, value = self._leaf_value(leaf, path, expanded_value)
-                    self._backup(path, ref_player, value)
-                    leaf.in_flight = False
-                    self.completed_simulations += 1
-                    done += 1
             except BaseException:
-                # Abandon what was not backed up, so a failed evaluation leaves neither
-                # virtual loss nor an in-flight mark behind and counts no simulation.
-                for path, leaf in batch[done:]:
+                # Nothing is filled yet, so abandoning the batch is exact: no virtual
+                # loss, no in-flight mark, no simulation counted.
+                for path, leaf in batch:
                     self._rollback_vloss(path)
                     leaf.in_flight = False
-                    if not leaf.is_expanded:
-                        leaf.actions = []  # undo the deferral: a fresh node again
+                    leaf.actions = []  # undo the deferral: a fresh node again
                 raise
-            remaining -= done
+            # Every result is already checked, so nothing below fails on the evaluator.
+            for path, leaf in batch:
+                expanded_value = (
+                    None if leaf.is_terminal else self._fill_expand(leaf, *next(results))
+                )
+                ref_player, value = self._leaf_value(leaf, path, expanded_value)
+                self._backup(path, ref_player, value)
+                leaf.in_flight = False
+                self.completed_simulations += 1
+            remaining -= len(batch)
         return self.root
 
     def advance(self, action: Action) -> None:
@@ -360,34 +374,47 @@ class MCTS:
         to_play = None if terminal else self.game.current_player(state)
         return _Node(state, terminal, to_play)
 
-    def _evaluate_leaves(
-        self, leaves: Sequence[_Node]
-    ) -> Sequence[tuple[float, dict[Action, float] | None]]:
-        """Evaluate one batch's non-terminal leaves.
+    def _evaluate_leaves(self, leaves: Sequence[_Node]) -> list[tuple[float, list[float]]]:
+        """Evaluate one batch's non-terminal leaves and check every result.
+
+        The evaluation comes from ``evaluate_batch`` in a single call if supplied, else
+        from ``evaluate`` mapped over the leaves, else it is the M0 default of value
+        ``0.0`` and uniform priors. Everything that can fail on what the evaluator
+        returned fails here, before any leaf is touched — which is what lets
+        :meth:`run` abandon a batch whole. Values are checked, never coerced.
 
         Args:
             leaves: The batch's deferred (non-terminal) leaves, in collection order.
 
         Returns:
-            One ``(value, raw_priors)`` per leaf, in order: from ``evaluate_batch`` in a
-            single call if supplied, else ``evaluate`` mapped over the leaves, else the M0
-            default of value ``0.0`` and uniform priors.
+            One ``(value, priors)`` per leaf, in order, with ``priors`` already
+            normalized over that leaf's legal actions (:meth:`_priors`).
 
         Raises:
-            ValueError: If ``evaluate_batch`` returns the wrong number of results.
+            ValueError: If ``evaluate_batch`` returns the wrong number of results, or a
+                result is not a ``(value, priors)`` pair.
+            TypeError: If a value is not a real number.
         """
         if self.evaluate_batch is None:
             if self.evaluate is None:
-                return [(0.0, None)] * len(leaves)
-            return [self.evaluate(self.game, leaf.state) for leaf in leaves]
-        if not leaves:
-            return []
-        results = self.evaluate_batch(self.game, [leaf.state for leaf in leaves])
-        if len(results) != len(leaves):
-            raise ValueError(
-                f"evaluate_batch returned {len(results)} results for {len(leaves)} states"
+                results = [(0.0, None)] * len(leaves)
+            else:
+                results = [self.evaluate(self.game, leaf.state) for leaf in leaves]
+        else:
+            # An all-terminal batch has nothing to evaluate: make no call at all.
+            results = (
+                self.evaluate_batch(self.game, [leaf.state for leaf in leaves]) if leaves else []
             )
-        return results
+            if len(results) != len(leaves):
+                raise ValueError(
+                    f"evaluate_batch returned {len(results)} results for {len(leaves)} states"
+                )
+        checked = []
+        for leaf, (value, raw_priors) in zip(leaves, results, strict=True):
+            if not isinstance(value, numbers.Real):
+                raise TypeError(f"evaluated value must be a real number; got {value!r}")
+            checked.append((value, self._priors(leaf.actions, raw_priors)))
+        return checked
 
     def _defer_expand(self, node: _Node) -> None:
         """Reserve a fresh non-terminal leaf for evaluation (the defer half of expansion).
@@ -402,25 +429,24 @@ class MCTS:
         node.actions = list(self.game.legal_moves(node.state))
         node.in_flight = True
 
-    def _fill_expand(
-        self, node: _Node, value: float, raw_priors: dict[Action, float] | None
-    ) -> float:
+    def _fill_expand(self, node: _Node, value: float, priors: list[float]) -> float:
         """Install an evaluation on a deferred leaf (the fill half of expansion).
 
         Completes the sparse ``{N, W, Q, P}`` expansion over the legal actions stored by
-        :meth:`_defer_expand`.
+        :meth:`_defer_expand`. It only assigns, so it cannot fail part-way.
 
         Args:
             node: A node previously passed to :meth:`_defer_expand`.
             value: The evaluation of ``node.state`` from ``node.to_play``'s perspective
                 (``0.0`` in M0, the network's value estimate with an evaluator).
-            raw_priors: Logits by action id, or ``None`` for uniform priors.
+            priors: Normalized priors over ``node.actions``, as :meth:`_priors` returns
+                them for this node.
 
         Returns:
             ``value``, unchanged — the leaf value to back up.
         """
         n = len(node.actions)
-        node.P = self._priors(node.actions, raw_priors)
+        node.P = priors
         node.N = [0] * n
         node.W = [0.0] * n
         node.Q = [0.0] * n

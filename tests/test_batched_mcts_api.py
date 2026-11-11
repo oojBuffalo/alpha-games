@@ -181,7 +181,7 @@ def test_deferred_leaf_is_a_collision_target_until_it_is_filled():
     assert node.actions == list(game.legal_moves(node.state))
     assert node.P == []
 
-    assert m._fill_expand(node, 0.25, {4: 3.0}) == 0.25
+    assert m._fill_expand(node, 0.25, m._priors(node.actions, {4: 3.0})) == 0.25
     n = len(node.actions)
     assert node.is_expanded
     assert abs(sum(node.P) - 1.0) < 1e-12
@@ -452,24 +452,42 @@ def test_batched_evaluator_takes_precedence_over_the_single_leaf_one():
     assert sum(len(call) for call in rec.calls) == 20
 
 
-@pytest.mark.parametrize("failure", ["raises", "short"])
+# What the third evaluate_batch call does, and the error (type, message) run() must
+# surface. The last four spoil only the *final* result, behind a well-formed prefix.
+COUNT = r"evaluate_batch returned \d+ results for \d+ states"
+EVALUATION_FAILURES = {
+    "raises": (None, RuntimeError, "evaluator down"),
+    "short": (lambda good: good[:-1], ValueError, COUNT),
+    "long": (lambda good: [*good, (0.0, None)], ValueError, COUNT),
+    "value-none": (lambda good: [*good[:-1], (None, None)], TypeError, "real number"),
+    "value-not-a-number": (lambda good: [*good[:-1], ("0.5", None)], TypeError, "real number"),
+    "priors-not-logits": (lambda good: [*good[:-1], (0.0, {0: "high"})], TypeError, None),
+    "result-not-a-pair": (lambda good: [*good[:-1], (0.0,)], ValueError, "unpack"),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(EVALUATION_FAILURES))
 def test_a_failed_evaluation_abandons_the_batch_and_leaves_the_tree_clean(failure):
     game = Connect4(4, 4, 3)
+    spoil, error, message = EVALUATION_FAILURES[failure]
     calls = []
 
     def flaky(game, states):
         calls.append(len(states))
-        if len(calls) == 3:
-            if failure == "raises":
-                raise RuntimeError("evaluator down")
-            return [(0.0, None)] * (len(states) - 1)
-        return [(0.0, None)] * len(states)
+        good = [(0.0, None)] * len(states)
+        if len(calls) != 3:
+            return good
+        if spoil is None:
+            raise RuntimeError("evaluator down")
+        return spoil(good)
 
     m = MCTS(game, evaluate_batch=flaky)
-    with pytest.raises(RuntimeError if failure == "raises" else ValueError):
+    with pytest.raises(error, match=message):
         m.run(40, root_state=game.initial_state(), batch_size=4)
 
-    # Only the two batches that finished count; the failed one's descents are rolled back.
+    # All or nothing: only the two batches that finished count. Every descent of the
+    # failed batch is rolled back, including those whose own result was well formed.
+    assert calls[2] > 1
     assert m.completed_simulations == calls[0] + calls[1] == sum(m.root.N) + 1
     _assert_no_residue(m.root)
 
