@@ -139,6 +139,8 @@ def d6_cfg(**overrides):
 
 def test_validate_accepts_the_validate_tier():
     validate_actor_self_play_config(self_play_cfg(sims=128))
+    # The schedule scalars are inert with the flag off, so they are not checked.
+    validate_actor_self_play_config(self_play_cfg(sims=128, pcr_mid_sims=200, pcr_full_plies=5))
     # ...which is the shape the checked-in full-game launch config is.
     shipped = load_launch_config(ROOT / "configs" / "blokus_duo.json").run.self_play
     assert (shipped.sims, shipped.playout_cap_randomization) == (128, False)
