@@ -15,10 +15,32 @@ Key invariants (never violated):
     the sign is correct even when one player moves consecutively (a blocked opponent).
     ``Q`` is therefore stored in the parent-mover's perspective and PUCT needs no flip.
   * Virtual loss is applied on descent and removed on backup, so a completed search
-    leaves zero residue; it exists so batched selection (M5) never re-picks an
-    in-flight leaf.
+    leaves zero residue; it steers concurrent in-flight descents apart.
   * Root Dirichlet noise (D7) is an *option*, off by default: it is exploration for
     self-play only, so every evaluation path runs the undisturbed priors.
+
+Batched parallel selection (design doc §6.2, §12 M5): ``run(n, batch_size=K)`` collects
+up to ``K`` descents before evaluating anything, hands the non-terminal leaves to one
+evaluation (``evaluate_batch`` if supplied, else ``evaluate`` mapped over them), then
+fills and backs up every path. Expansion is therefore split in two — a *defer* step that
+reserves the leaf during descent and a *fill* step that installs its evaluation — and
+terminal leaves take ``terminal_utility`` inside the loop without reaching the evaluator.
+
+  * Two mechanisms keep a batch's leaves distinct, and both are required. Virtual loss
+    diverts the next descent where there is a choice; the per-node *in-flight marker*
+    detects the cases it cannot divert — a forced move, or an unexpanded root, where no
+    edge exists for virtual loss to act on.
+  * The first collision closes the batch. A descent that reaches a leaf already in
+    flight has its virtual loss rolled back in full and is not a simulation; there is no
+    retry and no collision budget. ``K`` is thus an upper bound: a batch is also capped
+    by the remaining budget, and it need not fill even when the tree holds ``K``
+    unevaluated leaves. A batch's first descent cannot collide, so every batch completes
+    at least one simulation.
+  * ``completed_simulations`` counts backed-up simulations, as distinct from descents
+    attempted; the budget is spent against it, exactly.
+  * ``batch_size = 1`` is the serial search, bit for bit. Batching changes selection only
+    through the in-flight virtual-loss term: PUCT (D11), root noise (D7) and subtree
+    reuse are as in the serial engine.
 """
 
 from __future__ import annotations
@@ -424,8 +446,9 @@ class MCTS:
 
         A no-op unless ``root_noise`` is configured. Root priors only exist once the root is
         expanded, and a fresh root is expanded by its own first simulation — so this runs
-        before every simulation and fires on the first one that finds expanded priors (that
-        simulation's descent stops at the root, before any prior is read). Because the guard
+        before every batch and fires on the first one that finds expanded priors (a fresh
+        root's first batch is that one simulation, whatever the batch size: its descent
+        stops at the root, before any prior is read). Because the guard
         is the root *epoch*, a subtree promoted by :meth:`advance` gets fresh noise on the
         next search, while repeated :meth:`run` calls on one root never re-mix.
         """

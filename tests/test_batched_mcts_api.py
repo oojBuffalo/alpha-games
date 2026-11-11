@@ -431,3 +431,27 @@ def test_a_stale_in_flight_mark_fails_loudly_instead_of_spinning():
 
     with pytest.raises(RuntimeError):
         m.run(1)
+
+
+def test_batched_search_draws_root_noise_once_per_root_incarnation():
+    game = Connect4(4, 4, 3)
+    rng = random.Random(7)
+    m = MCTS(game, root_noise=(EPS, ALPHA_NUMERATOR, rng))
+
+    m.run(60, root_state=game.initial_state(), batch_size=8)
+    mixed = list(m.root.P)
+    n = len(mixed)
+    assert mixed != [1.0 / n] * n
+
+    # Exactly one Dirichlet draw was consumed, however many batches ran, and a further
+    # run on the same root never re-mixes.
+    replay = random.Random(7)
+    MCTS._dirichlet(n, ALPHA_NUMERATOR / n, replay)
+    assert rng.getstate() == replay.getstate()
+    m.run(60, batch_size=8)
+    assert m.root.P == mixed
+
+    m.advance(m.best_action())  # a new incarnation draws again
+    clean = list(m.root.P)
+    m.run(20, batch_size=8)
+    assert m.root.P != clean
