@@ -18,6 +18,7 @@ from core.metrics import EpochMetricsWriter
 from core.observability import (
     CHECKPOINT_PUBLISHED_KIND,
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_LEARNER_STEP,
@@ -259,6 +260,11 @@ def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
     stored_all = verify_acceptance(root, TTT, _run_config())
     assert stored_all.passed
 
+    # Not evaluable means not evaluable: the run's own transition counter
+    # being positive does not turn the check into a pass.
+    EpochMetricsWriter(root, "actor-1").append(
+        delta_record(SERIES_CONSECUTIVE_MOVER_TRANSITIONS, 3)
+    )
     schedule_on = _run_config_stub(
         batch_size=_BATCH_SIZE, publish_interval=_PUBLISH_INTERVAL, playout_cap_randomization=True
     )
@@ -266,7 +272,10 @@ def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
     check = _check(report, name)
     assert not check.passed
     assert not report.passed
-    assert "consecutive_mover_transitions" in check.detail
+    # The detail names the durable evidence and claims no reader for it.
+    assert check.detail.endswith(
+        f"the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} series, which this checklist does not read"
+    )
     assert "[FAIL] " + name in report.render()
     # Every other check reads exactly as it did.
     others = [(c.name, c.passed, c.detail) for c in report.checks if c.name != name]

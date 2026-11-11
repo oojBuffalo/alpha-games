@@ -202,8 +202,7 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
                 "fast-search positions were dropped and two adjacent stored samples "
                 "sharing a mover no longer show a player moving twice running; the "
                 f"durable evidence is the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} "
-                "series, which this M3 checklist does not read (the M5 acceptance "
-                "gate does)",
+                "series, which this checklist does not read",
             )
         )
     else:
