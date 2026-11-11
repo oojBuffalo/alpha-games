@@ -165,7 +165,8 @@ class SpikeResult:
     Attributes:
         games: Games completed in the measurement interval.
         plies: Plies played across those games.
-        sims: Simulations run across those games (``plies * sims_per_move``).
+        sims: Simulations run across those games: the sum of each measured
+            game's ``GameResult.sims_run``.
         net_evals: Leaf network evaluations counted by the wrapping evaluator.
         learner_steps: Learner steps taken inside the interval.
         legal_at_eval: Legal-set sizes seen at evaluated leaves, summed.
@@ -338,7 +339,9 @@ class RunMeta:
             hash — Invariant 4).
         warmup_games: Games discarded before measurement.
         measure_games: Games in the measurement interval.
-        sims: Micro sims/move during the spike.
+        sims: ``self_play.sims``, which the report prints as sims/move. That is
+            the per-move count only with playout-cap randomization off (the
+            checked-in micro config); with it on, it is the always-full budget.
         date: Run date, ``YYYY-MM-DD``.
     """
 
