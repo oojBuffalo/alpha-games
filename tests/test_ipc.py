@@ -58,12 +58,16 @@ from core.learner import (
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
 from core.observability import (
+    KIND_SEGMENT_END,
+    KIND_SPIKE_STOP,
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
     InferenceBatchCounter,
     PositionCounter,
+    delta_record,
     inference_batch_size_series,
     reduce_run,
 )
@@ -798,3 +802,98 @@ def test_multiprocess_acceptance_actors_and_learner_share_the_filesystem(tmp_pat
     assert resume_path(ckpt_dir).exists()
     for version in list_published_versions(ckpt_dir):
         load_checkpoint(published_checkpoint_path(ckpt_dir, version), MICRO)  # no torn write
+
+
+# ==============================================================================
+# 6. LaunchedRun.wait: the run-wide spike stop, over stand-in process handles
+# ==============================================================================
+
+
+class _ExitedProcess:
+    """A stand-in handle for a child that has already exited on its own."""
+
+    name = "exited"
+    pid = 0
+    exitcode = 0
+
+    def is_alive(self):
+        return False
+
+    def terminate(self):
+        raise AssertionError("an exited process is never signaled")
+
+    def join(self, timeout=None):
+        del timeout
+
+    def kill(self):
+        raise AssertionError("an exited process is never killed")
+
+
+def _exited_run(run_dir, *, spike_games=None):
+    """A :class:`~core.ipc.LaunchedRun` whose children have all exited already."""
+    return ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _ExitedProcess(), 1: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(run_dir, "orchestrator"),
+        spike_games=spike_games,
+    )
+
+
+def _write_completed_games(run_dir, per_actor):
+    """Append one ``games_completed`` delta per finished game, per actor."""
+    for actor_id, games in enumerate(per_actor):
+        writer = EpochMetricsWriter(run_dir, f"actor-{actor_id}")
+        for game in range(games):
+            writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=float(game)))
+
+
+def _orchestrator_kinds(run_dir):
+    return [rec["kind"] for rec in iter_epoch_records(run_dir, "orchestrator")]
+
+
+def test_wait_records_one_spike_stop_when_the_run_wide_total_reaches_the_target(tmp_path):
+    _write_completed_games(tmp_path, [2, 1])  # 3 run-wide: no single actor reaches 3
+    launched = _exited_run(tmp_path, spike_games=3)
+    assert launched.games_completed() == 3
+
+    launched.wait(poll_interval=0.0)
+
+    records = list(iter_epoch_records(tmp_path, "orchestrator"))
+    assert [rec["kind"] for rec in records] == [KIND_SPIKE_STOP, KIND_SEGMENT_END]
+    stop = records[0]
+    assert (stop["target"], stop["games_completed"]) == (3, 3)
+    assert stop["timestamp"] <= records[1]["timestamp"]
+
+
+def test_wait_below_the_spike_target_records_no_stop(tmp_path):
+    _write_completed_games(tmp_path, [1, 1])
+    _exited_run(tmp_path, spike_games=3).wait(poll_interval=0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+def test_wait_without_a_spike_target_records_no_stop(tmp_path):
+    _write_completed_games(tmp_path, [5, 5])
+    _exited_run(tmp_path).wait(poll_interval=0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+@pytest.mark.parametrize("spike_games", [0, -1])
+def test_launch_run_refuses_a_non_positive_spike_target_before_starting_anything(
+    tmp_path, spike_games
+):
+    run_config = _acceptance_run_config()
+    with pytest.raises(ValueError, match="spike_games"):
+        launch_run(
+            game_factory=_build_micro_game,
+            run_config=run_config,
+            self_play=run_config.self_play,
+            run_id="refused",
+            num_actors=1,
+            shard_dir=tmp_path / "shards",
+            ckpt_dir=tmp_path / "ckpt",
+            run_dir=tmp_path / "run",
+            run_seed=1,
+            spike_games=spike_games,
+        )
+    assert not (tmp_path / "run").exists()  # no segment opened, no process started

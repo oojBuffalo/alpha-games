@@ -38,6 +38,7 @@ from core.observability import (
     KIND_GAUGE,
     KIND_SEGMENT_END,
     KIND_SEGMENT_START,
+    KIND_SPIKE_STOP,
     KIND_TOTAL,
     SERIES_INFERENCE_BATCHES,
     InferenceBatchCounter,
@@ -52,6 +53,7 @@ from core.observability import (
     reduce_run,
     segment_end_record,
     segment_start_record,
+    spike_stop_record,
     total_record,
 )
 from core.replay_shard import read_shard
@@ -105,6 +107,13 @@ def test_segment_records_carry_device_and_is_cuda():
     end = segment_end_record(timestamp=2.0)
     assert end == {"kind": KIND_SEGMENT_END, "timestamp": 2.0}
     assert is_real_cuda("cpu") is False  # never real CUDA regardless of hardware
+
+
+def test_spike_stop_record_carries_the_target_and_the_observed_total():
+    rec = spike_stop_record(target=6, games_completed=7, timestamp=3.0)
+    assert rec == {"kind": KIND_SPIKE_STOP, "target": 6, "games_completed": 7, "timestamp": 3.0}
+    before = time.time()
+    assert spike_stop_record(target=1, games_completed=1)["timestamp"] >= before
 
 
 def test_records_round_trip_through_an_epoch_writer(tmp_path):

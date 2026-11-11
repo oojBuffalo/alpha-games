@@ -73,6 +73,12 @@ name and aggregation rule below is frozen, not an implementation detail.
 * ``"checkpoint_published"`` -- the learner's marker (``core.learner``,
   issue #60), unowned by this module but read by :func:`reduce_run`'s x-axis
   join.
+* ``"spike_stop"`` -- the orchestrator's marker that a bounded run reached
+  its run-wide completed-game target (:func:`spike_stop_record`; §12 M5).
+  Written at most once per launch, before the shutdown it triggers, so its
+  ``games_completed`` is the total observed at the stop: a signaled actor
+  still finishes its in-flight game, and the run's final total may be higher.
+  :func:`reduce_run` ignores it, like every kind it does not name.
 
 Every record additionally carries a ``timestamp`` (``time.time()``,
 informational for equality purposes elsewhere but load-bearing for the
@@ -105,6 +111,7 @@ KIND_GAUGE = "gauge"
 KIND_TOTAL = "total"
 KIND_SEGMENT_START = "segment_start"
 KIND_SEGMENT_END = "segment_end"
+KIND_SPIKE_STOP = "spike_stop"
 
 # Owned by core.learner (issue #60); defined here so both core.learner (the
 # writer) and this module (the reducer) share one literal with no drift.
@@ -275,6 +282,28 @@ def segment_end_record(*, timestamp: float | None = None) -> dict[str, Any]:
     """
     return {
         "kind": KIND_SEGMENT_END,
+        "timestamp": timestamp if timestamp is not None else time.time(),
+    }
+
+
+def spike_stop_record(
+    *, target: int, games_completed: int, timestamp: float | None = None
+) -> dict[str, Any]:
+    """Build the orchestrator's run-wide spike-stop record.
+
+    Args:
+        target: The run-wide completed-game target the launch was given.
+        games_completed: The run-wide completed-game total observed when the
+            target was found reached (at least ``target``).
+        timestamp: Wall-clock seconds. Defaults to ``time.time()``.
+
+    Returns:
+        ``{"kind": "spike_stop", "target", "games_completed", "timestamp"}``.
+    """
+    return {
+        "kind": KIND_SPIKE_STOP,
+        "target": target,
+        "games_completed": games_completed,
         "timestamp": timestamp if timestamp is not None else time.time(),
     }
 

@@ -119,12 +119,15 @@ from core.network import (
 )
 from core.observability import (
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_GAMES_COMPLETED,
     InferenceBatchCounter,
     PositionCounter,
     count_positions,
     gauge_record,
+    reduce_run,
     segment_end_record,
     segment_start_record,
+    spike_stop_record,
 )
 from core.runconfig import RunConfig, SelfPlayConfig
 
@@ -605,16 +608,74 @@ class LaunchedRun:
             segment records. :func:`launch_run` already appended this run's
             ``segment_start`` record before returning; :meth:`shutdown`
             appends the matching ``segment_end``.
+        spike_games: The run-wide completed-game target :meth:`wait` stops
+            the run at, or ``None`` (the default) for no run-wide stop.
     """
 
     ctx: BaseContext
     learner: multiprocessing.process.BaseProcess
     actors: dict[int, multiprocessing.process.BaseProcess]
     metrics_writer: EpochMetricsWriter
+    spike_games: int | None = None
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
         return (self.learner, *self.actors.values())
+
+    def games_completed(self) -> int:
+        """Return the run-wide completed-game total the run's durable metrics record.
+
+        Read from the run directory, never from a child: the sum of every
+        actor's ``games_completed`` deltas across every epoch file
+        (``core.observability.reduce_run``, the one sanctioned aggregation
+        point). On a resumed run directory that includes the games of its
+        earlier launches.
+
+        Returns:
+            The total, as of the records durable when this was called.
+        """
+        # ponytail: re-reduces the whole run dir per call; fine for a bounded
+        # run of a few hundred games, an incremental reader if one ever polls
+        # a long run.
+        return int(reduce_run(self.metrics_writer.run_dir).totals[SERIES_GAMES_COMPLETED])
+
+    def wait(self, poll_interval: float = 1.0) -> None:
+        """Block until the run ends, then shut it down.
+
+        The run ends when every process has exited on its own, when the
+        caller is interrupted (``KeyboardInterrupt``), or -- with
+        :attr:`spike_games` set -- when the run-wide completed-game total
+        reaches that target. The target is checked by this, the orchestrating
+        process, against the run's durable metrics (:meth:`games_completed`);
+        no child is told about it. On reaching it one ``spike_stop`` record
+        (``core.observability.spike_stop_record``) is appended before the
+        shutdown it triggers. The check runs before each liveness check, so a
+        run whose processes all exited at their own caps having reached the
+        target still records the stop. :meth:`shutdown` always runs.
+
+        With :attr:`spike_games` unset this reads no metrics and writes no
+        record of its own.
+
+        Args:
+            poll_interval: Seconds between polls of the target and of process
+                liveness.
+        """
+        try:
+            while True:
+                if self.spike_games is not None:
+                    completed = self.games_completed()
+                    if completed >= self.spike_games:
+                        self.metrics_writer.append(
+                            spike_stop_record(target=self.spike_games, games_completed=completed)
+                        )
+                        break
+                if not any(process.is_alive() for process in self.all_processes()):
+                    break
+                time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown()
 
     def shutdown(self, timeout: float = 30.0) -> None:
         """Send SIGTERM to every live process, join them, and close the GPU-hour segment.
@@ -667,6 +728,7 @@ def launch_run(
     ceiling_poll_interval: float = 1.0,
     max_games_per_actor: int | None = None,
     max_learner_steps: int | None = None,
+    spike_games: int | None = None,
 ) -> LaunchedRun:
     """Start ``num_actors`` actor processes and one learner process.
 
@@ -711,11 +773,21 @@ def launch_run(
         ceiling_poll_interval: Forwarded to the learner.
         max_games_per_actor: Forwarded to every actor (test-facing).
         max_learner_steps: Forwarded to the learner (test-facing).
+        spike_games: Optional run-wide completed-game target, counted over
+            every actor together. A stop condition like the two caps above,
+            not run identity, so it is not a config field. No process is
+            given it: :meth:`LaunchedRun.wait` enforces it from this side.
 
     Returns:
         A :class:`LaunchedRun` with live handles for the learner and every
         started actor.
+
+    Raises:
+        ValueError: If ``spike_games`` is given and is not positive. Raised
+            before the segment is opened or any process is started.
     """
+    if spike_games is not None and spike_games < 1:
+        raise ValueError(f"spike_games must be >= 1, got {spike_games}")
     metrics_writer = EpochMetricsWriter(run_dir, "orchestrator")
     metrics_writer.append(segment_start_record(device=device))
     ctx = new_spawn_context()
@@ -751,4 +823,10 @@ def launch_run(
         )
         for actor_id in ids
     }
-    return LaunchedRun(ctx=ctx, learner=learner, actors=actors, metrics_writer=metrics_writer)
+    return LaunchedRun(
+        ctx=ctx,
+        learner=learner,
+        actors=actors,
+        metrics_writer=metrics_writer,
+        spike_games=spike_games,
+    )

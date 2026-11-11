@@ -24,6 +24,10 @@ Usage::
     # including in material fields -- that is a fork's whole purpose.
     python3 scripts/run_selfplay.py configs/blokus_duo.json --fork-from runs/blokus_duo/<run-id>
 
+    # A bounded run: stop every process once 310 games have completed
+    # run-wide (all actors together), recording a ``spike_stop`` marker.
+    python3 scripts/run_selfplay.py configs/blokus_duo.json --spike-games 310
+
     # After a GPU acceptance run completes:
     python3 scripts/run_selfplay.py --verify-acceptance runs/blokus_duo/<run-id>
 
@@ -38,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -73,6 +76,7 @@ def _launch(
     max_games_per_actor: int | None,
     max_learner_steps: int | None,
     network_config: NetworkConfig | None,
+    spike_games: int | None,
 ) -> LaunchedRun:
     """Start every process for one run identity (the shared tail of launch/resume/fork).
 
@@ -90,6 +94,8 @@ def _launch(
             override, mirroring every other driver/IPC test in this repo.
             Not exposed as a CLI flag -- the architecture is design-doc
             pinned, not a runtime choice.
+        spike_games: Run-wide completed-game target for a bounded run
+            (``core.ipc.launch_run``); ``None`` for no run-wide stop.
 
     Returns:
         The live process handles.
@@ -113,32 +119,29 @@ def _launch(
         ceiling_poll_interval=launch_config.runtime.ceiling_poll_interval,
         max_games_per_actor=max_games_per_actor,
         max_learner_steps=max_learner_steps,
+        spike_games=spike_games,
     )
 
 
 def wait_for_completion(
     launched: LaunchedRun, poll_interval: float = DEFAULT_WAIT_POLL_INTERVAL
 ) -> None:
-    """Block until every process exits on its own, or until interrupted, then shut down.
+    """Block until the run ends, or until interrupted, then shut down.
 
     A production run (no test-facing step/game caps) never exits on its own,
     so this blocks until Ctrl-C (``SIGINT``); a bounded test run's processes
-    exit on their own once they hit their caps, and this returns promptly.
-    Either way, :meth:`~core.ipc.LaunchedRun.shutdown` always runs -- signaling
-    every process (a no-op for one already dead) and closing the GPU-hour
-    segment.
+    exit on their own once they hit their caps, and this returns promptly; a
+    run launched with ``--spike-games`` is stopped once its run-wide
+    completed-game total reaches that target. Either way,
+    :meth:`~core.ipc.LaunchedRun.shutdown` always runs -- signaling every
+    process (a no-op for one already dead) and closing the GPU-hour segment.
+    All of it is :meth:`~core.ipc.LaunchedRun.wait`.
 
     Args:
         launched: The live run to wait on.
-        poll_interval: Seconds between liveness polls.
+        poll_interval: Seconds between polls.
     """
-    try:
-        while any(p.is_alive() for p in launched.all_processes()):
-            time.sleep(poll_interval)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        launched.shutdown()
+    launched.wait(poll_interval)
 
 
 def cmd_launch(
@@ -149,6 +152,7 @@ def cmd_launch(
     block: bool = True,
     now: float | None = None,
     network_config: NetworkConfig | None = None,
+    spike_games: int | None = None,
 ) -> LaunchedRun:
     """Launch a brand-new run from a config file.
 
@@ -165,6 +169,7 @@ def cmd_launch(
             caller owns shutdown.
         now: Launch timestamp override, for deterministic run ids in tests.
         network_config: See :func:`_launch`. Not exposed as a CLI flag.
+        spike_games: See :func:`_launch`; ``None`` in production.
 
     Returns:
         The live run.
@@ -184,6 +189,7 @@ def cmd_launch(
         max_games_per_actor=max_games_per_actor,
         max_learner_steps=max_learner_steps,
         network_config=network_config,
+        spike_games=spike_games,
     )
     if block:
         wait_for_completion(launched)
@@ -198,6 +204,7 @@ def cmd_resume(
     max_learner_steps: int | None = None,
     block: bool = True,
     network_config: NetworkConfig | None = None,
+    spike_games: int | None = None,
 ) -> LaunchedRun:
     """Resume an existing run directory.
 
@@ -214,6 +221,7 @@ def cmd_resume(
         max_learner_steps: Test-facing cap; ``None`` in production.
         block: See :func:`cmd_launch`.
         network_config: See :func:`_launch`. Not exposed as a CLI flag.
+        spike_games: See :func:`_launch`; ``None`` in production.
 
     Returns:
         The live run.
@@ -233,6 +241,7 @@ def cmd_resume(
         max_games_per_actor=max_games_per_actor,
         max_learner_steps=max_learner_steps,
         network_config=network_config,
+        spike_games=spike_games,
     )
     if block:
         wait_for_completion(launched)
@@ -248,6 +257,7 @@ def cmd_fork(
     block: bool = True,
     now: float | None = None,
     network_config: NetworkConfig | None = None,
+    spike_games: int | None = None,
 ) -> LaunchedRun:
     """Fork a brand-new run identity from an existing run directory.
 
@@ -266,6 +276,7 @@ def cmd_fork(
         block: See :func:`cmd_launch`.
         now: Fork timestamp override, for deterministic run ids in tests.
         network_config: See :func:`_launch`. Not exposed as a CLI flag.
+        spike_games: See :func:`_launch`; ``None`` in production.
 
     Returns:
         The live run.
@@ -289,6 +300,7 @@ def cmd_fork(
         max_games_per_actor=max_games_per_actor,
         max_learner_steps=max_learner_steps,
         network_config=network_config,
+        spike_games=spike_games,
     )
     if block:
         wait_for_completion(launched)
@@ -358,6 +370,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="test-facing cap on learner steps trained; unset in production",
     )
     parser.add_argument(
+        "--spike-games",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "stop the whole run once N games have completed run-wide (all actors "
+            "together); a stop condition, not a config field"
+        ),
+    )
+    parser.add_argument(
         "--no-block",
         action="store_true",
         help="return immediately after starting processes, without waiting (test-facing)",
@@ -393,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_games_per_actor=args.max_games_per_actor,
                 max_learner_steps=args.max_learner_steps,
                 block=block,
+                spike_games=args.spike_games,
             )
         elif args.fork_from is not None:
             cmd_fork(
@@ -401,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_games_per_actor=args.max_games_per_actor,
                 max_learner_steps=args.max_learner_steps,
                 block=block,
+                spike_games=args.spike_games,
             )
         else:
             cmd_launch(
@@ -408,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_games_per_actor=args.max_games_per_actor,
                 max_learner_steps=args.max_learner_steps,
                 block=block,
+                spike_games=args.spike_games,
             )
     except MaterialConfigDiffError as exc:
         print(f"error: {exc}", file=sys.stderr)
