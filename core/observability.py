@@ -3,9 +3,11 @@
 ``core.metrics`` owns *storage*: one append-only epoch-stamped JSONL file per
 process, never shared, never rewound across a restart. This module owns
 *meaning* -- what a record's ``kind`` field says about how it may be
-aggregated, the one function (:func:`reduce_run`) allowed to aggregate them,
-and the counting primitive that turns network inference into the
-positions-evaluated series. Design doc §1 (the primary criterion's plot
+aggregated, the one function (:func:`reduce_run`) allowed to aggregate them
+over a whole run and its sibling (:func:`reduce_window`, §12 M5) that
+aggregates one warm-up-excluded window of the same records, and the counting
+primitive that turns network inference into the positions-evaluated series.
+Design doc §1 (the primary criterion's plot
 x-axes: cumulative network evaluations and GPU-hours) and §12 M3's
 observability bullet are the source of this contract; M4's eval harness
 (issue #72) consumes :func:`reduce_run`'s return value as-is, so every field
@@ -73,6 +75,18 @@ name and aggregation rule below is frozen, not an implementation detail.
 * ``"checkpoint_published"`` -- the learner's marker (``core.learner``,
   issue #60), unowned by this module but read by :func:`reduce_run`'s x-axis
   join.
+* ``"spike_stop"`` -- the orchestrator's marker that a bounded run reached
+  its run-wide completed-game target (:func:`spike_stop_record`; §12 M5).
+  Written at most once per launch, before the shutdown it triggers, so its
+  ``games_completed`` is the total observed at the stop: a signaled actor
+  still finishes its in-flight game, and the run's final total may be higher.
+  :func:`reduce_run` ignores it, like every kind it does not name.
+* ``"shutdown_forced"`` -- the orchestrator's record that a child outlived
+  the shutdown grace period and was killed (:func:`shutdown_forced_record`;
+  ``core.ipc.LaunchedRun.shutdown``), one per killed process. A killed child
+  ran no clean path -- an in-flight game or step was lost, its last flush
+  may be missing -- so a run directory carrying one says its own evidence
+  may be incomplete. :func:`reduce_run` ignores it too.
 
 Every record additionally carries a ``timestamp`` (``time.time()``,
 informational for equality purposes elsewhere but load-bearing for the
@@ -90,7 +104,8 @@ from __future__ import annotations
 import functools
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +120,8 @@ KIND_GAUGE = "gauge"
 KIND_TOTAL = "total"
 KIND_SEGMENT_START = "segment_start"
 KIND_SEGMENT_END = "segment_end"
+KIND_SPIKE_STOP = "spike_stop"
+KIND_SHUTDOWN_FORCED = "shutdown_forced"
 
 # Owned by core.learner (issue #60); defined here so both core.learner (the
 # writer) and this module (the reducer) share one literal with no drift.
@@ -117,6 +134,11 @@ SERIES_GAMES_COMPLETED = "games_completed"
 SERIES_POSITIONS_EVALUATED = "positions_evaluated"
 SERIES_SIMS_RUN = "sims_run"
 SERIES_LEARNER_STEP = "learner_step"
+
+# The learner's per-step D5 replay-ratio gauge. ``core.learner`` owns and
+# writes it; the name is repeated here, as ``learner_step``'s is, because
+# that module imports this one.
+SERIES_REPLAY_RATIO = "replay_ratio"
 
 # Actor-owned gauge (module docstring): the observed inference-autocast state.
 SERIES_ACTOR_AMP_ACTIVE = "actor_amp_active"
@@ -275,6 +297,49 @@ def segment_end_record(*, timestamp: float | None = None) -> dict[str, Any]:
     """
     return {
         "kind": KIND_SEGMENT_END,
+        "timestamp": timestamp if timestamp is not None else time.time(),
+    }
+
+
+def spike_stop_record(
+    *, target: int, games_completed: int, timestamp: float | None = None
+) -> dict[str, Any]:
+    """Build the orchestrator's run-wide spike-stop record.
+
+    Args:
+        target: The run-wide completed-game target the launch was given.
+        games_completed: The run-wide completed-game total observed when the
+            target was found reached (at least ``target``).
+        timestamp: Wall-clock seconds. Defaults to ``time.time()``.
+
+    Returns:
+        ``{"kind": "spike_stop", "target", "games_completed", "timestamp"}``.
+    """
+    return {
+        "kind": KIND_SPIKE_STOP,
+        "target": target,
+        "games_completed": games_completed,
+        "timestamp": timestamp if timestamp is not None else time.time(),
+    }
+
+
+def shutdown_forced_record(
+    *, process: str, pid: int | None, timestamp: float | None = None
+) -> dict[str, Any]:
+    """Build the orchestrator's record of one child killed at shutdown.
+
+    Args:
+        process: The killed process's name (``"learner"``, ``"actor-<id>"``).
+        pid: Its OS process id.
+        timestamp: Wall-clock seconds. Defaults to ``time.time()``.
+
+    Returns:
+        ``{"kind": "shutdown_forced", "process", "pid", "timestamp"}``.
+    """
+    return {
+        "kind": KIND_SHUTDOWN_FORCED,
+        "process": process,
+        "pid": pid,
         "timestamp": timestamp if timestamp is not None else time.time(),
     }
 
@@ -700,3 +765,512 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
         gpu_hours=gpu_seconds / _SECONDS_PER_HOUR,
         checkpoints=checkpoints,
     )
+
+
+# --- the windowed reducer (§12 M5) ---------------------------------------------
+
+# Which start condition bound a window (``WindowedRun.binding_condition``).
+WINDOW_BOUND_BY_WARMUP_GAMES = "warmup_games"
+WINDOW_BOUND_BY_REPLAY_WARMUP = "replay_warmup_positions"
+
+# Insufficient-data reasons. The first three are window-level
+# (``WindowedRun.reason``): no window exists, so no field holds a number.
+WINDOW_TOO_FEW_GAMES = "too_few_games_for_window"
+WINDOW_REPLAY_WARMUP_NOT_REACHED = "replay_warmup_positions_not_reached"
+WINDOW_ZERO_SPAN = "zero_span_window"
+# The rest are per-field (``WindowedRun.unavailable``), inside a sound window.
+WINDOW_FEWER_THAN_TWO_RECORDS = "fewer_than_two_records"
+WINDOW_NO_RECORD = "no_record"
+WINDOW_ZERO_DENOMINATOR = "zero_denominator"
+WINDOW_TOTAL_DECREASED = "total_decreased"
+
+# The percentiles of forward-pass size ``WindowedRun.batch_fill_percentiles`` reports.
+WINDOW_BATCH_FILL_PERCENTILES = (10, 50, 90)
+
+
+@dataclass(frozen=True)
+class WindowedRun:
+    """The return shape of :func:`reduce_window`: one warm-up-excluded window (§12 M5).
+
+    Every field but the two verdict fields is a measurement, and each is
+    ``None`` exactly when :attr:`unavailable` names it -- never ``0.0``, never
+    ``nan``, so arithmetic on a missing value fails loudly instead of
+    comparing quietly.
+
+    Attributes:
+        reason: The window-level verdict. ``None`` when the window exists.
+            Otherwise the named reason no window could be formed --
+            :data:`WINDOW_TOO_FEW_GAMES` (the warm-up game count was never
+            reached, or fewer than ``measure_games`` games completed after
+            the start), :data:`WINDOW_REPLAY_WARMUP_NOT_REACHED` (cumulative
+            stored positions never reached the threshold) or
+            :data:`WINDOW_ZERO_SPAN` (the start and the end carry one
+            timestamp) -- and every measurement is ``None``.
+        unavailable: ``{field name: reason}`` for every measurement that is
+            ``None``. Under a window-level verdict, every measurement mapped
+            to :attr:`reason`. Inside a sound window, the per-field reasons:
+            :data:`WINDOW_NO_RECORD` (the field's source series has no
+            usable record: none in the window for a summed series, none at
+            or before the window end for a latest-value one),
+            :data:`WINDOW_FEWER_THAN_TWO_RECORDS` (the ``learner_step``
+            series has no record at or before the window start, so the two
+            endpoint readings its difference needs do not exist),
+            :data:`WINDOW_TOTAL_DECREASED` (the ``learner_step`` total went
+            backwards inside the window, so no endpoint difference counts
+            its steps) and :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose
+            series are present but whose denominator summed to zero).
+        window_start: Timestamp of the start flush (:func:`reduce_window`).
+        window_end: Timestamp of the end flush.
+        start_game_ordinal: Run-wide cumulative ``games_completed`` through
+            the start flush. Games up to and including it are warm-up.
+        end_game_ordinal: Run-wide cumulative ``games_completed`` through the
+            end flush, the last game of the window.
+        binding_condition: Which start condition was met later --
+            :data:`WINDOW_BOUND_BY_WARMUP_GAMES` or
+            :data:`WINDOW_BOUND_BY_REPLAY_WARMUP`; the second when one flush
+            meets both.
+        games_in_window: ``end_game_ordinal - start_game_ordinal``:
+            ``measure_games``, every actor writing one game per flush.
+        games_per_hour: ``3600 * games_in_window / (window_end -
+            window_start)`` -- the pinned rate form. Exact: both boundaries
+            are game completions.
+        stored_positions_per_hour: The window's summed ``positions_stored``
+            deltas, per hour of the window span.
+        sims_per_sec: The window's summed ``sims_run`` deltas, per second.
+        net_evals_per_sec: The window's summed ``positions_evaluated``
+            deltas, per second.
+        learner_steps_in_window: The ``learner_step`` total series' endpoint
+            difference: its last value at or before ``window_end`` minus its
+            last value at or before ``window_start``. Never a sum of the
+            series' values, which are each already cumulative. The two
+            readings may be one record: no step completed in the window, an
+            exact ``0`` (the learner writes one record per step). Unavailable
+            if any reading in the window is below the one before it (a
+            learner restarted from an older step on a resumed run).
+        learner_steps_per_sec: ``learner_steps_in_window`` per second of the
+            window span.
+        replay_ratio_at_window_end: The learner's last ``replay_ratio``
+            gauge at or before ``window_end``. Recorded beside the rate, not
+            judged here: above the D5 ceiling it means the learner took no
+            paced step by the window's end.
+        moves_full_512: The window's summed ``moves_full_512`` deltas: plies
+            searched at the always-full tier.
+        moves_mid_256: The window's summed ``moves_mid_256`` deltas.
+        moves_fast_64: The window's summed ``moves_fast_64`` deltas. An actor
+            writes a tier series only when its count is non-zero, so once any
+            of the three has a record in the window an absent one is ``0``;
+            with none (a validate-tier run) all three are unavailable.
+        mid_tier_fraction: ``moves_mid_256 / (moves_mid_256 +
+            moves_fast_64)``: the empirical mid-tier fraction at plies >= 2,
+            the always-full plies being exactly the ones before them.
+        stored_positions_per_game: The window's summed ``positions_stored``
+            deltas over ``games_in_window``.
+        played_positions_per_game: The window's summed ``positions_played``
+            deltas over ``games_in_window``.
+        inference_batches: The window's summed ``inference_batches`` deltas:
+            network forward passes.
+        inference_batch_sizes: The size distribution of those forward
+            passes: ``{bucket series: summed delta}`` over every
+            ``inference_batch_size_*`` series, an absent bucket reading
+            ``0`` (it is written only when non-zero).
+        mean_batch_fill: The window's summed ``positions_evaluated`` over
+            its summed ``inference_batches``: mean leaves per forward pass,
+            exact.
+        batch_fill_percentiles: ``{percentile: (lowest size, highest size)}``
+            for each of :data:`WINDOW_BATCH_FILL_PERCENTILES`: the bounds of
+            the size bucket holding that percentile's forward pass, by
+            nearest rank over ``inference_batch_sizes``. Bounds, not an
+            interpolated estimate; the highest is ``None`` in the open-ended
+            top bucket.
+        consecutive_mover_transitions: The window's summed
+            ``consecutive_mover_transitions`` deltas.
+        actor_amp_active: Whether inference autocast was observed live:
+            ``True`` iff every ``actor_amp_active`` gauge record at or before
+            ``window_end``, from every actor epoch, reads ``1.0``. One
+            record reading otherwise makes it ``False``.
+        is_cuda: The ``is_cuda`` field of the last ``segment_start`` record
+            at or before ``window_end``: whether the launch the window ran
+            in had a real CUDA device.
+    """
+
+    reason: str | None
+    unavailable: dict[str, str]
+    window_start: float | None = None
+    window_end: float | None = None
+    start_game_ordinal: int | None = None
+    end_game_ordinal: int | None = None
+    binding_condition: str | None = None
+    games_in_window: int | None = None
+    games_per_hour: float | None = None
+    stored_positions_per_hour: float | None = None
+    sims_per_sec: float | None = None
+    net_evals_per_sec: float | None = None
+    learner_steps_in_window: int | None = None
+    learner_steps_per_sec: float | None = None
+    replay_ratio_at_window_end: float | None = None
+    moves_full_512: int | None = None
+    moves_mid_256: int | None = None
+    moves_fast_64: int | None = None
+    mid_tier_fraction: float | None = None
+    stored_positions_per_game: float | None = None
+    played_positions_per_game: float | None = None
+    inference_batches: int | None = None
+    inference_batch_sizes: dict[str, int] | None = None
+    mean_batch_fill: float | None = None
+    batch_fill_percentiles: dict[int, tuple[int, int | None]] | None = None
+    consecutive_mover_transitions: int | None = None
+    actor_amp_active: bool | None = None
+    is_cuda: bool | None = None
+
+
+def _game_flushes(
+    ordered: list[tuple[float, str, int, dict[str, Any]]],
+) -> list[tuple[float, dict[str, Any]]]:
+    """Group the actors' delta records into per-game flushes, in run time order.
+
+    An actor flushes every series of a finished game on one timestamp,
+    ``games_completed`` first (``core.actor``). A flush is therefore a
+    ``games_completed`` delta plus the delta records that follow it from the
+    same process on the same timestamp -- contiguous in the pinned order
+    (:func:`_ordered_records`). A delta record outside any such group belongs
+    to no game and is not counted.
+
+    Args:
+        ordered: Every record, in the pinned total order.
+
+    Returns:
+        ``(timestamp, {series: summed delta})`` per flush, in that order.
+    """
+    flushes: list[tuple[float, dict[str, Any]]] = []
+    owner: tuple[str, float] | None = None
+    for ts, proc, _seq, rec in ordered:
+        if rec.get("kind") != KIND_DELTA:
+            continue
+        series = rec["series"]
+        if series == SERIES_GAMES_COMPLETED:
+            flushes.append((ts, {}))
+            owner = (proc, ts)
+        elif owner != (proc, ts):
+            continue
+        deltas = flushes[-1][1]
+        deltas[series] = deltas.get(series, 0) + rec["value"]
+    return flushes
+
+
+def _window_start(
+    cumulative_games: list[Any],
+    cumulative_stored: list[Any],
+    *,
+    warmup_games: int,
+    replay_warmup_positions: int,
+) -> tuple[int | None, str]:
+    """Apply the window-start rule -- the one place it is written (§12 M5).
+
+    The window starts at the **later** of two flushes: (a) the one at which
+    the run-wide cumulative ``games_completed`` reaches ``warmup_games``, and
+    (b) the one at which the run-wide cumulative ``positions_stored`` reaches
+    ``replay_warmup_positions`` -- the point from which the learner's D5
+    pacing is live.
+
+    ``warmup_games = 0`` is met before any game. (b) needs at least one
+    stored position, which exists only once the first game is flushed, so
+    (b) then binds and the window opens at the first flush or later: zero
+    and one warm-up game give the same window.
+
+    Args:
+        cumulative_games: Run-wide cumulative ``games_completed`` through
+            each flush, in run time order.
+        cumulative_stored: Run-wide cumulative ``positions_stored`` through
+            each flush, in the same order.
+        warmup_games: Condition (a)'s game count.
+        replay_warmup_positions: Condition (b)'s stored-position count,
+            at least 1.
+
+    Returns:
+        ``(index of the start flush, which condition bound it)`` -- (b) when
+        one flush meets both -- or ``(None, the insufficient-data reason)``
+        when a condition is never met.
+    """
+    games_at = next((i for i, n in enumerate(cumulative_games) if n >= warmup_games), None)
+    if games_at is None:
+        return None, WINDOW_TOO_FEW_GAMES
+    stored_at = next(
+        (i for i, n in enumerate(cumulative_stored) if n >= replay_warmup_positions), None
+    )
+    if stored_at is None:
+        return None, WINDOW_REPLAY_WARMUP_NOT_REACHED
+    if stored_at >= games_at:
+        return stored_at, WINDOW_BOUND_BY_REPLAY_WARMUP
+    return games_at, WINDOW_BOUND_BY_WARMUP_GAMES
+
+
+def _last_at_or_before(
+    ordered: list[tuple[float, str, int, dict[str, Any]]], kind: str, series: str, timestamp: float
+) -> Any:
+    """Return a series' last recorded value at or before ``timestamp``.
+
+    Args:
+        ordered: Every record, in the pinned total order.
+        kind: The record kind to read (:data:`KIND_TOTAL` or :data:`KIND_GAUGE`).
+        series: The series name.
+        timestamp: The inclusive upper bound.
+
+    Returns:
+        The value, or ``None`` if the series has no record that early.
+    """
+    value = None
+    for ts, _proc, _seq, rec in ordered:
+        if ts > timestamp:
+            break
+        if rec.get("kind") == kind and rec.get("series") == series:
+            value = rec["value"]
+    return value
+
+
+def _ratio(numerator: Any, denominator: Any) -> float | None:
+    """Return ``numerator / denominator``, or ``None`` where that is undefined.
+
+    Args:
+        numerator: The numerator, or ``None`` if its series has no record.
+        denominator: The denominator, or ``None`` likewise.
+
+    Returns:
+        The quotient, or ``None`` if either is ``None`` or the denominator
+        is zero.
+    """
+    return None if numerator is None or not denominator else numerator / denominator
+
+
+def _batch_fill_percentiles(sizes: dict[str, Any]) -> dict[int, tuple[int, int | None]] | None:
+    """Return the size-bucket bounds of each reported percentile of forward-pass size.
+
+    Args:
+        sizes: Forward-pass counts keyed by every bucket series, smallest
+            bucket first (``_INFERENCE_BATCH_SIZE_SERIES`` order).
+
+    Returns:
+        ``{percentile: (lowest size, highest size)}`` over
+        :data:`WINDOW_BATCH_FILL_PERCENTILES`, by nearest rank -- bucket
+        ``i`` holds sizes ``2**i`` through ``2**(i+1) - 1`` and the top
+        bucket has no highest size (``None``) -- or ``None`` if no forward
+        pass was counted.
+    """
+    total = sum(sizes.values())
+    if not total:
+        return None
+    top = len(sizes) - 1
+    bounds: dict[int, tuple[int, int | None]] = {}
+    for percentile in WINDOW_BATCH_FILL_PERCENTILES:
+        rank = -(-percentile * total // 100)  # ceiling: the nearest-rank position
+        seen = 0
+        for i, count in enumerate(sizes.values()):
+            seen += count
+            if seen >= rank:
+                bounds[percentile] = (2**i, None if i == top else 2 ** (i + 1) - 1)
+                break
+    return bounds
+
+
+def _insufficient_window(reason: str) -> WindowedRun:
+    """Return the verdict for a window that could not be formed.
+
+    Args:
+        reason: The window-level reason.
+
+    Returns:
+        A :class:`WindowedRun` with every measurement ``None`` and named
+        unavailable for ``reason``.
+    """
+    measurements = [f.name for f in fields(WindowedRun) if f.name not in ("reason", "unavailable")]
+    return WindowedRun(reason=reason, unavailable=dict.fromkeys(measurements, reason))
+
+
+def reduce_window(
+    run_dir: Path | str,
+    *,
+    warmup_games: int,
+    measure_games: int,
+    replay_warmup_positions: int,
+) -> WindowedRun:
+    """Reduce a run's metrics over one run-wide, warm-up-excluded window (§12 M5).
+
+    The sibling of :func:`reduce_run`, over the same records in the same
+    pinned order, and the only other place a delta series is summed or a
+    total series differenced. :func:`reduce_run` is first-record-to-last
+    with no warm-up slice and is unchanged; this slices one window out. It
+    returns measurements and data-sufficiency verdicts only -- no floor, no
+    pass or fail.
+
+    **The window.** Run-wide: every actor's finished games, merged in the
+    pinned record order, each game one flush (:func:`_game_flushes`). It
+    starts at the later of two conditions (:func:`_window_start`) and ends at
+    the flush at which the run-wide cumulative ``games_completed`` reaches
+    the start's own cumulative count plus ``measure_games``. Both boundaries
+    are read on one clock, the metrics records' timestamps. The games after
+    the start flush through the end flush are the window's games; a game is
+    placed by its run-wide ordinal, so one that shares the start's timestamp
+    but is ordered after it is inside.
+
+    **Aggregation rules.** A summed (``delta``) field adds the window's
+    games' flushes, whole. A flush is stamped when its game finishes, so a
+    window's sums include the part of its first games played before
+    ``window_start`` and exclude the games still in flight at ``window_end``:
+    each such field is exact **up to one actor flush period** (one game per
+    actor) at each boundary -- a stated bound, never interpolated.
+    ``games_per_hour`` carries no such bound. A ``total`` series
+    (``learner_step``) is differenced between its endpoint readings, never
+    summed. A ``gauge`` is read at its last record at or before the boundary.
+    Learner and gauge records are placed by timestamp alone.
+
+    **Insufficient data is an explicit verdict.** A window that cannot be
+    formed returns a named :attr:`WindowedRun.reason` and no number; a field
+    whose own series cannot support it is ``None`` with its reason in
+    :attr:`WindowedRun.unavailable`.
+
+    Args:
+        run_dir: The run's root directory (``core.metrics.metrics_dir``).
+        warmup_games: Completed games, run-wide, before the window may start
+            (``throughput.warmup_games``). ``0`` and ``1`` give the same
+            window: at least one stored position is required, and the first
+            exists only once the first game is flushed (:func:`_window_start`).
+        measure_games: Completed games the window spans
+            (``throughput.measure_games``).
+        replay_warmup_positions: Cumulative stored positions before the
+            window may start (``training.replay_warmup_positions``).
+
+    Returns:
+        The :class:`WindowedRun`.
+
+    Raises:
+        ValueError: If ``warmup_games`` is negative, or
+            ``replay_warmup_positions`` or ``measure_games`` is not positive
+            (the bounds the run config puts on the three).
+    """
+    if warmup_games < 0 or replay_warmup_positions < 1 or measure_games < 1:
+        raise ValueError(
+            "need warmup_games >= 0, replay_warmup_positions >= 1 and measure_games >= 1; got "
+            f"{warmup_games}, {replay_warmup_positions}, {measure_games}"
+        )
+    ordered = _ordered_records(run_dir)
+    flushes = _game_flushes(ordered)
+    cumulative_games: list[Any] = []
+    cumulative_stored: list[Any] = []
+    games = stored = 0
+    for _ts, deltas in flushes:
+        games += deltas[SERIES_GAMES_COMPLETED]
+        stored += deltas.get(SERIES_POSITIONS_STORED, 0)
+        cumulative_games.append(games)
+        cumulative_stored.append(stored)
+
+    start, binding = _window_start(
+        cumulative_games,
+        cumulative_stored,
+        warmup_games=warmup_games,
+        replay_warmup_positions=replay_warmup_positions,
+    )
+    if start is None:
+        return _insufficient_window(binding)
+    target = cumulative_games[start] + measure_games
+    end = next((i for i in range(start + 1, len(flushes)) if cumulative_games[i] >= target), None)
+    if end is None:
+        return _insufficient_window(WINDOW_TOO_FEW_GAMES)
+    window_start, window_end = flushes[start][0], flushes[end][0]
+    span = window_end - window_start
+    if span <= 0:
+        return _insufficient_window(WINDOW_ZERO_SPAN)
+
+    sums: dict[str, Any] = {}
+    for _ts, deltas in flushes[start + 1 : end + 1]:
+        for series, value in deltas.items():
+            sums[series] = sums.get(series, 0) + value
+
+    def per(series: str, unit_seconds: float) -> float | None:
+        """Return a summed series' rate over the window.
+
+        Args:
+            series: The delta series.
+            unit_seconds: Seconds in the rate's time unit.
+
+        Returns:
+            The window's sum per unit of time, or ``None`` if the series has
+            no record in the window.
+        """
+        return sums[series] / (span / unit_seconds) if series in sums else None
+
+    games_in_window = cumulative_games[end] - cumulative_games[start]
+    step_at_start = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_start)
+    # The reading at the start, then every reading inside the window, in order.
+    steps = [step_at_start] + [
+        rec["value"]
+        for ts, _proc, _seq, rec in ordered
+        if window_start < ts <= window_end
+        and rec.get("kind") == KIND_TOTAL
+        and rec.get("series") == SERIES_LEARNER_STEP
+    ]
+    steps_decreased = step_at_start is not None and any(
+        later < earlier for earlier, later in pairwise(steps)
+    )
+    learner_steps = None if step_at_start is None or steps_decreased else steps[-1] - steps[0]
+
+    tiers = (SERIES_MOVES_FULL_512, SERIES_MOVES_MID_256, SERIES_MOVES_FAST_64)
+    has_tiers = any(series in sums for series in tiers)
+    full, mid, fast = (sums.get(series, 0) if has_tiers else None for series in tiers)
+    batches = sums.get(SERIES_INFERENCE_BATCHES)
+    sizes = (
+        None
+        if batches is None
+        else {series: sums.get(series, 0) for series in _INFERENCE_BATCH_SIZE_SERIES}
+    )
+    through_end = [rec for ts, _proc, _seq, rec in ordered if ts <= window_end]
+    amp = [
+        rec["value"]
+        for rec in through_end
+        if rec.get("kind") == KIND_GAUGE and rec.get("series") == SERIES_ACTOR_AMP_ACTIVE
+    ]
+    segments = [rec for rec in through_end if rec.get("kind") == KIND_SEGMENT_START]
+
+    values: dict[str, Any] = {
+        "window_start": window_start,
+        "window_end": window_end,
+        "start_game_ordinal": cumulative_games[start],
+        "end_game_ordinal": cumulative_games[end],
+        "binding_condition": binding,
+        "games_in_window": games_in_window,
+        "games_per_hour": games_in_window / (span / _SECONDS_PER_HOUR),
+        "stored_positions_per_hour": per(SERIES_POSITIONS_STORED, _SECONDS_PER_HOUR),
+        "sims_per_sec": per(SERIES_SIMS_RUN, 1.0),
+        "net_evals_per_sec": per(SERIES_POSITIONS_EVALUATED, 1.0),
+        "learner_steps_in_window": learner_steps,
+        "learner_steps_per_sec": None if learner_steps is None else learner_steps / span,
+        "replay_ratio_at_window_end": _last_at_or_before(
+            ordered, KIND_GAUGE, SERIES_REPLAY_RATIO, window_end
+        ),
+        "moves_full_512": full,
+        "moves_mid_256": mid,
+        "moves_fast_64": fast,
+        "mid_tier_fraction": _ratio(mid, mid + fast) if has_tiers else None,
+        "stored_positions_per_game": _ratio(sums.get(SERIES_POSITIONS_STORED), games_in_window),
+        "played_positions_per_game": _ratio(sums.get(SERIES_POSITIONS_PLAYED), games_in_window),
+        "inference_batches": batches,
+        "inference_batch_sizes": sizes,
+        "mean_batch_fill": _ratio(sums.get(SERIES_POSITIONS_EVALUATED), batches),
+        "batch_fill_percentiles": None if sizes is None else _batch_fill_percentiles(sizes),
+        "consecutive_mover_transitions": sums.get(SERIES_CONSECUTIVE_MOVER_TRANSITIONS),
+        "actor_amp_active": all(value == 1.0 for value in amp) if amp else None,
+        "is_cuda": segments[-1].get("is_cuda") if segments else None,
+    }
+    # The reason a field is None when it is not simply a series with no record.
+    reasons = dict.fromkeys(
+        ("learner_steps_in_window", "learner_steps_per_sec"),
+        WINDOW_TOTAL_DECREASED if steps_decreased else WINDOW_FEWER_THAN_TWO_RECORDS,
+    )
+    if has_tiers:
+        reasons["mid_tier_fraction"] = WINDOW_ZERO_DENOMINATOR
+    if batches is not None:
+        reasons["batch_fill_percentiles"] = WINDOW_ZERO_DENOMINATOR
+        if SERIES_POSITIONS_EVALUATED in sums:
+            reasons["mean_batch_fill"] = WINDOW_ZERO_DENOMINATOR
+    unavailable = {
+        name: reasons.get(name, WINDOW_NO_RECORD) for name, value in values.items() if value is None
+    }
+    return WindowedRun(reason=None, unavailable=unavailable, **values)

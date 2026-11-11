@@ -26,6 +26,7 @@ import dataclasses
 import os
 import signal
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -58,12 +59,17 @@ from core.learner import (
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
 from core.observability import (
+    KIND_SEGMENT_END,
+    KIND_SHUTDOWN_FORCED,
+    KIND_SPIKE_STOP,
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_POSITIONS_EVALUATED,
     SERIES_SIMS_RUN,
     InferenceBatchCounter,
     PositionCounter,
+    delta_record,
     inference_batch_size_series,
     reduce_run,
 )
@@ -798,3 +804,465 @@ def test_multiprocess_acceptance_actors_and_learner_share_the_filesystem(tmp_pat
     assert resume_path(ckpt_dir).exists()
     for version in list_published_versions(ckpt_dir):
         load_checkpoint(published_checkpoint_path(ckpt_dir, version), MICRO)  # no torn write
+
+
+# ==============================================================================
+# 6. LaunchedRun.wait: the run-wide spike stop, over stand-in process handles
+# ==============================================================================
+
+
+class _ExitedProcess:
+    """A stand-in handle for a child that has already exited on its own."""
+
+    name = "exited"
+    pid = 0
+    exitcode = 0
+
+    def is_alive(self):
+        return False
+
+    def terminate(self):
+        raise AssertionError("an exited process is never signaled")
+
+    def join(self, timeout=None):
+        del timeout
+
+    def kill(self):
+        raise AssertionError("an exited process is never killed")
+
+
+def _exited_run(run_dir, *, spike_games=None):
+    """A :class:`~core.ipc.LaunchedRun` whose children have all exited already."""
+    return ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _ExitedProcess(), 1: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(run_dir, "orchestrator"),
+        spike_games=spike_games,
+    )
+
+
+def _write_completed_games(run_dir, per_actor):
+    """Append one ``games_completed`` delta per finished game, per actor."""
+    for actor_id, games in enumerate(per_actor):
+        writer = EpochMetricsWriter(run_dir, f"actor-{actor_id}")
+        for game in range(games):
+            writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=float(game)))
+
+
+def _orchestrator_kinds(run_dir):
+    return [rec["kind"] for rec in iter_epoch_records(run_dir, "orchestrator")]
+
+
+def test_wait_records_one_spike_stop_when_the_run_wide_total_reaches_the_target(
+    tmp_path, monkeypatch
+):
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [2, 1])  # 3 run-wide: no single actor reaches 3
+    launched = _exited_run(tmp_path, spike_games=3)
+    assert launched.games_completed() == 3
+
+    launched.wait(poll_interval=0.0)
+
+    records = list(iter_epoch_records(tmp_path, "orchestrator"))
+    assert [rec["kind"] for rec in records] == [KIND_SPIKE_STOP, KIND_SEGMENT_END]
+    stop = records[0]
+    assert (stop["target"], stop["games_completed"]) == (3, 3)
+    assert stop["timestamp"] <= records[1]["timestamp"]
+
+
+def test_wait_below_the_spike_target_records_no_stop(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1, 1])
+    _exited_run(tmp_path, spike_games=3).wait(poll_interval=0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+def test_wait_without_a_spike_target_records_no_stop(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [5, 5])
+    _exited_run(tmp_path).wait(poll_interval=0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+class _HeldProcess:
+    """A stand-in handle that stays alive through any signal or join until killed.
+
+    Args:
+        clock: Optional one-item list holding a fake monotonic time; a join
+            advances it.
+        join_takes: Seconds a join consumes on ``clock`` (capped at its
+            timeout).
+    """
+
+    name = "actor-0"
+    pid = 4242
+
+    def __init__(self, clock=None, join_takes=0.0):
+        self.alive = True
+        self.calls = []
+        self.clock = clock
+        self.join_takes = join_takes
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def join(self, timeout=None):
+        self.calls.append(("join", timeout))
+        if self.clock is not None and timeout is not None:
+            self.clock[0] += min(timeout, self.join_takes)
+
+    def kill(self):
+        self.calls.append("kill")
+        self.alive = False
+
+
+def _bound_polls(monkeypatch, limit=20):
+    """Make a ``wait`` that keeps polling fail, instead of spinning forever.
+
+    Returns:
+        The list every poll's sleep is appended to.
+    """
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        if len(polls) > limit:
+            raise AssertionError(f"wait() was still polling after {limit} polls")
+
+    monkeypatch.setattr(ipc.time, "sleep", sleep)
+    return polls
+
+
+def test_wait_ends_a_run_whose_actors_have_all_exited_below_the_target(tmp_path, monkeypatch):
+    """Every game writer is gone, so the target is out of reach: stop, and record no stop."""
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1, 1])
+    learner = _HeldProcess()  # e.g. waiting at its replay-ratio ceiling for shards
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=learner,
+        actors={0: _ExitedProcess(), 1: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=3,
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=1.0)
+
+    assert learner.calls[0] == "terminate"  # the run was shut down
+    kinds = _orchestrator_kinds(tmp_path)
+    assert KIND_SPIKE_STOP not in kinds  # its absence is the sign the target was not reached
+    assert kinds[-1] == KIND_SEGMENT_END
+
+
+def test_wait_ends_a_spike_run_whose_learner_has_exited_below_the_target(tmp_path, monkeypatch):
+    """Without its learner the run is not the loop the target bounds: stop, record no stop.
+
+    The actors here are alive and would wait forever on a pacing file a
+    departed learner left at hold.
+    """
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1, 1])
+    actors = [_HeldProcess(), _HeldProcess()]
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors=dict(enumerate(actors)),
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=3,
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=1.0)
+
+    assert [actor.calls[0] for actor in actors] == ["terminate", "terminate"]
+    kinds = _orchestrator_kinds(tmp_path)
+    assert KIND_SPIKE_STOP not in kinds
+    assert kinds[-1] == KIND_SEGMENT_END
+
+
+class _ExpiringProcess(_ExitedProcess):
+    """A stand-in child that is alive for its first ``alive_for`` liveness reads."""
+
+    def __init__(self, alive_for):
+        self.alive_for = alive_for
+
+    def is_alive(self):
+        self.alive_for -= 1
+        return self.alive_for >= 0
+
+
+@pytest.mark.parametrize("survivor", ["learner", "actor"])
+def test_wait_without_a_spike_target_polls_until_the_last_process_has_exited(
+    tmp_path, monkeypatch, survivor
+):
+    """With no target, neither side's exit ends the wait while the other is alive."""
+    polls = _bound_polls(monkeypatch)
+    learner = _ExpiringProcess(3) if survivor == "learner" else _ExitedProcess()
+    actor = _ExpiringProcess(3) if survivor == "actor" else _ExitedProcess()
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=learner,
+        actors={0: actor},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    launched.wait(poll_interval=0.0)
+
+    assert len(polls) == 3  # one per poll that still saw the survivor alive
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+class _FinishingProcess(_ExitedProcess):
+    """An actor whose last game lands, and which exits, as its liveness is first read."""
+
+    def __init__(self, run_dir):
+        self.run_dir = run_dir
+        self.finished = False
+
+    def is_alive(self):
+        if not self.finished:
+            self.finished = True
+            writer = EpochMetricsWriter(self.run_dir, "actor-1")
+            writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=9.0))
+        return False
+
+
+def test_wait_records_a_target_reached_by_the_game_that_ended_the_last_actor(tmp_path, monkeypatch):
+    """The total is read after the actors are seen gone, so it is the final one."""
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1])  # 1 of 2 until the last game lands
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _ExitedProcess(), 1: _FinishingProcess(tmp_path)},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=2,
+    )
+    launched.wait(poll_interval=0.0)
+
+    records = list(iter_epoch_records(tmp_path, "orchestrator"))
+    assert [rec["kind"] for rec in records] == [KIND_SPIKE_STOP, KIND_SEGMENT_END]
+    assert (records[0]["target"], records[0]["games_completed"]) == (2, 2)
+
+
+def test_wait_shuts_the_run_down_when_interrupted(tmp_path, monkeypatch):
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ipc.time, "sleep", interrupted)
+    held = _HeldProcess()
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=held,
+        actors={0: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=1.0)  # returns: the interrupt is the stop
+
+    assert held.calls[0] == "terminate"
+    assert not held.is_alive()
+    assert _orchestrator_kinds(tmp_path)[-1] == KIND_SEGMENT_END
+
+
+@pytest.mark.parametrize("grace", [float("nan"), float("inf"), -1.0])
+@pytest.mark.parametrize("method", ["wait", "shutdown"])
+def test_a_grace_period_that_is_not_finite_and_non_negative_is_refused_before_any_signal(
+    tmp_path, monkeypatch, method, grace
+):
+    polls = _bound_polls(monkeypatch)
+    held = _HeldProcess()
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=held,
+        actors={0: _ExitedProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    with pytest.raises(ValueError, match="grace"):
+        if method == "wait":
+            launched.wait(poll_interval=0.0, shutdown_grace=grace)
+        else:
+            launched.shutdown(grace)
+    assert polls == []  # refused before the first poll, not after the run's whole course
+    assert held.calls == []  # nothing signaled, nothing killed
+    assert not (tmp_path / "metrics").exists() or _orchestrator_kinds(tmp_path) == []
+
+
+@pytest.mark.parametrize("spike_games", [0, -1])
+def test_launch_run_refuses_a_non_positive_spike_target_before_starting_anything(
+    tmp_path, spike_games
+):
+    run_config = _acceptance_run_config()
+    launched = None
+    try:
+        with pytest.raises(ValueError, match="spike_games"):
+            launched = launch_run(
+                game_factory=_build_micro_game,
+                run_config=run_config,
+                self_play=run_config.self_play,
+                run_id="refused",
+                num_actors=1,
+                shard_dir=tmp_path / "shards",
+                ckpt_dir=tmp_path / "ckpt",
+                run_dir=tmp_path / "run",
+                run_seed=1,
+                max_games_per_actor=1,  # were it accepted, the run would still end
+                max_learner_steps=1,
+                spike_games=spike_games,
+            )
+    finally:
+        if launched is not None:  # accepted: the test fails, and leaves no process behind
+            _kill_leftovers(launched.all_processes())
+    assert not (tmp_path / "run").exists()  # no segment opened, no process started
+
+
+# ==============================================================================
+# 7. LaunchedRun.shutdown: every child gone before the GPU-hour segment closes
+# ==============================================================================
+
+
+def _lingering_child(ready_path, exit_path, linger):
+    """A child that, once signaled, takes ``linger`` seconds to finish and exit.
+
+    Stands in for an actor finishing its in-flight game. Module-level, so it
+    is a valid spawn-context target.
+
+    Args:
+        ready_path: Touched once the signal handler is installed.
+        exit_path: Written with ``time.time()`` as the child's last act.
+        linger: Seconds of work left to do after the signal.
+    """
+    stop = ShutdownFlag().install()
+    Path(ready_path).touch()
+    deadline = time.monotonic() + 60.0  # never outlive a failed test
+    while not stop() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(linger)
+    Path(exit_path).write_text(repr(time.time()))
+
+
+def _stubborn_child(ready_path):
+    """A child that ignores SIGTERM: only SIGKILL (or its own bound) ends it.
+
+    Args:
+        ready_path: Touched once SIGTERM is being ignored.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    Path(ready_path).touch()
+    time.sleep(60.0)  # never outlive a failed test
+
+
+def _start_double(ctx, target, name, tmp_path, *args):
+    """Start one child double and wait until it reports its handler installed."""
+    ready = tmp_path / f"{name}.ready"
+    process = ctx.Process(target=target, args=(str(ready), *args), name=name)
+    process.start()
+    assert _wait_until(ready.exists, timeout=60.0, interval=0.01), f"{name} never started"
+    return process
+
+
+class _LivenessSpyWriter(EpochMetricsWriter):
+    """An orchestrator writer that notes which children are alive at each append."""
+
+    def __init__(self, run_dir):
+        super().__init__(run_dir, "orchestrator")
+        self.processes = ()
+        self.alive_at_append = []
+
+    def append(self, record):
+        alive = sorted(p.name for p in self.processes if p.is_alive())
+        self.alive_at_append.append((record["kind"], alive))
+        super().append(record)
+
+
+def _launched_doubles(tmp_path, learner, actors):
+    """Wrap already-started child doubles in a :class:`~core.ipc.LaunchedRun`."""
+    writer = _LivenessSpyWriter(tmp_path / "run")
+    launched = ipc.LaunchedRun(
+        ctx=ipc.new_spawn_context(), learner=learner, actors=actors, metrics_writer=writer
+    )
+    writer.processes = launched.all_processes()
+    return launched, writer
+
+
+def _kill_leftovers(processes):
+    """Never leave a child double behind, whatever the test concluded."""
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+            process.join(10.0)
+
+
+def test_shutdown_closes_the_segment_only_after_the_last_child_has_exited(tmp_path):
+    ctx = ipc.new_spawn_context()
+    last_exit = tmp_path / "actor-0.exit"
+    learner = _start_double(ctx, _lingering_child, "learner", tmp_path, str(tmp_path / "l"), 0.0)
+    actor = _start_double(ctx, _lingering_child, "actor-0", tmp_path, str(last_exit), 1.0)
+    launched, writer = _launched_doubles(tmp_path, learner, {0: actor})
+    try:
+        launched.shutdown(timeout=60.0)
+
+        assert [p.exitcode for p in launched.all_processes()] == [0, 0]  # nobody was killed
+        (end,) = iter_epoch_records(tmp_path / "run", "orchestrator")
+        assert end["kind"] == KIND_SEGMENT_END
+        assert writer.alive_at_append == [(KIND_SEGMENT_END, [])]
+        assert end["timestamp"] >= float(last_exit.read_text())  # after its in-flight work
+    finally:
+        _kill_leftovers(launched.all_processes())
+
+
+def test_shutdown_escalates_a_child_that_outlives_the_grace_period_and_records_it(tmp_path):
+    ctx = ipc.new_spawn_context()
+    learner = _start_double(ctx, _lingering_child, "learner", tmp_path, str(tmp_path / "l"), 0.0)
+    stubborn = _start_double(ctx, _stubborn_child, "actor-7", tmp_path)
+    launched, writer = _launched_doubles(tmp_path, learner, {7: stubborn})
+    try:
+        started = time.monotonic()
+        launched.shutdown(timeout=0.5)
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 0.5  # the grace period was given before escalating
+        assert not any(p.is_alive() for p in launched.all_processes())  # returns with all gone
+        assert learner.exitcode == 0
+        assert stubborn.exitcode == -signal.SIGKILL
+        forced, end = iter_epoch_records(tmp_path / "run", "orchestrator")
+        assert forced == {
+            "kind": KIND_SHUTDOWN_FORCED,
+            "process": "actor-7",
+            "pid": stubborn.pid,
+            "timestamp": forced["timestamp"],
+        }
+        assert end["kind"] == KIND_SEGMENT_END
+        assert forced["timestamp"] <= end["timestamp"]
+        # Neither record was written while the stubborn child was still alive.
+        assert writer.alive_at_append == [(KIND_SHUTDOWN_FORCED, []), (KIND_SEGMENT_END, [])]
+    finally:
+        _kill_leftovers(launched.all_processes())
+
+
+def test_wait_gives_shutdown_its_grace_period_as_one_deadline(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(ipc.time, "monotonic", lambda: clock[0])
+    held = [_HeldProcess(clock, join_takes=3.0), _HeldProcess(clock, join_takes=3.0)]
+    _write_completed_games(tmp_path, [1])
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors=dict(enumerate(held)),
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=1,
+    )
+    launched.wait(poll_interval=0.0, shutdown_grace=5.0)
+
+    for process in held:
+        terminate, _grace_join, kill, final_join = process.calls
+        assert (terminate, kill, final_join) == ("terminate", "kill", ("join", None))
+    # One deadline shared by all: the caller's grace for the first join, and only
+    # what the first left of it for the second.
+    assert [process.calls[1] for process in held] == [("join", 5.0), ("join", 2.0)]
+    assert _orchestrator_kinds(tmp_path) == [
+        KIND_SPIKE_STOP,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SEGMENT_END,
+    ]

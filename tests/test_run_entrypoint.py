@@ -35,6 +35,7 @@ import multiprocessing
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,9 +44,19 @@ import torch
 
 from core.actor import ActorDriver
 from core.checkpoint import load_checkpoint, resume_path
-from core.ipc import build_actor_refresh
+from core.ipc import DEFAULT_SHUTDOWN_GRACE_SECONDS, build_actor_refresh
 from core.learner import LearnerDriver
+from core.metrics import iter_epoch_records
 from core.network import NetworkConfig
+from core.observability import (
+    KIND_SEGMENT_END,
+    KIND_SEGMENT_START,
+    KIND_SPIKE_STOP,
+    SERIES_GAMES_COMPLETED,
+    SERIES_LEARNER_STEP,
+    reduce_run,
+    reduce_window,
+)
 from core.replay_shard import read_shard
 from core.run_identity import (
     LAUNCH_SCHEMA_VERSION,
@@ -384,6 +395,307 @@ def test_material_diff_error_has_no_way_to_be_overridden_via_the_cli_argparser()
     help_text = parser.format_help()
     assert "--force" not in help_text
     assert "--override" not in help_text
+
+
+# ==============================================================================
+# 1b. The run-wide spike stop (§12 M5): --spike-games
+# ==============================================================================
+
+
+def _orchestrator_records(run_dir: Path) -> list[dict]:
+    return list(iter_epoch_records(run_dir, "orchestrator"))
+
+
+def _wait_bounded(launched, timeout: float) -> bool:
+    """Wait for a run on a helper thread, so a run that never stops fails instead of hanging.
+
+    Args:
+        launched: The live run (started with ``block=False``).
+        timeout: Seconds to allow before giving up and killing every child.
+
+    Returns:
+        Whether ``wait_for_completion`` returned within ``timeout``.
+    """
+    thread = threading.Thread(
+        target=rs.wait_for_completion, args=(launched,), kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        for process in launched.all_processes():
+            process.kill()
+        return False
+    return True
+
+
+def _assert_every_process_stopped_cleanly(launched) -> None:
+    """Assert every child is gone and none crashed or had to be killed.
+
+    A child signaled while already exiting on its own (its cap reached, its
+    work complete) reports ``-SIGTERM``, not ``0``: the interpreter restores
+    the default handler early in its teardown.
+
+    Args:
+        launched: The run, after its wait returned.
+    """
+    for process in launched.all_processes():
+        assert not process.is_alive()
+        assert process.exitcode in (0, -signal.SIGTERM), process
+
+
+def test_spike_games_stops_the_whole_run_and_records_the_stop(tmp_path):
+    # The learner's own stop is out of reach, so every process is mid-run at the stop.
+    raw = _base_raw(tmp_path, publish_interval=1000, checkpoint_count=1000)
+    raw["num_actors"] = 2
+    cfg = _write_config(tmp_path / "cfg.json", raw)
+    backstop = 40  # per actor: only reached if the spike stop never fires
+
+    launched = rs.cmd_launch(
+        cfg,
+        spike_games=6,
+        max_games_per_actor=backstop,
+        block=False,
+        now=1_700_000_000.0,
+        network_config=MICRO_NET_CONFIG,
+    )
+    assert _wait_bounded(launched, 120.0), "the run did not stop"
+    _assert_every_process_stopped_cleanly(launched)
+    assert launched.learner.exitcode == 0  # signaled mid-run: its own should_stop path
+
+    run_dir = _only_run_dir(tmp_path)
+    total = reduce_run(run_dir).totals[SERIES_GAMES_COMPLETED]
+    records = _orchestrator_records(run_dir)
+    (stop,) = [rec for rec in records if rec["kind"] == KIND_SPIKE_STOP]
+    assert stop["target"] == 6
+    # A signaled actor finishes its in-flight game, so the final total may exceed
+    # the total observed at the stop; neither is below the target.
+    assert 6 <= stop["games_completed"] <= total < 2 * backstop
+    assert _shard_count(run_dir) == total  # every counted game's shard was published
+    # No child had to be escalated, and the segment closed after all of them.
+    assert [rec["kind"] for rec in records] == [
+        KIND_SEGMENT_START,
+        KIND_SPIKE_STOP,
+        KIND_SEGMENT_END,
+    ]
+    child_timestamps = [
+        rec["timestamp"]
+        for proc in ("learner", "actor-0", "actor-1")
+        for rec in iter_epoch_records(run_dir, proc)
+    ]
+    assert records[-1]["timestamp"] >= max(child_timestamps)
+    assert reduce_run(run_dir).gpu_hours > 0  # the segment is complete
+
+    # The stopped run's own records are what the windowed reducer reads: real
+    # actor flushes group into games, and every validate-tier series is found.
+    window = reduce_window(run_dir, warmup_games=1, measure_games=3, replay_warmup_positions=1)
+    assert window.reason is None
+    assert (window.start_game_ordinal, window.end_game_ordinal, window.games_in_window) == (1, 4, 3)
+    assert window.stored_positions_per_game == window.played_positions_per_game > 0
+    assert window.inference_batches == sum(window.inference_batch_sizes.values()) > 0
+    assert window.consecutive_mover_transitions is not None
+    assert (window.actor_amp_active, window.is_cuda) == (False, False)  # a CPU run
+    tier_fields = ("moves_full_512", "moves_mid_256", "moves_fast_64", "mid_tier_fraction")
+    assert all(name in window.unavailable for name in tier_fields)  # no schedule ran
+
+
+def test_spike_games_terminates_a_run_whose_learner_has_no_stop_of_its_own(tmp_path):
+    """The hang case: capped actors stop feeding shards, the learner waits at its ceiling.
+
+    Both actors exit at their cap; the learner's pinned stop is out of reach
+    and its D5 ceiling is live, so once it has caught up with the shards it
+    waits for more forever. Only the run-wide stop can end this run.
+    """
+    raw = _base_raw(
+        tmp_path, replay_warmup_positions=1, publish_interval=1000, checkpoint_count=1000
+    )
+    raw["num_actors"] = 2
+    cfg = _write_config(tmp_path / "cfg.json", raw)
+
+    launched = rs.cmd_launch(
+        cfg,
+        spike_games=6,
+        max_games_per_actor=3,
+        block=False,
+        now=1_700_000_000.0,
+        network_config=MICRO_NET_CONFIG,
+    )
+    assert _wait_bounded(launched, 120.0), "the run hung with its learner at the ceiling"
+    _assert_every_process_stopped_cleanly(launched)
+    assert launched.learner.exitcode == 0  # it left its ceiling wait on the signal
+
+    run_dir = _only_run_dir(tmp_path)
+    reduced = reduce_run(run_dir)
+    assert reduced.totals[SERIES_GAMES_COMPLETED] == 6  # exactly the caps: 2 actors x 3
+    assert 0 < reduced.totals[SERIES_LEARNER_STEP] < 1000 * 1000  # stopped, not finished
+    (stop,) = [rec for rec in _orchestrator_records(run_dir) if rec["kind"] == KIND_SPIKE_STOP]
+    assert (stop["target"], stop["games_completed"]) == (6, 6)
+
+
+def test_spike_games_ends_a_run_whose_actors_all_exit_below_the_target(tmp_path):
+    """The target is out of reach: both actors are capped below it and the learner waits.
+
+    Nothing can complete another game, so the run is shut down rather than
+    polled forever -- and no ``spike_stop`` is recorded, since none happened.
+    """
+    raw = _base_raw(
+        tmp_path, replay_warmup_positions=1, publish_interval=1000, checkpoint_count=1000
+    )
+    raw["num_actors"] = 2
+    cfg = _write_config(tmp_path / "cfg.json", raw)
+
+    launched = rs.cmd_launch(
+        cfg,
+        spike_games=50,
+        max_games_per_actor=1,
+        block=False,
+        now=1_700_000_000.0,
+        network_config=MICRO_NET_CONFIG,
+    )
+    assert _wait_bounded(launched, 120.0), "the run polled on for a target it could not reach"
+    _assert_every_process_stopped_cleanly(launched)
+
+    run_dir = _only_run_dir(tmp_path)
+    assert reduce_run(run_dir).totals[SERIES_GAMES_COMPLETED] == 2  # the caps: 2 actors x 1
+    kinds = [rec["kind"] for rec in _orchestrator_records(run_dir)]
+    assert kinds == [KIND_SEGMENT_START, KIND_SEGMENT_END]
+
+
+def test_a_run_without_a_spike_target_records_only_its_gpu_segment(tmp_path):
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    rs.cmd_launch(
+        cfg,
+        max_games_per_actor=2,
+        max_learner_steps=2,
+        block=True,
+        now=1_700_000_000.0,
+        network_config=MICRO_NET_CONFIG,
+        shutdown_grace_seconds=120.0,
+    )
+    kinds = [rec["kind"] for rec in _orchestrator_records(_only_run_dir(tmp_path))]
+    assert kinds == [KIND_SEGMENT_START, KIND_SEGMENT_END]
+
+
+@pytest.mark.parametrize(
+    "mode_args,command",
+    [([], "cmd_launch"), (["--resume", "run"], "cmd_resume"), (["--fork-from", "run"], "cmd_fork")],
+    ids=["launch", "resume", "fork"],
+)
+def test_the_cli_threads_the_stop_arguments_into_every_launch_mode(monkeypatch, mode_args, command):
+    seen = {}
+    monkeypatch.setattr(rs, command, lambda *args, **kwargs: seen.update(kwargs))
+
+    flags = ["--spike-games", "310", "--shutdown-grace-seconds", "900"]
+    assert rs.main(["cfg.json", *mode_args, *flags]) == 0
+    assert (seen["spike_games"], seen["shutdown_grace_seconds"]) == (310, 900.0)
+
+    seen.clear()
+    assert rs.main(["cfg.json", *mode_args]) == 0
+    assert seen["spike_games"] is None  # unset by default: the M3 paths are unchanged
+    assert seen["shutdown_grace_seconds"] == DEFAULT_SHUTDOWN_GRACE_SECONDS
+
+
+class _RecordingRun:
+    """A stand-in live run that only records how it was waited on."""
+
+    wait_args = None
+
+    def wait(self, poll_interval=None, shutdown_grace="not passed"):
+        self.wait_args = (poll_interval, shutdown_grace)
+
+
+def _record_launches(monkeypatch):
+    """Replace the shared launch tail with a recorder that starts no process.
+
+    Returns:
+        The list each call appends ``(keyword arguments, stand-in run)`` to.
+    """
+    launches = []
+
+    def fake_launch(launch_config, run_id, root, **kwargs):
+        del launch_config, run_id, root
+        launches.append((kwargs, _RecordingRun()))
+        return launches[-1][1]
+
+    monkeypatch.setattr(rs, "_launch", fake_launch)
+    return launches
+
+
+@pytest.mark.parametrize("mode", ["launch", "resume", "fork"])
+def test_each_launch_mode_hands_the_stop_arguments_to_the_run_it_starts(
+    tmp_path, monkeypatch, mode
+):
+    launches = _record_launches(monkeypatch)
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    rs.cmd_launch(cfg, block=False, now=1_700_000_000.0)  # a parent's provenance, no process
+    parent = _only_run_dir(tmp_path)
+    launches.clear()
+
+    stop = dict(spike_games=7, shutdown_grace_seconds=42.0)
+    if mode == "launch":
+        rs.cmd_launch(cfg, now=1_700_000_500.0, **stop)
+    elif mode == "resume":
+        rs.cmd_resume(cfg, parent, **stop)
+    else:
+        rs.cmd_fork(cfg, parent, now=1_700_000_500.0, **stop)
+
+    ((kwargs, run),) = launches
+    assert kwargs["spike_games"] == 7  # the target reaches the run that enforces it
+    assert run.wait_args == (rs.DEFAULT_WAIT_POLL_INTERVAL, 42.0)  # and the grace its wait
+
+
+@pytest.mark.parametrize("mode", ["launch", "resume", "fork"])
+@pytest.mark.parametrize(
+    "stop",
+    [
+        dict(shutdown_grace_seconds=float("nan")),
+        dict(shutdown_grace_seconds=float("inf")),
+        dict(shutdown_grace_seconds=-1.0),
+        dict(spike_games=0),
+    ],
+    ids=["nan_grace", "inf_grace", "negative_grace", "zero_target"],
+)
+def test_each_launch_mode_refuses_an_unusable_stop_argument_before_doing_anything(
+    tmp_path, monkeypatch, mode, stop
+):
+    """A direct caller gets the refusal the CLI gives, before a run exists to be orphaned."""
+    launches = _record_launches(monkeypatch)
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    parent = tmp_path / "runs" / "no-such-run"  # never read: the refusal comes first
+
+    with pytest.raises(ValueError, match="--spike-games|--shutdown-grace-seconds"):
+        if mode == "launch":
+            rs.cmd_launch(cfg, **stop)
+        elif mode == "resume":
+            rs.cmd_resume(cfg, parent, **stop)
+        else:
+            rs.cmd_fork(cfg, parent, **stop)
+    assert launches == []
+    assert not (tmp_path / "runs").exists()  # no provenance written
+
+
+@pytest.mark.parametrize(
+    "stop_args",
+    [
+        ["--spike-games", "0"],
+        ["--spike-games", "-3"],
+        ["--shutdown-grace-seconds", "-1"],
+        ["--shutdown-grace-seconds", "nan"],
+        ["--shutdown-grace-seconds", "inf"],
+        ["--spike-games", "3", "--no-block"],  # nothing would be left to enforce the target
+    ],
+    ids=" ".join,
+)
+def test_the_cli_refuses_an_unusable_stop_argument_before_creating_a_run(
+    tmp_path, capsys, monkeypatch, stop_args
+):
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    # Were one accepted, the test fails without starting a process it would leave behind.
+    monkeypatch.setattr(rs, "cmd_launch", lambda *args, **kwargs: None)
+    with pytest.raises(SystemExit) as exc_info:
+        rs.main([str(cfg), *stop_args])
+    assert exc_info.value.code == 2
+    assert stop_args[0] in capsys.readouterr().err
+    assert not (tmp_path / "runs").exists()  # refused before any provenance was written
 
 
 def test_two_fresh_single_actor_runs_from_the_same_seed_play_an_identical_first_game(tmp_path):
