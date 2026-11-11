@@ -82,11 +82,14 @@ runs its own clean path.
 constraint).** The D5 trunk is 8 residual blocks × 128 channels; the
 learner's training batch (256, AMP) peak-allocates 0.52 of 16.0 GiB (~3%) of
 the RTX 4060 Ti's device memory (``docs/bench/m2-train-step.md``). Each
-actor process built here runs only batch-1 leaf inference through
-``core.network.make_network_evaluator`` (M5 batches inference across actors;
-out of scope here) -- a strictly smaller resident footprint than the
-learner's own training step, and the learner's headroom above already
-leaves ample room for several such actors to share the device concurrently.
+actor process built here runs only leaf inference -- batch-1 through
+``core.network.make_network_evaluator``, or one forward per within-search
+leaf batch of at most ``self_play.leaf_batch_size`` positions through
+``core.network.make_batched_network_evaluator`` (§12 M5; batching never
+crosses a game or an actor) -- a smaller resident footprint than the
+learner's own training step at any leaf batch below the learner's 256, and
+the learner's headroom above already leaves ample room for several such
+actors to share the device concurrently.
 No memory scheduler, cgroup, or MPS configuration is built here; §3's
 "single consumer GPU" framing is satisfied by this arithmetic, not by code.
 """
@@ -108,7 +111,12 @@ from core.checkpoint import load_checkpoint, published_checkpoint_path, read_lat
 from core.game import Game
 from core.learner import PACING_HOLD, LearnerDriver, pacing_file_path, read_pacing_file
 from core.metrics import EpochMetricsWriter
-from core.network import Network, NetworkConfig, make_network_evaluator
+from core.network import (
+    Network,
+    NetworkConfig,
+    make_batched_network_evaluator,
+    make_network_evaluator,
+)
 from core.observability import (
     SERIES_ACTOR_AMP_ACTIVE,
     PositionCounter,
@@ -130,6 +138,24 @@ GameFactory = Callable[[], Game]
 # what LaunchedRun.shutdown sends; SIGINT covers Ctrl-C on a single process
 # run directly (e.g. under a future #63 CLI, or by hand in development).
 _DEFAULT_SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
+
+
+def _leaf_count(game: Game, states: Sequence[Any]) -> int:
+    """Return how many positions one batched-evaluator call evaluates.
+
+    The ``batch_size`` reader ``core.observability.count_positions`` needs for
+    the ``BatchEvaluator`` call shape: positions evaluated are *leaves*, not
+    forward passes (the §1 x-axis).
+
+    Args:
+        game: The adapter (unused; part of the call shape).
+        states: The batch's leaf states.
+
+    Returns:
+        ``len(states)``.
+    """
+    del game
+    return len(states)
 
 
 def _default_wait(poll_interval: float) -> None:
@@ -227,12 +253,16 @@ def build_actor_refresh(
     via :func:`core.checkpoint.load_checkpoint` -- a mismatch raises
     ``core.artifact_fingerprint.FingerprintMismatchError`` straight through,
     uncaught, exactly the "loud failure" the checkpoint module already
-    promises. The built evaluator is cached by version, so repeated calls
-    naming the same ``latest`` (the common case -- most games are played
-    between publishes, not across one) neither touch the disk again nor
-    rebuild a ``Network``.
+    promises. Two evaluators are built over the one loaded ``Network`` -- the
+    scalar ``core.mcts.Evaluator`` and the batched ``core.mcts.BatchEvaluator``
+    -- and cached by version, so repeated calls naming the same ``latest``
+    (the common case -- most games are played between publishes, not across
+    one) neither touch the disk again nor rebuild a ``Network``. Which of the
+    two a game searches with is the caller's decision
+    (``core.actor.ActorDriver``: the batched one iff
+    ``self_play.leaf_batch_size > 1``).
 
-    **Actor-side AMP.** Every built evaluator runs under the run's inference
+    **Actor-side AMP.** Both evaluators run under the run's inference
     autocast policy (``core.amp.AmpMode.resolve(device)``: live on CUDA, an
     exact no-op elsewhere -- the train step's own rule, derived from the
     device, never a config field). ``core.amp.amp_evaluator`` is the outermost
@@ -258,10 +288,12 @@ def build_actor_refresh(
             inject their own no-sleep fake.
         position_counter: Optional (issue #62). When given, every built
             evaluator is wrapped with ``core.observability.count_positions``
-            before caching, so every leaf-inference call this actor makes
-            through it adds ``1`` position to the counter (M3's batch-1
-            bridge). ``None`` (the default) counts nothing. Wrapped once per
-            newly-built version, never re-wrapped on a cache hit.
+            before caching, so every call this actor makes adds the positions
+            it evaluated to the counter: ``1`` through the scalar evaluator,
+            the number of leaves in the batch -- not ``1`` per forward pass --
+            through the batched one. ``None`` (the default) counts nothing.
+            Wrapped once per newly-built version, never re-wrapped on a
+            cache hit.
         metrics_writer: Optional. When given, the *observed* autocast state
             -- read from inside the context at this closure's first leaf
             evaluation, not inferred from ``device`` -- is appended to it as
@@ -270,13 +302,13 @@ def build_actor_refresh(
             checkpoint versions are loaded afterwards.
 
     Returns:
-        A zero-argument ``RefreshFn`` returning ``(evaluator, model_version)``
-        -- ``core.actor.RefreshResult``.
+        A zero-argument ``RefreshFn`` returning ``(evaluator, model_version,
+        evaluate_batch)`` -- ``core.actor.RefreshResult``'s three-element form.
     """
     directory = Path(ckpt_dir)
     net_config = network_config if network_config is not None else NetworkConfig.from_game(game)
     wait_fn = wait if wait is not None else lambda: _default_wait(poll_interval)
-    cache: dict[str, Any] = {"version": None, "evaluator": None}
+    cache: dict[str, Any] = {"version": None, "evaluator": None, "evaluate_batch": None}
     amp = AmpMode.resolve(device)
     amp_recorded = False
 
@@ -301,11 +333,16 @@ def build_actor_refresh(
             net = Network(net_config).to(device)
             net.load_state_dict(bundle.model_state_dict)
             evaluator = make_network_evaluator(net, game, device=device)
+            evaluate_batch = make_batched_network_evaluator(net, game, device=device)
             if position_counter is not None:
                 evaluator = count_positions(evaluator, position_counter)
+                evaluate_batch = count_positions(
+                    evaluate_batch, position_counter, batch_size=_leaf_count
+                )
             cache["evaluator"] = amp_evaluator(evaluator, amp, observe=record_amp)
+            cache["evaluate_batch"] = amp_evaluator(evaluate_batch, amp, observe=record_amp)
             cache["version"] = version
-        return cache["evaluator"], cache["version"]
+        return cache["evaluator"], cache["version"], cache["evaluate_batch"]
 
     return refresh
 

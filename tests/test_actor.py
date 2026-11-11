@@ -61,7 +61,14 @@ def refresh_sequence(versions):
 
 
 def make_driver(
-    tmp_path, *, run_id="run", actor_id=0, run_seed=1, sims=VALIDATE_TIER_SIMS, **kwargs
+    tmp_path,
+    *,
+    run_id="run",
+    actor_id=0,
+    run_seed=1,
+    sims=VALIDATE_TIER_SIMS,
+    leaf_batch_size=1,
+    **kwargs,
 ):
     """Build an :class:`~core.actor.ActorDriver` over TTT with sensible defaults.
 
@@ -72,6 +79,7 @@ def make_driver(
         actor_id: Actor identity within the run.
         run_seed: The run's root seed.
         sims: Self-play sim count (default: the D6 validate tier).
+        leaf_batch_size: Maximum leaves per evaluation (default: serial).
         **kwargs: Forwarded to :class:`~core.actor.ActorDriver` (``refresh``,
             ``pacing``, ``wait``, ``max_games``, ``should_stop``).
 
@@ -81,7 +89,7 @@ def make_driver(
     kwargs.setdefault("refresh", refresh_sequence([1] * 10))
     return ActorDriver(
         game=TTT,
-        self_play=self_play_cfg(sims=sims),
+        self_play=self_play_cfg(sims=sims, leaf_batch_size=leaf_batch_size),
         run_id=run_id,
         actor_id=actor_id,
         out_dir=tmp_path,
@@ -472,3 +480,66 @@ def test_should_stop_call_count_is_unchanged_when_no_pacing_hook_is_installed(tm
     paths = driver.run()
     assert len(paths) == 2
     assert checks["n"] == 3
+
+
+# --- batched leaf inference (§12 M5) -------------------------------------------
+
+
+def _spy_refresh():
+    """A three-element ``refresh`` over uniform stand-in evaluators that log their calls.
+
+    Returns:
+        ``(refresh, scalar_calls, batch_sizes)`` -- the two lists record every
+        scalar call and every batched call's leaf count.
+    """
+    scalar_calls, batch_sizes = [], []
+
+    def scalar(game, state):
+        scalar_calls.append(state)
+        return 0.0, None
+
+    def batched(game, states):
+        batch_sizes.append(len(states))
+        return [(0.0, None)] * len(states)
+
+    return (lambda: (scalar, 1, batched)), scalar_calls, batch_sizes
+
+
+def test_at_leaf_batch_size_one_the_search_stays_on_the_scalar_evaluator(tmp_path):
+    refresh, scalar_calls, batch_sizes = _spy_refresh()
+    make_driver(tmp_path, refresh=refresh, max_games=1).run()
+    assert scalar_calls and batch_sizes == []
+
+
+def test_above_leaf_batch_size_one_the_search_uses_the_batched_evaluator(tmp_path):
+    refresh, scalar_calls, batch_sizes = _spy_refresh()
+    paths = make_driver(tmp_path, refresh=refresh, max_games=1, leaf_batch_size=4).run()
+    assert len(paths) == 1
+    assert scalar_calls == []
+    assert max(batch_sizes) > 1 and all(1 <= n <= 4 for n in batch_sizes)
+
+
+def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path):
+    """No batched evaluator on offer: the engine maps the scalar one over each batch."""
+    calls = []
+
+    def scalar(game, state):
+        calls.append(state)
+        return 0.0, None
+
+    driver = make_driver(tmp_path, refresh=lambda: (scalar, 1), max_games=1, leaf_batch_size=4)
+    assert len(driver.run()) == 1
+    assert calls
+
+
+def test_a_batched_game_is_reproducible_from_its_durable_coordinates(tmp_path):
+    """Same (run_seed, actor_id, game_index) and config => the same shard, batched too."""
+    shards = []
+    for sub in ("a", "b"):
+        refresh, _, _ = _spy_refresh()
+        (path,) = make_driver(tmp_path / sub, refresh=refresh, max_games=1, leaf_batch_size=4).run()
+        shards.append(read_shard(path, TTT).records)
+    assert len(shards[0]) == len(shards[1]) > 0
+    for a, b in zip(shards[0], shards[1], strict=True):
+        assert np.array_equal(np.asarray(a.planes), np.asarray(b.planes))
+        assert (a.sparse_pi, a.z, a.mover, a.ply) == (b.sparse_pi, b.z, b.mover, b.ply)

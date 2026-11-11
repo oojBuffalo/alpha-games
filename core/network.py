@@ -20,6 +20,7 @@ argument for channel-major."
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -27,7 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from core.game import Action, Game, State
-from core.mcts import Evaluator
+from core.mcts import BatchEvaluator, Evaluator
 
 # Head reduction widths — 1×1 conv channels ahead of each head's FC,
 # AlphaZero-style: two planes feed the flat policy FC, one plane each feeds
@@ -241,14 +242,58 @@ class Network(nn.Module):
         return policy, value, aux
 
 
+def _validated_surface(net: Network, game: Game) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    """Return ``game``'s declared encoding surface, checked against ``net.config``.
+
+    Args:
+        net: The network an evaluator is being built for.
+        game: The adapter ``net`` was built for.
+
+    Returns:
+        ``(input_planes, input_shape, policy_shape)`` as ``game`` declares them.
+
+    Raises:
+        ValueError: If ``net.config`` disagrees with that surface.
+    """
+    cfg = net.config
+    surface = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
+    if (cfg.input_planes, cfg.input_shape, cfg.policy_shape) != surface:
+        raise ValueError(
+            f"net config ({cfg.input_planes}, {cfg.input_shape}, {cfg.policy_shape}) does "
+            f"not match {type(game).__name__}'s declared encoding surface {surface}"
+        )
+    return surface
+
+
+def _reject_cross_wiring(adapter: Game, surface: tuple, game: Game) -> None:
+    """Reject a callback-time ``game`` whose encoding surface is not the validated one.
+
+    Args:
+        adapter: The adapter the evaluator was built (and validated) for.
+        surface: ``adapter``'s declared surface (:func:`_validated_surface`).
+        game: The adapter the search called the evaluator with.
+
+    Raises:
+        ValueError: If ``game`` is a different object declaring a different surface.
+    """
+    if game is not adapter:
+        declared = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
+        if declared != surface:
+            raise ValueError(
+                f"evaluator cross-wired: built for {type(adapter).__name__} with "
+                f"encoding surface {surface}, called with {type(game).__name__} "
+                f"declaring {declared}"
+            )
+
+
 def make_network_evaluator(net: Network, game: Game, device: str = "cpu") -> Evaluator:
     """Bridge ``net`` into the ``MCTS.evaluate`` seam (§12 M0: "from M2, the network").
 
     The returned callable matches the M0 ``Evaluator`` seam exactly — the same
     seam, no new abstraction — so ``MCTS(game, evaluate=make_network_evaluator(...))``
     is the whole wiring. Batch-1 per-leaf inference is the M2/M3 functional
-    path; batched/asynchronous inference (queueing across concurrent descents)
-    is explicitly M5 scope and does not live here.
+    path; :func:`make_batched_network_evaluator` is its M5 sibling for the
+    engine's ``evaluate_batch`` seam, under the same conventions.
 
     **Value sign convention (the bug this docstring exists to prevent):** the
     scalar ``tanh`` head is returned as-is because it is *mover-relative by
@@ -300,26 +345,13 @@ def make_network_evaluator(net: Network, game: Game, device: str = "cpu") -> Eva
         ValueError: If ``net.config`` disagrees with ``game``'s declared
             ``input_planes`` / ``input_shape`` / ``policy_shape``.
     """
-    cfg = net.config
     adapter = game
-    surface = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
-    if (cfg.input_planes, cfg.input_shape, cfg.policy_shape) != surface:
-        raise ValueError(
-            f"net config ({cfg.input_planes}, {cfg.input_shape}, {cfg.policy_shape}) does "
-            f"not match {type(game).__name__}'s declared encoding surface {surface}"
-        )
+    surface = _validated_surface(net, game)
     dev = torch.device(device)
     net.to(dev).eval()
 
     def evaluate(game: Game, state: State) -> tuple[float, dict[Action, float]]:
-        if game is not adapter:
-            declared = (game.input_planes, tuple(game.input_shape), tuple(game.policy_shape))
-            if declared != surface:
-                raise ValueError(
-                    f"evaluator cross-wired: built for {type(adapter).__name__} with "
-                    f"encoding surface {surface}, called with {type(game).__name__} "
-                    f"declaring {declared}"
-                )
+        _reject_cross_wiring(adapter, surface, game)
         legal = list(game.legal_moves(state))
         x = torch.as_tensor(adapter.encode_state(state), dtype=torch.float32, device=dev)
         with torch.inference_mode():
@@ -328,3 +360,75 @@ def make_network_evaluator(net: Network, game: Game, device: str = "cpu") -> Eva
         return value.item(), dict(zip(legal, policy[0, idx].tolist(), strict=True))
 
     return evaluate
+
+
+def make_batched_network_evaluator(net: Network, game: Game, device: str = "cpu") -> BatchEvaluator:
+    """Bridge ``net`` into the ``MCTS.evaluate_batch`` seam: one forward per leaf batch.
+
+    The batched sibling of :func:`make_network_evaluator` (design doc §6.2
+    batched parallel selection, §12 M5), and held to every convention that
+    docstring pins — mover-relative ``tanh`` value returned as-is, priors as raw
+    legal-id logits with the engine owning the single softmax, states encoded
+    with the factory-validated adapter, a cross-wired callback-time ``game``
+    rejected before any inference. The one difference is cardinality: the
+    states of a call are stacked into a single ``(B, planes, H, W)`` tensor and
+    the net runs once.
+
+    Results are positional. The engine guarantees the states of one call belong
+    to distinct leaves, **not** that they are distinct values (there is no
+    transposition table), so nothing here is keyed by state: row ``i`` of the
+    forward answers ``states[i]``, and two equal states simply produce two
+    equal rows.
+
+    Only the legal logits leave the device (sparse-everywhere): one gather over
+    every row's legal ids and one transfer per call, never the dense
+    ``(B, num_actions)`` head.
+
+    Args:
+        net: The network to evaluate leaves with. Moved to ``device`` and
+            switched to ``eval()`` mode in place (so the batch statistics of a
+            call never enter a normalization layer and a row's result does not
+            depend on its batch-mates); forwards run under
+            ``torch.inference_mode()``.
+        game: The adapter ``net`` was built for — validated against
+            ``net.config`` exactly as in :func:`make_network_evaluator`.
+        device: Torch device for inference (default ``"cpu"``).
+
+    Returns:
+        A ``BatchEvaluator``: ``(game, states) -> [(value, {action_id:
+        raw_logit}), ...]``, one result per state in input order, each value
+        from that state's mover's perspective. An empty ``states`` returns
+        ``[]`` without a forward.
+
+    Raises:
+        ValueError: If ``net.config`` disagrees with ``game``'s declared
+            ``input_planes`` / ``input_shape`` / ``policy_shape``.
+    """
+    adapter = game
+    surface = _validated_surface(net, game)
+    dev = torch.device(device)
+    net.to(dev).eval()
+
+    def evaluate_batch(
+        game: Game, states: Sequence[State]
+    ) -> list[tuple[float, dict[Action, float]]]:
+        _reject_cross_wiring(adapter, surface, game)
+        if not states:
+            return []
+        legal = [list(game.legal_moves(state)) for state in states]
+        x = torch.stack(
+            [torch.as_tensor(adapter.encode_state(state), dtype=torch.float32) for state in states]
+        ).to(dev)
+        with torch.inference_mode():
+            policy, value, _ = net(x)
+        rows = torch.as_tensor(
+            [row for row, ids in enumerate(legal) for _ in ids], dtype=torch.long, device=dev
+        )
+        cols = torch.as_tensor([a for ids in legal for a in ids], dtype=torch.long, device=dev)
+        logits = iter(policy[rows, cols].tolist())
+        return [
+            (v, {action: next(logits) for action in ids})
+            for v, ids in zip(value.tolist(), legal, strict=True)
+        ]
+
+    return evaluate_batch

@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from core import ipc
 from core.actor import ActorDriver
 from core.amp import AmpMode
 from core.artifact_fingerprint import FingerprintMismatchError
@@ -56,7 +57,13 @@ from core.learner import (
 )
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
-from core.observability import SERIES_ACTOR_AMP_ACTIVE, reduce_run
+from core.observability import (
+    SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_POSITIONS_EVALUATED,
+    SERIES_SIMS_RUN,
+    PositionCounter,
+    reduce_run,
+)
 from core.replay_shard import SampleRecord, read_shard, shard_filename, write_shard
 from core.replay_window import ReplayWindow
 from core.runconfig import TrainingConfig, load_run_config
@@ -217,7 +224,7 @@ def test_refresh_blocks_until_the_first_checkpoint_lands(tmp_path):
     refresh = build_actor_refresh(
         game=TTT, ckpt_dir=ckpt_dir, network_config=TTT_NET_CONFIG, wait=wait
     )
-    evaluator, version = refresh()
+    evaluator, version, _ = refresh()
 
     assert calls["n"] == 2
     assert version == 0
@@ -238,15 +245,17 @@ def test_refresh_returns_growing_versions_and_caches_the_unchanged_case(tmp_path
     refresh = build_actor_refresh(
         game=TTT, ckpt_dir=ckpt_dir, network_config=TTT_NET_CONFIG, wait=unreachable
     )
-    eval0, v0 = refresh()
-    eval0_again, v0_again = refresh()
+    eval0, v0, batch0 = refresh()
+    eval0_again, v0_again, batch0_again = refresh()
     assert (v0, v0_again) == (0, 0)
-    assert eval0 is eval0_again  # cache hit: an unchanged `latest` never rebuilds
+    # cache hit: an unchanged `latest` never rebuilds either evaluator
+    assert eval0 is eval0_again and batch0 is batch0_again
 
     learner._run_step()  # step 0 -> 1, publish_interval=1 -> publishes v1
-    eval1, v1 = refresh()
+    eval1, v1, batch1 = refresh()
     assert v1 == 1
-    assert eval1 is not eval0  # cache miss: a new `latest` rebuilds
+    # cache miss: a new `latest` rebuilds both
+    assert eval1 is not eval0 and batch1 is not batch0
 
 
 def test_refresh_raises_loudly_on_fingerprint_mismatch(tmp_path):
@@ -283,14 +292,14 @@ def test_refresh_persists_the_observed_amp_state_once_per_actor_epoch(tmp_path):
     )
     state = TTT.initial_state()
 
-    eval0, _ = refresh()
+    eval0, _, _ = refresh()
     assert _amp_records(run_dir) == []  # building an evaluator observes nothing
     eval0(TTT, state)
     eval0(TTT, state)
     assert _amp_records(run_dir) == [0.0]
 
     learner._run_step()  # publishes v1 -> a freshly built evaluator
-    eval1, version = refresh()
+    eval1, version, _ = refresh()
     assert version == 1 and eval1 is not eval0
     eval1(TTT, state)
     assert _amp_records(run_dir) == [0.0]  # one record per actor epoch, not per version
@@ -315,7 +324,7 @@ def test_refresh_amp_record_is_the_observed_state_not_the_device(tmp_path, monke
         network_config=TTT_NET_CONFIG,
         metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
     )
-    evaluator, _ = refresh()
+    evaluator, _, _ = refresh()
     evaluator(TTT, TTT.initial_state())
     assert _amp_records(run_dir) == [1.0]
 
@@ -331,10 +340,126 @@ def test_refresh_on_cuda_persists_a_live_amp_record(tmp_path):
         network_config=TTT_NET_CONFIG,
         metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
     )
-    evaluator, _ = refresh()
+    evaluator, _, _ = refresh()
     evaluator(TTT, TTT.initial_state())
     assert _amp_records(run_dir) == [1.0]
     assert reduce_run(run_dir).gauges[SERIES_ACTOR_AMP_ACTIVE] == 1.0
+
+
+def test_refresh_builds_a_batched_evaluator_that_counts_leaves(tmp_path):
+    shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
+    _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
+    counter = PositionCounter()
+    refresh = build_actor_refresh(
+        game=TTT, ckpt_dir=ckpt_dir, network_config=TTT_NET_CONFIG, position_counter=counter
+    )
+    scalar, _, batched = refresh()
+    s0 = TTT.initial_state()
+    s1 = TTT.apply(s0, 4)
+
+    results = batched(TTT, [s0, s1, s0])  # equal states are legal in one batch
+    assert counter.total == 3  # three leaves, one forward pass
+    assert len(results) == 3
+    assert results[0][0] == pytest.approx(scalar(TTT, s0)[0], abs=1e-5)  # the same weights
+    assert counter.total == 4
+
+
+def _spy_on_batched_factory(monkeypatch):
+    """Make every batched evaluator ``core.ipc`` builds log its batches' leaf counts.
+
+    Args:
+        monkeypatch: The pytest fixture.
+
+    Returns:
+        The list the leaf counts are appended to, one entry per forward pass.
+    """
+    sizes = []
+    real = ipc.make_batched_network_evaluator
+
+    def factory(net, game, device="cpu"):
+        inner = real(net, game, device=device)
+
+        def spy(game_, states):
+            sizes.append(len(states))
+            return inner(game_, states)
+
+        return spy
+
+    monkeypatch.setattr(ipc, "make_batched_network_evaluator", factory)
+    return sizes
+
+
+def _run_counted_actor(tmp_path, monkeypatch, *, leaf_batch_size):
+    """Run two real-evaluator TTT games through the IPC refresh, fully observed.
+
+    Args:
+        tmp_path: The pytest fixture.
+        monkeypatch: The pytest fixture.
+        leaf_batch_size: The actor's ``self_play.leaf_batch_size``.
+
+    Returns:
+        ``(totals, sizes)``: the reduced run's totals and the leaf count of
+        every batched forward pass.
+    """
+    shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
+    _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
+    sizes = _spy_on_batched_factory(monkeypatch)
+    counter = PositionCounter()
+    writer = EpochMetricsWriter(run_dir, "actor-0")
+    actor = ActorDriver(
+        game=TTT,
+        self_play=_ttt_self_play(leaf_batch_size=leaf_batch_size),
+        run_id="run-1",
+        actor_id=0,
+        out_dir=shard_dir,
+        run_seed=7,
+        refresh=build_actor_refresh(
+            game=TTT,
+            ckpt_dir=ckpt_dir,
+            network_config=TTT_NET_CONFIG,
+            position_counter=counter,
+            metrics_writer=writer,
+        ),
+        max_games=2,
+        metrics_writer=writer,
+        position_counter=counter,
+    )
+    assert len(actor.run()) == 2
+    return reduce_run(run_dir).totals, sizes
+
+
+def test_a_batched_actor_counts_leaves_evaluated_not_forward_passes(tmp_path, monkeypatch):
+    totals, sizes = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=8)
+
+    assert totals[SERIES_POSITIONS_EVALUATED] == sum(sizes)  # the x-axis counts leaves
+    assert sum(sizes) > len(sizes)  # ...which is more than the forward passes run
+    assert max(sizes) > 1 and all(1 <= n <= 8 for n in sizes)
+    # Terminal leaves are simulations but never reach the network.
+    assert 0 < totals[SERIES_POSITIONS_EVALUATED] <= totals[SERIES_SIMS_RUN]
+
+
+def test_a_serial_actor_never_touches_the_batched_evaluator(tmp_path, monkeypatch):
+    totals, sizes = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=1)
+    assert sizes == []
+    assert 0 < totals[SERIES_POSITIONS_EVALUATED] <= totals[SERIES_SIMS_RUN]
+
+
+def test_the_batched_evaluator_also_runs_inside_the_amp_context(tmp_path, monkeypatch):
+    """Both evaluators sit under the wrapper: a batched first call is observed live too."""
+    shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
+    _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
+    forced = AmpMode(device_type="cpu", enabled=True)
+    monkeypatch.setattr(AmpMode, "resolve", classmethod(lambda cls, device: forced))
+    refresh = build_actor_refresh(
+        game=TTT,
+        ckpt_dir=ckpt_dir,
+        network_config=TTT_NET_CONFIG,
+        metrics_writer=EpochMetricsWriter(run_dir, "actor-0"),
+    )
+    scalar, _, batched = refresh()
+    batched(TTT, [TTT.initial_state()])
+    scalar(TTT, TTT.initial_state())  # the second evaluator's first call records nothing
+    assert _amp_records(run_dir) == [1.0]
 
 
 # ==============================================================================

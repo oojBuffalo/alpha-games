@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from core.game import Action, Game, PlayerId, State
-from core.mcts import MCTS, Evaluator
+from core.mcts import MCTS, BatchEvaluator, Evaluator
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
 
@@ -277,6 +277,7 @@ def play_game(
     *,
     model_version: int | None = None,
     game_id: tuple[str, str, int] | None = None,
+    evaluate_batch: BatchEvaluator | None = None,
 ) -> GameResult:
     """Play one complete self-play game, returning its stored samples.
 
@@ -286,6 +287,13 @@ def play_game(
     no playout-cap randomization — that is D6/M5), every ply is stored, and the
     targets are backfilled once the game ends.
 
+    Each search collects up to ``cfg.leaf_batch_size`` leaves per evaluation
+    (§6.2 batched parallel selection). ``1`` is the serial search, bit for bit.
+    Above ``1`` the trajectory legitimately differs from the serial one —
+    virtual loss steers a batch's descents apart — but stays a pure function of
+    the seed and config, and the stored counts are still the root's raw ``N``:
+    virtual loss is fully backed out before a search returns.
+
     Args:
         game: The adapter to play. Game-specific behavior enters *only* here —
             this module never imports ``games/``.
@@ -293,7 +301,8 @@ def play_game(
             bridges the batch-1 network in). ``None`` runs the M0 engine: value
             0.0 and uniform priors, which is what the stdlib-only tests use.
         cfg: The shared self-play scalars (``core.runconfig.SelfPlayConfig``);
-            ``root_noise`` False disables the D7 hook entirely.
+            ``root_noise`` False disables the D7 hook entirely, and
+            ``leaf_batch_size`` bounds the leaves per evaluation.
         rngs: The per-game stream bundle (``GameRNGs.for_game(run_seed, index)``);
             ``dirichlet`` goes to the D7 hook and ``move_selection`` to D10.
             ``tie_break`` is deliberately unconsumed here: at M2.5 both the PUCT
@@ -309,6 +318,11 @@ def play_game(
             function never derives or validates the id — it is only ever a
             label the caller already owns (``core.actor.ActorDriver``, from
             ``core.replay_shard.ShardWriter``'s persisted state).
+        evaluate_batch: Optional batched leaf evaluator
+            (``core.network.make_batched_network_evaluator``). When supplied
+            the engine evaluates every leaf batch through it in one call and
+            ``evaluator`` is not used; ``None`` maps ``evaluator`` over each
+            batch's leaves instead.
 
     Returns:
         The finished :class:`GameResult`, its samples already backfilled.
@@ -316,7 +330,7 @@ def play_game(
     root_noise = None
     if cfg.root_noise:
         root_noise = (cfg.dirichlet_eps, cfg.dirichlet_alpha_numerator, rngs.dirichlet)
-    search = MCTS(game, evaluate=evaluator, root_noise=root_noise)
+    search = MCTS(game, evaluate=evaluator, evaluate_batch=evaluate_batch, root_noise=root_noise)
     state = game.initial_state()
     search.set_root(state)
 
@@ -324,7 +338,7 @@ def play_game(
     moves: list[Action] = []
     ply = 0
     while not game.is_terminal(state):
-        search.run(cfg.sims)
+        search.run(cfg.sims, batch_size=cfg.leaf_batch_size)
         visits = search.action_visit_counts()
         samples.append(
             Sample(

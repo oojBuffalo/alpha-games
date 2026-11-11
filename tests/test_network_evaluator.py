@@ -21,7 +21,12 @@ import pytest
 import torch
 
 from core import MCTS
-from core.network import Network, NetworkConfig, make_network_evaluator
+from core.network import (
+    Network,
+    NetworkConfig,
+    make_batched_network_evaluator,
+    make_network_evaluator,
+)
 from core.runner import _OpeningRestricted
 from games.blokus_duo import BlokusDuo
 from games.othello import Othello
@@ -235,3 +240,102 @@ def test_evaluator_accepts_the_runner_opening_restriction_wrapper():
     m = MCTS(wrapped, evaluate=ev)
     m.run(8, root_state=s0)
     assert m.best_action() in keep
+
+
+# --- the batched bridge (§12 M5): one forward per leaf batch --------------------------
+
+
+def _playout_states(game, plies):
+    """Return the states along a fixed first-legal-move playout, opening included."""
+    state = game.initial_state()
+    states = [state]
+    for _ in range(plies):
+        state = game.apply(state, next(iter(game.legal_moves(state))))
+        states.append(state)
+    return states
+
+
+@pytest.mark.parametrize(
+    ("game", "net"), [(OTHELLO, OTHELLO_NET), (BLOKUS, BLOKUS_NET)], ids=["othello", "blokus"]
+)
+def test_batched_forward_matches_per_leaf_forwards(game, net):
+    # CPU, seeded weights, no autocast on either side: one stacked forward must
+    # reproduce the per-leaf forwards, row for row, in input order.
+    states = _playout_states(game, 4)
+    states.append(states[1])  # equal states in one batch: results are positional
+    single = make_network_evaluator(net, game)
+    batched = make_batched_network_evaluator(net, game)
+
+    results = batched(game, states)
+
+    assert len(results) == len(states)
+    for state, (value, priors) in zip(states, results, strict=True):
+        ref_value, ref_priors = single(game, state)
+        assert isinstance(value, float)
+        assert list(priors) == list(game.legal_moves(state))  # every legal id, nothing else
+        assert value == pytest.approx(ref_value, abs=1e-5)
+        for action, logit in priors.items():
+            assert logit == pytest.approx(ref_priors[action], abs=1e-5)
+    # The repeated state is answered twice, once per position.
+    assert results[-1][0] == pytest.approx(results[1][0], abs=1e-6)
+    assert results[-1][1] == pytest.approx(results[1][1], abs=1e-6)
+
+
+def test_batched_evaluator_puts_the_net_in_eval_mode():
+    # In train mode BatchNorm would normalize a leaf by its batch-mates, so a
+    # row's answer would depend on what else was collected with it.
+    net = Network(NetworkConfig.from_game(OTHELLO)).train()
+    batched = make_batched_network_evaluator(net, OTHELLO)
+    assert net.training is False
+    states = _playout_states(OTHELLO, 2)
+    alone = batched(OTHELLO, states[:1])[0]
+    together = batched(OTHELLO, states)[0]
+    assert together[0] == pytest.approx(alone[0], abs=1e-5)
+
+
+def test_batched_evaluator_returns_nothing_for_an_empty_batch_without_a_forward():
+    class _Unreachable(Network):
+        def forward(self, x):
+            raise AssertionError("an empty batch must not reach the net")
+
+    batched = make_batched_network_evaluator(
+        _Unreachable(NetworkConfig.from_game(OTHELLO)), OTHELLO
+    )
+    assert batched(OTHELLO, []) == []
+
+
+def test_batched_bridge_rejects_mismatched_pairing_and_cross_wiring():
+    with pytest.raises(ValueError, match="does not match"):
+        make_batched_network_evaluator(OTHELLO_NET, BLOKUS)
+    batched = make_batched_network_evaluator(OTHELLO_NET, OTHELLO)
+    with pytest.raises(ValueError, match="cross-wired"):
+        batched(BLOKUS, [BLOKUS.initial_state()])
+
+
+def test_batched_evaluator_accepts_surface_preserving_wrapper():
+    # Legal ids from the callback-time game, encoding from the validated adapter.
+    s0 = OTHELLO.initial_state()
+    restricted = list(OTHELLO.legal_moves(s0))[:2]
+    wrapper = _SurfacePreservingWrapper(OTHELLO, keep=set(restricted).__contains__)
+    ((_, priors),) = make_batched_network_evaluator(OTHELLO_NET, OTHELLO)(wrapper, [s0])
+    assert list(priors) == restricted
+
+
+def test_batched_bridge_drives_batched_mcts():
+    calls = []
+    batched = make_batched_network_evaluator(OTHELLO_NET, OTHELLO)
+
+    def spy(game, states):
+        calls.append(len(states))
+        return batched(game, states)
+
+    def scalar_must_not_run(game, state):
+        raise AssertionError("evaluate_batch supplied: the scalar evaluator is not used")
+
+    m = MCTS(OTHELLO, evaluate=scalar_must_not_run, evaluate_batch=spy)
+    root = m.run(64, root_state=OTHELLO.initial_state(), batch_size=8)
+
+    assert sum(root.N) == 63  # the first simulation expands the root
+    assert max(calls) > 1  # several leaves really shared one forward
+    assert sum(calls) <= 64 and all(1 <= n <= 8 for n in calls)
+    assert all(v == 0 for v in root.vloss)
