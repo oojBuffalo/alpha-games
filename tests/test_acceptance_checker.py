@@ -30,7 +30,7 @@ from games.tictactoe import TicTacToe
 TTT = TicTacToe()
 
 
-def _game_records(run_id, actor_id, game_index, movers, model_version):
+def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT):
     """Build one synthetic game's records, with a caller-chosen mover sequence.
 
     Args:
@@ -40,19 +40,20 @@ def _game_records(run_id, actor_id, game_index, movers, model_version):
         movers: The mover stamped on each successive ply -- the caller's
             direct control over consecutive-mover (blocked-skip) sequences.
         model_version: Stamped on every record in this game.
+        game: The adapter whose encoding the records carry.
 
     Returns:
         A tuple of ``len(movers)`` ``SampleRecord``s.
     """
-    state = TTT.initial_state()
-    planes = TTT.encode_state(state)
-    legal_action = next(iter(TTT.legal_moves(state)))
+    state = game.initial_state()
+    planes = game.encode_state(state)
+    legal_action = next(iter(game.legal_moves(state)))
     return tuple(
         SampleRecord(
             planes=planes,
             sparse_pi=((legal_action, 1),),
             z=0.0,
-            aux=(),
+            aux=(0.0,) * len(game.value_targets.aux_names),
             mover=mover,
             model_version=model_version,
             ply=ply,
@@ -62,11 +63,11 @@ def _game_records(run_id, actor_id, game_index, movers, model_version):
     )
 
 
-def _write_game_shard(shard_dir, run_id, actor_id, seq, movers, model_version):
+def _write_game_shard(shard_dir, run_id, actor_id, seq, movers, model_version, game=TTT):
     """Publish one synthetic single-game shard."""
-    records = _game_records(run_id, actor_id, seq, movers, model_version)
+    records = _game_records(run_id, actor_id, seq, movers, model_version, game)
     shard_id = shard_filename(run_id, actor_id, seq)
-    write_shard(shard_dir / shard_id, TTT, records, run_id=run_id, actor_id=actor_id, seq=seq)
+    write_shard(shard_dir / shard_id, game, records, run_id=run_id, actor_id=actor_id, seq=seq)
 
 
 def _run_config_stub(*, batch_size, publish_interval):
@@ -120,8 +121,20 @@ _LEARNER_STEP = 10  # >= 2 full publish intervals
 _BATCH_SIZE = 4
 
 
-def _build_passing_run(tmp_path: Path, run_id: str = "accept-run") -> Path:
-    """Build a synthetic run directory that passes every acceptance check."""
+def _build_passing_run(
+    tmp_path: Path, run_id: str = "accept-run", *, game=TTT, learner_step: int = _LEARNER_STEP
+) -> Path:
+    """Build a synthetic run directory that passes every acceptance check.
+
+    Args:
+        tmp_path: Parent directory.
+        run_id: The run's id, and its directory name.
+        game: The adapter the shards are written for.
+        learner_step: The learner's recorded cumulative step.
+
+    Returns:
+        The run directory.
+    """
     root = tmp_path / run_id
     shard_dir = root / "shards"
     shard_dir.mkdir(parents=True)
@@ -132,10 +145,10 @@ def _build_passing_run(tmp_path: Path, run_id: str = "accept-run") -> Path:
         else:
             movers = [0, 1, 0]
         model_version = 0 if i < _NUM_GAMES // 2 else 1  # actor reload observed partway through
-        _write_game_shard(shard_dir, run_id, "0", i, movers, model_version)
+        _write_game_shard(shard_dir, run_id, "0", i, movers, model_version, game)
 
     _write_actor_metrics(root, num_games=_NUM_GAMES)
-    _write_learner_metrics(root, learner_step=_LEARNER_STEP, published_versions=(0, 1))
+    _write_learner_metrics(root, learner_step=learner_step, published_versions=(0, 1))
     _write_checkpoints(root / "checkpoints", (0, 1))
     return root
 

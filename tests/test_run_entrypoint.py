@@ -53,6 +53,7 @@ from core.run_identity import (
     MaterialConfigDiffError,
     RunRecord,
     iso_now,
+    load_launch_config,
     read_run_record,
     read_stored_config,
     resolve_resume,
@@ -61,6 +62,8 @@ from core.run_identity import (
 )
 from games.blokus_duo import BlokusDuo
 from games.blokus_duo.config import MICRO_CONFIG
+from tests.test_acceptance_checker import _build_passing_run
+from tests.test_run_identity import V1_CONFIG_FIXTURE
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "run_selfplay.py"
@@ -336,6 +339,36 @@ def test_fork_creates_new_identity_with_lineage_and_leaves_parent_untouched(tmp_
     # The parent is provably untouched.
     assert (parent_dir / "config.json").read_text() == parent_config_bytes
     assert _shard_count(parent_dir) == parent_shards_before
+
+
+def test_verify_acceptance_cli_reads_a_schema_v1_run_dir_end_to_end(tmp_path, capsys):
+    """An M3-era run dir verifies through the CLI: the loader, not just the checker.
+
+    The run directory is the acceptance checker's own passing fixture, written
+    for the full game, under the genuine schema-v1 ``config.json`` (no
+    ``self_play.leaf_batch_size``) -- which the strict launch loader rejects.
+    """
+    full = BlokusDuo()
+    run_id = "blokus_duo-20260825T000000000000-1f18e71e6f6b"
+    root = _build_passing_run(tmp_path, run_id, game=full, learner_step=400)
+    (root / "config.json").write_bytes(V1_CONFIG_FIXTURE.read_bytes())
+    (root / "run_record.json").write_text(
+        json.dumps(
+            RunRecord(
+                run_id=run_id, created_at="2026-08-25T00:00:00Z", entry_condition={}
+            ).to_dict()
+        )
+    )
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        load_launch_config(root / "config.json")
+
+    assert rs.main(["--verify-acceptance", str(root)]) == 0
+
+    out = capsys.readouterr().out
+    assert out.count("[PASS]") == 9
+    assert "[FAIL]" not in out
+    assert "verdict: PASS" in out
+    assert (root / "config.json").read_bytes() == V1_CONFIG_FIXTURE.read_bytes()
 
 
 def test_unknown_config_field_is_a_loud_error(tmp_path):

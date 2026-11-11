@@ -654,8 +654,12 @@ class Lineage:
 
     Attributes:
         parent_run_id: The parent run's id.
-        parent_config_hash: :func:`compute_config_hash` of the parent's
-            stored config, at fork time.
+        parent_config_hash: :func:`compute_document_hash` of the parent's
+            stored ``config.json`` *as persisted*, at fork time -- for a
+            document :func:`write_provenance` wrote, exactly the
+            :func:`compute_config_hash` its launch computed, whose first 12
+            hex chars end the parent's run id. Never a hash of the object the
+            document migrates to.
         parent_run_dir: The parent's concrete run directory, as a string.
         forked_at: ISO-8601 UTC timestamp of the fork.
         imported_weights_version: The parent model version whose weights were
@@ -950,7 +954,9 @@ def resolve_fork(
 
     Never diffs against the parent (module docstring) -- forks may freely
     change material fields; that is their purpose. The parent run directory
-    is never written to.
+    is never written to. The parent's stored config must still read as a
+    valid config (migrated if it is of an older schema), but the lineage hash
+    is taken over the document as stored.
 
     Args:
         parent_run_dir: The existing run directory to fork from.
@@ -964,9 +970,11 @@ def resolve_fork(
 
     Raises:
         FileNotFoundError: If ``parent_run_dir`` has no recorded provenance.
+        ValueError: If the parent's stored config cannot be read
+            (:func:`read_stored_config_document`).
     """
     parent_root = Path(parent_run_dir)
-    parent_config = read_stored_config(parent_root)
+    parent_document, _ = read_stored_config_document(parent_root)
     parent_record = read_run_record(parent_root)
     new_run_id = generate_run_id(new_launch_config, now=now)
     return ForkResolution(
@@ -974,7 +982,7 @@ def resolve_fork(
         run_root=run_root(new_launch_config, new_run_id),
         lineage=Lineage(
             parent_run_id=parent_record.run_id,
-            parent_config_hash=compute_config_hash(parent_config),
+            parent_config_hash=compute_document_hash(parent_document),
             parent_run_dir=str(parent_root),
             forked_at=iso_now(now),
             imported_weights_version=None,

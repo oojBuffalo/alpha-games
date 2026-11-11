@@ -24,6 +24,7 @@ Four layers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -61,6 +62,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # through ``write_provenance`` -- no ``self_play.leaf_batch_size``, and no
 # evaluation-protocol stamps either (those arrived with M4).
 V1_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v1.json"
+
+# ``compute_config_hash`` of that config as the same M3-era code computed it at
+# launch -- the digest whose first 12 hex chars a real run id of that era ends in.
+V1_LAUNCH_TIME_HASH = "1f18e71e6f6b73f649e2d2c05107aca832773dd88d56de9a6e8964ad8ff536a3"
 
 
 def _base_raw():
@@ -680,6 +685,22 @@ def test_document_hash_of_a_stored_config_is_its_launch_time_config_hash(tmp_pat
     raw, _ = read_stored_config_document(root)
     assert compute_document_hash(raw) == compute_config_hash(lc)
     assert compute_document_hash(lc.to_dict()) == compute_config_hash(lc)
+
+
+def test_fork_from_a_v1_parent_records_the_hash_of_the_document_as_stored(tmp_path):
+    """Lineage hashes the parent's file as persisted, never the migrated object."""
+    parent = _v1_run_dir(tmp_path)
+    stored_bytes = (parent / "config.json").read_bytes()
+
+    resolution = resolve_fork(parent, _launch_config(), now=1_700_000_500.0)
+    recorded = resolution.lineage.parent_config_hash
+
+    canonical = json.dumps(json.loads(stored_bytes), sort_keys=True).encode("utf-8")
+    assert recorded == hashlib.sha256(canonical).hexdigest()  # the unchanged parent file
+    assert recorded == V1_LAUNCH_TIME_HASH  # what the launching code computed
+    assert read_run_record(parent).run_id.endswith(f"-{recorded[:12]}")  # the run id's digest
+    assert recorded != compute_config_hash(read_stored_config(parent))  # not the migration
+    assert (parent / "config.json").read_bytes() == stored_bytes
 
 
 def test_resolve_fork_never_writes_the_parent_directory(tmp_path):
