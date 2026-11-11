@@ -572,15 +572,25 @@ def test_versioned_reader_rejects_a_version_it_has_no_migration_for(tmp_path, ve
     doc = lc.to_dict()
     doc["schema_version"] = version
     (root / "config.json").write_text(json.dumps(doc))
-    with pytest.raises((ValueError, TypeError), match="schema_version"):
+    # The strict parser's own two errors, and nothing else: a ``true`` that looked
+    # up the v1 migration step would fail (or pass) for an unrelated reason.
+    expected = "schema_version mismatch|schema_version: expected an int"
+    with pytest.raises((ValueError, TypeError), match=expected):
         read_stored_config_document(root)
 
 
-def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwritten(tmp_path):
-    """The migration fills what v1 could not say; it never replaces what a file does say."""
+@pytest.mark.parametrize("value", [8, 1])
+def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwritten(
+    tmp_path, value
+):
+    """The migration fills what v1 could not say; the key's presence is the error.
+
+    Rejected whatever the value -- including ``1``, the value the migration
+    itself would fill: a v1 document cannot carry the key at all.
+    """
     root = _v1_run_dir(tmp_path)
     doc = json.loads(V1_CONFIG_FIXTURE.read_text())
-    doc["self_play"]["leaf_batch_size"] = 8
+    doc["self_play"]["leaf_batch_size"] = value
     (root / "config.json").write_text(json.dumps(doc))
     with pytest.raises(ValueError, match="leaf_batch_size"):
         read_stored_config_document(root)

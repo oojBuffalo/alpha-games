@@ -520,11 +520,12 @@ def test_at_leaf_batch_size_one_the_search_stays_on_the_scalar_evaluator(tmp_pat
 
 
 def test_above_leaf_batch_size_one_the_search_uses_the_batched_evaluator(tmp_path):
+    """Pinned at 2, the smallest batched size: the switch is ``> 1``, not some larger bound."""
     refresh, scalar_calls, batch_sizes = _spy_refresh()
-    paths = make_driver(tmp_path, refresh=refresh, max_games=1, leaf_batch_size=4).run()
+    paths = make_driver(tmp_path, refresh=refresh, max_games=1, leaf_batch_size=2).run()
     assert len(paths) == 1
     assert scalar_calls == []
-    assert max(batch_sizes) > 1 and all(1 <= n <= 4 for n in batch_sizes)
+    assert max(batch_sizes) == 2 and all(1 <= n <= 2 for n in batch_sizes)
 
 
 def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path):
