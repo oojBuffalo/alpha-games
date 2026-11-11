@@ -15,7 +15,12 @@ import pytest
 from core import MCTS
 from games.connect4 import Connect4
 from games.tictactoe import TicTacToe
-from tests.fixtures.pass_game import consecutive_trap_game, consecutive_win_game
+from tests.fixtures.pass_game import (
+    PassGame,
+    Scenario,
+    consecutive_trap_game,
+    consecutive_win_game,
+)
 
 EPS = 0.25  # D7
 ALPHA_NUMERATOR = 10.8  # D7
@@ -208,6 +213,8 @@ class _Recorder:
         root_vloss: The root's virtual-loss vector as seen inside each call — i.e. while
             the batch's descents are still in flight.
         in_flight: The states of every in-flight node, as seen inside each call.
+        pending: The states of the in-flight *non-terminal* nodes, as seen inside each
+            call. The tree walk yields each node once, so this lists one state per node.
     """
 
     def __init__(self, value: float = 0.0):
@@ -216,11 +223,14 @@ class _Recorder:
         self.calls: list[list] = []
         self.root_vloss: list[list[int]] = []
         self.in_flight: list[list] = []
+        self.pending: list[list] = []
 
     def __call__(self, game, states):
+        nodes = [n for n in _all_nodes(self.mcts.root) if n.in_flight]
         self.calls.append(list(states))
         self.root_vloss.append(list(self.mcts.root.vloss))
-        self.in_flight.append([n.state for n in _all_nodes(self.mcts.root) if n.in_flight])
+        self.in_flight.append([n.state for n in nodes])
+        self.pending.append([n.state for n in nodes if not n.is_terminal])
         return [(self.value, None)] * len(states)
 
 
@@ -284,16 +294,61 @@ def test_one_batch_collects_distinct_unevaluated_leaves():
     _assert_no_residue(m.root)
 
 
-def test_no_batch_ever_holds_a_duplicate_leaf():
-    game = Connect4(4, 4, 3)
+def test_no_batch_ever_holds_one_leaf_twice_though_equal_states_may_share_a_batch():
+    game = TicTacToe()
     m, rec = _recorded(game)
 
-    m.run(300, root_state=game.initial_state(), batch_size=8)
+    m.run(100, root_state=game.initial_state(), batch_size=2)
 
-    assert all(0 < len(call) <= 8 for call in rec.calls)
-    assert all(len(set(call)) == len(call) for call in rec.calls)
+    assert all(0 < len(call) <= 2 for call in rec.calls)
     assert any(len(call) > 1 for call in rec.calls)
-    assert m.completed_simulations == 300
+    # Distinct leaves means distinct *nodes*: every state handed over belongs to its own
+    # in-flight node, so a leaf collected twice would leave a state without one.
+    for call, pending in zip(rec.calls, rec.pending, strict=True):
+        assert sorted(pending) == sorted(call)
+    # It does not mean distinct states. With no transposition table two leaves reached by
+    # different move orders hold equal states, and one batch can carry both.
+    assert any(len(set(call)) < len(call) for call in rec.calls)
+    assert m.completed_simulations == 100
+
+
+def test_each_result_of_a_batch_is_installed_on_its_own_leaf():
+    game = Connect4(4, 4, 3)
+    evaluate = _seeded_evaluator(3)  # value and logits depend on the state
+    m = MCTS(game, evaluate_batch=_mapped(evaluate))
+    start = game.initial_state()
+
+    root = m.run(5, root_state=start, batch_size=4)
+
+    assert root.N == [1, 1, 1, 1]  # one batch of four, one visit down each root edge
+    for i, child in enumerate(root.children):
+        value, logits = evaluate(game, game.apply(start, root.actions[i]))
+        assert root.W[i] == -value  # the child's own value, from its mover's perspective
+        assert child.P == m._priors(child.actions, logits)  # and its own priors
+
+
+def test_a_duplicate_at_an_in_flight_terminal_leaf_closes_the_batch():
+    # One forced move straight into a terminal: every descent after the first in a batch
+    # lands on the same terminal leaf, which needs no evaluation but is in flight.
+    game = PassGame(
+        Scenario(start=0, to_play={0: 0}, edges={0: [(0, 1)]}, terminal={1: (1.0, -1.0)})
+    )
+    m = MCTS(game)
+    collided = []
+    descend = m._descend
+
+    def spy(**kwargs):
+        result = descend(**kwargs)
+        collided.append(result[2])
+        return result
+
+    m._descend = spy
+    root = m.run(4, root_state=0, batch_size=4)
+
+    assert collided == [False, True, False, True, False, True, False]
+    assert m.completed_simulations == 4
+    assert root.N == [3] and root.W == [3.0]
+    _assert_no_residue(root)
 
 
 def test_forced_duplicate_closes_the_batch_and_the_rejected_descent_costs_nothing():
@@ -435,17 +490,26 @@ def test_a_stale_in_flight_mark_fails_loudly_instead_of_spinning():
 
 def test_batched_search_draws_root_noise_once_per_root_incarnation():
     game = Connect4(4, 4, 3)
-    rng = random.Random(7)
-    m = MCTS(game, root_noise=(EPS, ALPHA_NUMERATOR, rng))
+    rng = random.Random(4)
+    rec = _Recorder()
+    m = rec.mcts = MCTS(game, evaluate_batch=rec, root_noise=(EPS, ALPHA_NUMERATOR, rng))
+    start = game.initial_state()
 
-    m.run(60, root_state=game.initial_state(), batch_size=8)
+    m.run(60, root_state=start, batch_size=8)
     mixed = list(m.root.P)
     n = len(mixed)
     assert mixed != [1.0 / n] * n
 
+    # The noise is already in the priors when the first batch that selects from the root
+    # descends. That batch sends one descent down each root edge: edge 0 first (no visits
+    # yet, so U = 0 everywhere), then the rest in order of decreasing *noised* prior.
+    by_noised_prior = [0, *sorted(range(1, n), key=lambda k: (-mixed[k], k))]
+    assert by_noised_prior != list(range(n))  # the clean priors would give index order
+    assert rec.calls[1] == [game.apply(start, m.root.actions[k]) for k in by_noised_prior]
+
     # Exactly one Dirichlet draw was consumed, however many batches ran, and a further
     # run on the same root never re-mixes.
-    replay = random.Random(7)
+    replay = random.Random(4)
     MCTS._dirichlet(n, ALPHA_NUMERATOR / n, replay)
     assert rng.getstate() == replay.getstate()
     m.run(60, batch_size=8)
