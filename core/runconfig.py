@@ -370,8 +370,10 @@ class SelfPlayConfig:
     """Self-play search scalars — the sub-shape M3's ``RunConfig`` also composes.
 
     Attributes:
-        sims: MCTS simulations per move (§12 M2.5 pins 64 for the micro run;
-            M3's fixed-128 baseline sets the same field).
+        sims: The always-full simulation budget, in both modes. With
+            ``playout_cap_randomization`` off it is the fixed per-move budget
+            (§12 M2.5 pins 64 for the micro run; M3's baseline 128). With it
+            on it is the budget of the always-full plies (D6: 512).
         k_temp: D10 temperature ply cutoff — sample ∝ raw N below it, argmax N
             at and after it.
         dirichlet_eps: D7 root-noise mixing weight ε.
@@ -386,6 +388,20 @@ class SelfPlayConfig:
             remaining simulation budget and closes it on the first collision,
             so any value ``>= 1`` is valid whatever ``sims`` is. A JSON config
             must state it explicitly; the default serves Python construction.
+        playout_cap_randomization: Whether the per-move budget is drawn at
+            the D6 schedule (§7, §12 M5) instead of fixed at ``sims``. Off by
+            default; the four ``pcr_*`` scalars below are inert while it is
+            off. Like ``leaf_batch_size``, a JSON config must state all five
+            keys explicitly.
+        pcr_mid_sims: The reduced full-search budget (D6: 256), searched with
+            probability ``pcr_mid_probability`` at plies at or past
+            ``pcr_full_plies``.
+        pcr_fast_sims: The fast-search budget (D6: 64), searched otherwise at
+            those plies.
+        pcr_mid_probability: Probability of the mid tier at a ply at or past
+            ``pcr_full_plies`` (D6: 0.25).
+        pcr_full_plies: Number of opening plies always searched at ``sims``
+            (D6: 2, i.e. plies 0-1).
     """
 
     sims: int
@@ -394,21 +410,51 @@ class SelfPlayConfig:
     dirichlet_alpha_numerator: float
     root_noise: bool
     leaf_batch_size: int = 1
+    playout_cap_randomization: bool = False
+    pcr_mid_sims: int = 256
+    pcr_fast_sims: int = 64
+    pcr_mid_probability: float = 0.25
+    pcr_full_plies: int = 2
 
     def __post_init__(self) -> None:
         """Validate the search scalars.
 
+        The ``pcr_*`` scalars are range-checked in both modes; their ordering
+        against ``sims`` is checked only when ``playout_cap_randomization`` is
+        on, since off they are unused and ``sims`` is a free fixed budget.
+        ``leaf_batch_size`` is deliberately not compared with any tier budget:
+        it is only an upper bound on a batch.
+
         Raises:
             ValueError: If ``sims`` is not positive, ``k_temp`` is negative,
                 ``dirichlet_eps`` is outside ``[0, 1]``,
-                ``dirichlet_alpha_numerator`` is not positive, or
-                ``leaf_batch_size`` is not positive.
+                ``dirichlet_alpha_numerator`` is not positive,
+                ``leaf_batch_size`` is not positive, ``pcr_mid_sims`` or
+                ``pcr_fast_sims`` is not positive, ``pcr_mid_probability`` is
+                outside ``(0, 1)``, ``pcr_full_plies`` is negative, or
+                playout-cap randomization is on without
+                ``sims > pcr_mid_sims > pcr_fast_sims``.
         """
         _positive(self.leaf_batch_size, "self_play.leaf_batch_size")
         _positive(self.sims, "self_play.sims")
         _non_negative(self.k_temp, "self_play.k_temp")
         _unit_interval(self.dirichlet_eps, "self_play.dirichlet_eps")
         _positive(self.dirichlet_alpha_numerator, "self_play.dirichlet_alpha_numerator")
+        _positive(self.pcr_mid_sims, "self_play.pcr_mid_sims")
+        _positive(self.pcr_fast_sims, "self_play.pcr_fast_sims")
+        if not 0.0 < self.pcr_mid_probability < 1.0:
+            raise ValueError(
+                f"self_play.pcr_mid_probability must be in (0, 1), got {self.pcr_mid_probability}"
+            )
+        _non_negative(self.pcr_full_plies, "self_play.pcr_full_plies")
+        if self.playout_cap_randomization and not (
+            self.sims > self.pcr_mid_sims > self.pcr_fast_sims
+        ):
+            raise ValueError(
+                "self_play: playout-cap randomization needs sims > pcr_mid_sims > pcr_fast_sims, "
+                f"got sims={self.sims}, pcr_mid_sims={self.pcr_mid_sims}, "
+                f"pcr_fast_sims={self.pcr_fast_sims}"
+            )
 
 
 @dataclass(frozen=True)
@@ -801,6 +847,11 @@ def _self_play_from_dict(raw: Mapping[str, Any]) -> SelfPlayConfig:
             "dirichlet_alpha_numerator",
             "root_noise",
             "leaf_batch_size",
+            "playout_cap_randomization",
+            "pcr_mid_sims",
+            "pcr_fast_sims",
+            "pcr_mid_probability",
+            "pcr_full_plies",
         ),
         where,
     )
@@ -811,6 +862,11 @@ def _self_play_from_dict(raw: Mapping[str, Any]) -> SelfPlayConfig:
         dirichlet_alpha_numerator=_float(raw, "dirichlet_alpha_numerator", where),
         root_noise=_bool(raw, "root_noise", where),
         leaf_batch_size=_int(raw, "leaf_batch_size", where),
+        playout_cap_randomization=_bool(raw, "playout_cap_randomization", where),
+        pcr_mid_sims=_int(raw, "pcr_mid_sims", where),
+        pcr_fast_sims=_int(raw, "pcr_fast_sims", where),
+        pcr_mid_probability=_float(raw, "pcr_mid_probability", where),
+        pcr_full_plies=_int(raw, "pcr_full_plies", where),
     )
 
 

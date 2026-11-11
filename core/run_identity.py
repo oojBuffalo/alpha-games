@@ -118,6 +118,16 @@ FIELD_CLASSIFICATION: dict[str, str] = {
     # the batch size changes which leaves are searched -- hence the visit
     # counts, the moves played, and the data distribution.
     "self_play.leaf_batch_size": MATERIAL,
+    # Playout-cap randomization (D6) sets how many simulations each ply is
+    # searched with, so the flag and every schedule scalar change the visit
+    # counts, the moves played, and the data distribution. The scalars are
+    # material even while the flag is off: they are part of the recorded
+    # protocol, and erring material only costs a resume refusal.
+    "self_play.playout_cap_randomization": MATERIAL,
+    "self_play.pcr_mid_sims": MATERIAL,
+    "self_play.pcr_fast_sims": MATERIAL,
+    "self_play.pcr_mid_probability": MATERIAL,
+    "self_play.pcr_full_plies": MATERIAL,
     # --- training (D5/§6.2 pinned scalars) ---
     "training.games": MATERIAL,
     "training.learner_steps": MATERIAL,
@@ -249,7 +259,9 @@ def _flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
 #:
 #: * **1** -- the M3 shape.
 #: * **2** -- adds ``self_play.leaf_batch_size`` (§12 M5).
-LAUNCH_SCHEMA_VERSION = 2
+#: * **3** -- adds ``self_play.playout_cap_randomization`` and the four
+#:   ``self_play.pcr_*`` schedule scalars (D6, §12 M5).
+LAUNCH_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -804,11 +816,56 @@ def _migrate_v1_to_v2(document: Mapping[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+#: What a schema-v2 document migrates to: playout-cap randomization off, with
+#: the D6 schedule scalars as inert defaults.
+_V3_PCR_OFF_DEFAULTS = {
+    "playout_cap_randomization": False,
+    "pcr_mid_sims": 256,
+    "pcr_fast_sims": 64,
+    "pcr_mid_probability": 0.25,
+    "pcr_full_plies": 2,
+}
+
+
+def _migrate_v2_to_v3(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate a schema-v2 stored config to v3: fill playout-cap randomization off.
+
+    Every v2 run searched each ply at the fixed ``self_play.sims`` -- the
+    self-play loop had no per-move budget draw -- so "off" is what the run
+    actually ran with, and ``sims`` is carried through unchanged. The four
+    schedule scalars are inert while the flag is off.
+
+    Args:
+        document: A v2 document, as stored or as migrated from v1; not mutated.
+
+    Returns:
+        The v3-shaped copy.
+
+    Raises:
+        ValueError: If the document already carries any of the keys this step
+            fills -- keys no schema before 3 had, so their values cannot be
+            what the run ran with and are not silently replaced.
+    """
+    migrated = dict(document)
+    self_play = migrated.get("self_play")
+    if isinstance(self_play, Mapping):  # anything else is from_dict's error to raise
+        present = sorted(set(_V3_PCR_OFF_DEFAULTS) & set(self_play))
+        if present:
+            raise ValueError(
+                f"stored config: a document older than schema 3 carries self_play keys "
+                f"{present}, which no schema before 3 has"
+            )
+        migrated["self_play"] = {**self_play, **_V3_PCR_OFF_DEFAULTS}
+    migrated["schema_version"] = 3
+    return migrated
+
+
 #: One step per superseded schema version: ``version -> (document at that
 #: version -> document at version + 1)``. A later schema bump appends its own
 #: step here and nowhere else; :func:`read_stored_config_document` chains them.
 _STORED_CONFIG_MIGRATIONS = {
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 

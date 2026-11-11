@@ -31,6 +31,14 @@ name and aggregation rule below is frozen, not an implementation detail.
   count is non-zero, so an absent one reads as zero. The buckets sum to
   ``inference_batches``; mean batch fill is ``positions_evaluated /
   inference_batches`` exactly, and the buckets bound any percentile of it.
+  The *per-tier move* series (§12 M5) are actor-owned deltas of the same
+  standing -- flushed at the game boundary, not required of an M3 run:
+  :data:`SERIES_MOVES_FULL_512`, :data:`SERIES_MOVES_MID_256` and
+  :data:`SERIES_MOVES_FAST_64` count the plies a game searched at each D6
+  playout-cap tier. They are written only by an actor running playout-cap
+  randomization, and each only when its count is non-zero, so an absent one
+  reads as zero; over such a run they sum to the plies played, and
+  ``sims_run`` is ``512 * full + 256 * mid + 64 * fast`` exactly.
 * ``"gauge"`` -- a latest-value observation, never summed: loss components,
   the D5 replay ratio (learner-owned). Only the most recent record in run
   time order matters. :data:`SERIES_ACTOR_AMP_ACTIVE` is the one actor-owned
@@ -109,6 +117,13 @@ _INFERENCE_BATCH_SIZE_SERIES = (
     "inference_batch_size_32_63",
     "inference_batch_size_64_plus",
 )
+
+# Per-tier move accounting (module docstring): plies searched at each D6
+# playout-cap tier. The budgets are in the names because an actor runs
+# playout-cap randomization only at the D6 pins (``core.actor``).
+SERIES_MOVES_FULL_512 = "moves_full_512"
+SERIES_MOVES_MID_256 = "moves_mid_256"
+SERIES_MOVES_FAST_64 = "moves_fast_64"
 
 RATE_GAMES_PER_HOUR = "games_per_hour"
 RATE_SIMS_PER_SEC = "sims_per_sec"

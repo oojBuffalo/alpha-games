@@ -6,13 +6,18 @@
   "game_config": "MICRO_CONFIG",
 
   "self_play": {
-    "_doc": "The shared core.selfplay.SelfPlayConfig sub-shape. M3's RunConfig composes this same object; the sim count stays a config field (M3's fixed-128 assertion lives in its actor layer, not here). leaf_batch_size stays 1: batch-1 leaf inference is M2.5's recorded configuration (section 12 M2.5).",
+    "_doc": "The shared core.selfplay.SelfPlayConfig sub-shape. M3's RunConfig composes this same object; the sim count stays a config field (M3's fixed-128 assertion lives in its actor layer, not here). leaf_batch_size stays 1: batch-1 leaf inference is M2.5's recorded configuration (section 12 M2.5). playout_cap_randomization stays false (section 12 M2.5: fixed 64 sims, no PCR), so the four pcr_* scalars are inert.",
     "sims": 64,
     "k_temp": 4,
     "dirichlet_eps": 0.25,
     "dirichlet_alpha_numerator": 10.8,
     "root_noise": true,
-    "leaf_batch_size": 1
+    "leaf_batch_size": 1,
+    "playout_cap_randomization": false,
+    "pcr_mid_sims": 256,
+    "pcr_fast_sims": 64,
+    "pcr_mid_probability": 0.25,
+    "pcr_full_plies": 2
   },
 
   "training": {

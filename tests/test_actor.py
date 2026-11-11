@@ -17,11 +17,12 @@ count, rather than working around it.
 from __future__ import annotations
 
 import dataclasses
-from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from core.acceptance import _REQUIRED_POSITIVE_SERIES
 from core.actor import (
     VALIDATE_TIER_SIMS,
     ActorDriver,
@@ -29,17 +30,26 @@ from core.actor import (
 )
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.observability import (
+    SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
+    SERIES_MOVES_FAST_64,
+    SERIES_MOVES_FULL_512,
+    SERIES_MOVES_MID_256,
     SERIES_POSITIONS_EVALUATED,
+    SERIES_SIMS_RUN,
     InferenceBatchCounter,
     PositionCounter,
     count_positions,
 )
 from core.replay_shard import read_shard, shard_filename
+from core.run_identity import load_launch_config
 from core.runconfig import load_run_config
+from core.seeding import GameRNGs
+from core.selfplay import play_game
 from games.tictactoe import TicTacToe
 
 TTT = TicTacToe()
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def self_play_cfg(**overrides):
@@ -76,6 +86,7 @@ def make_driver(
     run_seed=1,
     sims=VALIDATE_TIER_SIMS,
     leaf_batch_size=1,
+    self_play=None,
     **kwargs,
 ):
     """Build an :class:`~core.actor.ActorDriver` over TTT with sensible defaults.
@@ -88,6 +99,8 @@ def make_driver(
         run_seed: The run's root seed.
         sims: Self-play sim count (default: the D6 validate tier).
         leaf_batch_size: Maximum leaves per evaluation (default: serial).
+        self_play: A complete self-play config to use instead of the one
+            built from ``sims`` / ``leaf_batch_size``.
         **kwargs: Forwarded to :class:`~core.actor.ActorDriver` (``refresh``,
             ``pacing``, ``wait``, ``max_games``, ``should_stop``).
 
@@ -97,7 +110,7 @@ def make_driver(
     kwargs.setdefault("refresh", refresh_sequence([1] * 10))
     return ActorDriver(
         game=TTT,
-        self_play=self_play_cfg(sims=sims, leaf_batch_size=leaf_batch_size),
+        self_play=self_play or self_play_cfg(sims=sims, leaf_batch_size=leaf_batch_size),
         run_id=run_id,
         actor_id=actor_id,
         out_dir=tmp_path,
@@ -109,40 +122,83 @@ def make_driver(
 # --- D6 config validation ---------------------------------------------------
 
 
-def test_validate_accepts_exactly_128_sims():
+def d6_cfg(**overrides):
+    """Build the D6 playout-cap-randomization shape an actor accepts.
+
+    Args:
+        **overrides: Fields to replace, e.g. one schedule scalar moved off its
+            pin to build a hybrid.
+
+    Returns:
+        ``sims`` 512 with PCR on over the config's D6 scalar defaults (mid
+        256, fast 64, probability 0.25, always-full boundary 2), then
+        ``overrides`` applied.
+    """
+    return self_play_cfg(**{"sims": 512, "playout_cap_randomization": True, **overrides})
+
+
+def test_validate_accepts_the_validate_tier():
     validate_actor_self_play_config(self_play_cfg(sims=128))
+    # The schedule scalars are inert with the flag off, so they are not checked.
+    validate_actor_self_play_config(self_play_cfg(sims=128, pcr_mid_sims=200, pcr_full_plies=5))
+    # ...which is the shape the checked-in full-game launch config is.
+    shipped = load_launch_config(ROOT / "configs" / "blokus_duo.json").run.self_play
+    assert (shipped.sims, shipped.playout_cap_randomization) == (128, False)
+    validate_actor_self_play_config(shipped)
+
+
+def test_validate_accepts_the_d6_schedule():
+    cfg = d6_cfg()
+    assert (cfg.sims, cfg.pcr_mid_sims, cfg.pcr_fast_sims) == (512, 256, 64)
+    assert (cfg.pcr_mid_probability, cfg.pcr_full_plies) == (0.25, 2)
+    validate_actor_self_play_config(cfg)
+
+
+@pytest.mark.parametrize("leaf_batch_size", [1, 8, 256])
+def test_validate_leaves_the_leaf_batch_size_free_in_both_shapes(leaf_batch_size):
+    validate_actor_self_play_config(self_play_cfg(sims=128, leaf_batch_size=leaf_batch_size))
+    validate_actor_self_play_config(d6_cfg(leaf_batch_size=leaf_batch_size))
 
 
 @pytest.mark.parametrize("bad_sims", [1, 64, 127, 129, 256, 512])
-def test_validate_rejects_any_other_sim_count(bad_sims):
+def test_validate_rejects_any_other_fixed_sim_count(bad_sims):
+    """PCR off, only the validate tier's 128 is an actor shape."""
     with pytest.raises(ValueError, match="128"):
         validate_actor_self_play_config(self_play_cfg(sims=bad_sims))
 
 
-def test_validate_rejects_playout_cap_randomization_when_present_and_true():
-    """Forward-compat: a future SelfPlayConfig.playout_cap_randomization field."""
-    stub = SimpleNamespace(sims=128, playout_cap_randomization=True)
-    with pytest.raises(ValueError, match="playout-cap"):
-        validate_actor_self_play_config(stub)
-
-
-def test_validate_accepts_playout_cap_randomization_when_present_and_false():
-    stub = SimpleNamespace(sims=128, playout_cap_randomization=False)
-    validate_actor_self_play_config(stub)
-
-
-def test_validate_accepts_its_absence_today():
-    """SelfPlayConfig carries no PCR field yet (D8/M5) -- absence must pass."""
-    cfg = self_play_cfg(sims=128)
-    assert not hasattr(cfg, "playout_cap_randomization")
-    validate_actor_self_play_config(cfg)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sims": 513},
+        {"sims": 1024},
+        {"pcr_mid_sims": 255},
+        {"pcr_mid_sims": 128},
+        {"pcr_fast_sims": 65},
+        {"pcr_fast_sims": 32},
+        {"pcr_mid_probability": 0.3},
+        {"pcr_mid_probability": 0.75},
+        {"pcr_full_plies": 0},
+        {"pcr_full_plies": 1},
+        {"pcr_full_plies": 3},
+        # The validate tier's budget with PCR switched on over a smaller schedule.
+        {"sims": 128, "pcr_mid_sims": 64, "pcr_fast_sims": 32},
+    ],
+)
+def test_validate_rejects_a_pcr_schedule_off_the_d6_pins(overrides):
+    """Every one of these is a valid ``SelfPlayConfig``; none is a pinned actor shape."""
+    with pytest.raises(ValueError, match="128.*512"):
+        validate_actor_self_play_config(d6_cfg(**overrides))
 
 
 def test_actor_driver_construction_enforces_the_same_gate(tmp_path):
     with pytest.raises(ValueError, match="128"):
         make_driver(tmp_path, sims=64)
+    with pytest.raises(ValueError, match="512"):
+        make_driver(tmp_path, self_play=d6_cfg(pcr_full_plies=3))
     driver = make_driver(tmp_path, sims=128)
     assert driver.writer.state.next_game_index == 0
+    assert make_driver(tmp_path / "d6", self_play=d6_cfg()).self_play.playout_cap_randomization
 
 
 def test_actor_driver_rejects_a_non_positive_max_games(tmp_path):
@@ -619,3 +675,65 @@ def test_no_batch_counter_means_no_inference_batch_series(tmp_path):
         metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
     ).run()
     assert not any(series.startswith("inference_batch") for series, _ in _series_values(tmp_path))
+
+
+# --- playout-cap randomization: real sims and the per-tier move series --------
+
+TIER_SERIES = {
+    "full": SERIES_MOVES_FULL_512,
+    "mid": SERIES_MOVES_MID_256,
+    "fast": SERIES_MOVES_FAST_64,
+}
+
+
+def test_a_d6_actor_flushes_the_real_sims_and_its_tier_mix(tmp_path):
+    """``sims_run`` is the sum of the drawn budgets, never ``plies * sims``."""
+    games = 6
+    make_driver(
+        tmp_path / "shards",
+        run_seed=11,
+        actor_id=2,
+        self_play=d6_cfg(),
+        max_games=games,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-2"),
+    ).run()
+
+    # The same games, replayed from their durable coordinates.
+    replayed = [
+        play_game(TTT, None, d6_cfg(), GameRNGs.for_actor_game(11, 2, index))
+        for index in range(games)
+    ]
+    assert {name for r in replayed for name, _ in r.tier_counts} == set(TIER_SERIES)
+
+    flushed = _series_values(tmp_path, "actor-2")
+    assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1] * games
+    assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [r.sims_run for r in replayed]
+    assert any(r.sims_run != r.plies * 512 for r in replayed)
+    for tier, series in TIER_SERIES.items():
+        # Written per game, only when that game played the tier.
+        expected = [count for r in replayed for name, count in r.tier_counts if name == tier]
+        assert [v for s, v in flushed if s == series] == expected
+
+    total = lambda series: sum(v for s, v in flushed if s == series)  # noqa: E731
+    assert sum(total(series) for series in TIER_SERIES.values()) == sum(r.plies for r in replayed)
+    assert total(SERIES_SIMS_RUN) == (
+        512 * total(SERIES_MOVES_FULL_512)
+        + 256 * total(SERIES_MOVES_MID_256)
+        + 64 * total(SERIES_MOVES_FAST_64)
+    )
+
+
+def test_a_validate_tier_actor_writes_no_tier_series(tmp_path):
+    """PCR off, the flush is exactly what it was: ``plies * 128`` and no tier mix."""
+    paths = make_driver(
+        tmp_path / "shards",
+        max_games=2,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+    plies = [len(read_shard(path, TTT).records) for path in paths]
+
+    flushed = _series_values(tmp_path)
+    assert {series for series, _ in flushed} == {SERIES_GAMES_COMPLETED, SERIES_SIMS_RUN}
+    # ...so the acceptance checklist of such a run must never require them.
+    assert not set(TIER_SERIES.values()) & set(_REQUIRED_POSITIVE_SERIES)
+    assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [p * 128 for p in plies]

@@ -522,6 +522,43 @@ def test_run_spike_evaluates_leaves_under_the_runs_amp_setting():
     assert off.amp is False  # ...and a disabled mode really is a no-op
 
 
+def test_run_spike_sums_each_measured_games_own_simulations(monkeypatch):
+    """Under playout-cap randomization ``plies * sims`` is not the count searched.
+
+    One warm-up game and two measured ones: the total is the measured games'
+    drawn budgets, summed -- not the last game's, and not the warm-up's too.
+    """
+    import dataclasses
+
+    from core.runconfig import MICRO_RUN_CONFIG_PATH, load_run_config
+    from core.seeding import GameRNGs
+    from core.selfplay import draw_tier
+
+    base = load_run_config(MICRO_RUN_CONFIG_PATH)
+    self_play = dataclasses.replace(
+        base.self_play, playout_cap_randomization=True, sims=12, pcr_mid_sims=6, pcr_fast_sims=2
+    )
+    cfg = dataclasses.replace(base, self_play=self_play)
+    played = []
+    play_game = BENCH.play_game
+    monkeypatch.setattr(
+        BENCH, "play_game", lambda *a, **kw: played.append(play_game(*a, **kw)) or played[-1]
+    )
+    cpu = torch.device("cpu")
+    spike = BENCH.run_spike(
+        cfg, BENCH.build_game(cfg), cpu, 1, 2, BENCH.AmpMode("cpu", False), verbose=False
+    )
+
+    def drawn(index: int) -> int:
+        """Sum game ``index``'s budgets, redrawn from its own tier stream."""
+        tier_rng = GameRNGs.for_game(cfg.run_seed, index).pcr_tier
+        plies = range(played[index].plies)
+        return sum(draw_tier(self_play, ply, tier_rng).sims for ply in plies)
+
+    assert len(played) == 3 and spike.plies == played[1].plies + played[2].plies
+    assert spike.sims == drawn(1) + drawn(2) != spike.plies * self_play.sims
+
+
 # --- main's assembly: metadata provenance and persisted evidence ----------------
 
 

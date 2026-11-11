@@ -165,7 +165,8 @@ class SpikeResult:
     Attributes:
         games: Games completed in the measurement interval.
         plies: Plies played across those games.
-        sims: Simulations run across those games (``plies * sims_per_move``).
+        sims: Simulations run across those games: the sum of each measured
+            game's ``GameResult.sims_run``.
         net_evals: Leaf network evaluations counted by the wrapping evaluator.
         learner_steps: Learner steps taken inside the interval.
         legal_at_eval: Legal-set sizes seen at evaluated leaves, summed.
@@ -338,7 +339,9 @@ class RunMeta:
             hash — Invariant 4).
         warmup_games: Games discarded before measurement.
         measure_games: Games in the measurement interval.
-        sims: Micro sims/move during the spike.
+        sims: ``self_play.sims``, which the report prints as sims/move. That is
+            the per-move count only with playout-cap randomization off (the
+            checked-in micro config); with it on, it is the always-full budget.
         date: Run date, ``YYYY-MM-DD``.
     """
 
@@ -706,7 +709,7 @@ def run_spike(
         device=str(device),
     )
 
-    plies = net_evals = legal = amp_evals = measured_steps = 0
+    plies = sims = net_evals = legal = amp_evals = measured_steps = 0
     self_play_seconds = train_seconds = 0.0
     started = 0.0
     # The learner-step index is monotonic across warm-up and measurement — it
@@ -717,7 +720,7 @@ def run_spike(
         measuring = index >= warmup_games
         if index == warmup_games:
             # Discard everything the warm-up accumulated, then start the clock.
-            plies = net_evals = legal = amp_evals = measured_steps = 0
+            plies = sims = net_evals = legal = amp_evals = measured_steps = 0
             self_play_seconds = train_seconds = 0.0
             started = time.perf_counter()
 
@@ -755,6 +758,7 @@ def run_spike(
 
         if measuring:
             plies += result.plies
+            sims += result.sims_run
             net_evals += counters[0]
             legal += counters[1]
             amp_evals += counters[2]
@@ -773,7 +777,7 @@ def run_spike(
     return SpikeResult(
         games=measure_games,
         plies=plies,
-        sims=plies * cfg.self_play.sims,
+        sims=sims,
         net_evals=net_evals,
         learner_steps=measured_steps,
         legal_at_eval=legal,
