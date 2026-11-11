@@ -314,6 +314,7 @@ class InferenceBatchCounter:
     """
 
     def __init__(self) -> None:
+        """Start with no forward passes recorded."""
         self._batches = 0
         self._by_series: dict[str, int] = {}
 

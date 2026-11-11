@@ -412,6 +412,20 @@ def make_batched_network_evaluator(net: Network, game: Game, device: str = "cpu"
     def evaluate_batch(
         game: Game, states: Sequence[State]
     ) -> list[tuple[float, dict[Action, float]]]:
+        """Evaluate one leaf batch with a single forward.
+
+        Args:
+            game: The adapter the search is running; supplies each state's
+                legal ids and must declare the validated encoding surface.
+            states: The batch's leaf states. Need not be distinct.
+
+        Returns:
+            One ``(value, {action_id: raw_logit})`` per state, in input order.
+
+        Raises:
+            ValueError: If ``game`` declares a different encoding surface from
+                the adapter this evaluator was built for.
+        """
         _reject_cross_wiring(adapter, surface, game)
         if not states:
             return []
