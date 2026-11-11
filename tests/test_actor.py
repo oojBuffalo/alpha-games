@@ -856,3 +856,33 @@ def test_a_d6_actor_flushes_the_transitions_its_dropped_plies_would_hide(tmp_pat
         assert len(stored) < len(movers)
         stored_pairs.append(sum(a == b for a, b in zip(stored, stored[1:], strict=False)))
     assert stored_pairs != [3] * games
+
+
+# --- flush order: the shard is published before the game is counted -----------
+
+
+def test_a_game_whose_shard_is_not_published_is_counted_by_no_series(tmp_path):
+    """Shard first, metrics second: the counters never run ahead of the shards."""
+    driver = make_driver(
+        tmp_path / "shards",
+        max_games=2,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    )
+    publish = driver.writer.write_shard
+    calls = []
+
+    def publish_the_first_game_only(games):
+        calls.append(len(games))
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return publish(games)
+
+    driver.writer.write_shard = publish_the_first_game_only
+    with pytest.raises(OSError, match="disk full"):
+        driver.run()
+
+    flushed = _series_values(tmp_path)
+    assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1]  # the published game
+    (shard,) = sorted((tmp_path / "shards").glob("shard-*.npz"))
+    stored = [v for s, v in flushed if s == SERIES_POSITIONS_STORED]
+    assert stored == [len(read_shard(shard, TTT).records)]
