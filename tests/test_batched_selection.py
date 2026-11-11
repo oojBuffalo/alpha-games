@@ -41,6 +41,7 @@ from tests.fixtures.pass_game import (
     consecutive_trap_game,
     consecutive_win_game,
 )
+from tests.reference.minimax import optimal_values, reachable_states, subtree_size
 from tests.test_batched_mcts_api import _all_nodes
 
 BATCH_SIZES = [1, 2, 3, 5, 8]
@@ -653,3 +654,73 @@ def test_batch_size_one_is_bit_identical_to_an_independent_serial_search(game_na
             m.run(100, **run_kwargs)
             _serial_search(game, reference, 100, evaluate)
             assert _stats(m.root) == _stats(reference)
+
+
+# --- the MCTS-vs-minimax oracle, re-run through batched selection ----------------------
+
+SOLVED = {
+    "ttt": (TicTacToe, 100),
+    "connect3": (lambda: Connect4(3, 3, 3), 30),
+}
+
+
+def _assert_plays_optimally_on_endgames(game, plies: int, sims_for, batch_size: int) -> int:
+    """Assert batched MCTS keeps the mover's optimal value at every late position.
+
+    Args:
+        game: A solved game whose state is ``(board, to_play)`` with ``-1`` for empty.
+        plies: Check every reachable nonterminal position with at most this many empty cells.
+        sims_for: Maps a position's subtree size to its simulation budget.
+        batch_size: The batch size of every search.
+
+    Returns:
+        The number of positions checked.
+    """
+    values: dict = {}
+    sizes: dict = {}
+    tested = 0
+    for state in reachable_states(game):
+        if game.is_terminal(state) or state[0].count(-1) > plies:
+            continue
+        m = MCTS(game)
+        m.run(sims_for(subtree_size(game, state, sizes)), root_state=state, batch_size=batch_size)
+        mover = game.current_player(state)
+        target = optimal_values(game, state, values)[mover]
+        achieved = optimal_values(game, game.apply(state, m.best_action()), values)[mover]
+        assert achieved >= target - 1e-9, (
+            f"batch_size={batch_size} blundered on {state}: chose {m.best_action()} "
+            f"(value {achieved}) < optimal {target}"
+        )
+        tested += 1
+    return tested
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("solved", sorted(SOLVED))
+def test_batched_mcts_plays_optimally_on_solved_endgames(solved, batch_size):
+    make_game, at_least = SOLVED[solved]
+    tested = _assert_plays_optimally_on_endgames(
+        make_game(), 3, lambda size: min(2000, max(240, 30 * size)), batch_size
+    )
+    assert tested > at_least
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_batched_mcts_plays_optimally_on_ttt_deep(batch_size):
+    _assert_plays_optimally_on_endgames(
+        TicTacToe(), 5, lambda size: min(3000, max(300, 16 * size)), batch_size
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize(
+    ("moves", "sims", "best"),
+    [([0, 1, 0, 1, 0, 1], 1500, 0), ([0, 1, 2, 1, 0, 1], 2000, 1)],
+    ids=["takes-the-win", "blocks-the-loss"],
+)
+def test_batched_mcts_finds_the_connect4_tactic(moves, sims, best, batch_size):
+    game = Connect4()
+    m = MCTS(game)
+    m.run(sims, root_state=game.from_moves(moves), batch_size=batch_size)
+    assert m.best_action() == best
