@@ -1361,6 +1361,9 @@ class _PairWorkerPool:
     each worker's checkpoint cache stays warm across polls. Every message is
     read through :meth:`next_pair`, which raises :class:`EvalWorkerError` on a
     reported failure or on a worker that exited without one.
+
+    A failure or interrupt while spawning or waiting for the workers closes
+    the pool (terminating the workers already started) before it propagates.
     """
 
     def __init__(
@@ -1374,10 +1377,28 @@ class _PairWorkerPool:
         eval_seed: int,
         torch_threads: int | None,
     ) -> None:
+        """Spawn the workers and wait until each reports ready.
+
+        Args:
+            workers: Number of worker processes.
+            setup: Rebuilds ``(game, profile)`` in each worker.
+            ckpt_dir: The watched run's checkpoint directory.
+            device: Torch device for inference.
+            eval_sims: The rung-6/7 (and rung-8) search budget *S*.
+            eval_seed: The harness's root seed (:func:`cell_seed`).
+            torch_threads: Intra-op threads per worker, or ``None`` for torch's
+                default.
+
+        Raises:
+            EvalWorkerError: If a worker fails during setup or the workers
+                report different thread counts.
+            OSError: If a worker process cannot be started (already-started
+                workers are terminated first).
+        """
         context = multiprocessing.get_context("spawn")
         self._tasks = context.Queue()
         self._results = context.Queue()
-        self._processes = [
+        unstarted = [
             context.Process(
                 target=_pair_worker_main,
                 args=(
@@ -1396,9 +1417,12 @@ class _PairWorkerPool:
             )
             for index in range(workers)
         ]
-        for process in self._processes:
-            process.start()
+        #: Only processes whose ``start()`` returned; ``close`` joins just these.
+        self._processes: list[Any] = []
         try:
+            for process in unstarted:
+                process.start()
+                self._processes.append(process)
             reported = {self._next("ready")[1] for _ in self._processes}
             if len(reported) != 1:
                 raise EvalWorkerError(
@@ -1478,6 +1502,14 @@ class _CellAppender:
     """
 
     def __init__(self, run_dir: Path, cell_id: str, start: int, stop: int) -> None:
+        """Bind the appender to one cell file.
+
+        Args:
+            run_dir: The watched run directory.
+            cell_id: The cell's finished id string.
+            start: The first pair index still missing from the cell file.
+            stop: One past the last pair index to play.
+        """
         self.cell_id = cell_id
         self.next_index = start
         self.stop = stop
@@ -1596,6 +1628,17 @@ def _execution_pool(
     ``workers == 1`` yields no pool: the caller plays in-process under
     ``execution.torch_threads``. Otherwise a :class:`_PairWorkerPool` is
     started, closed normally on success and aborted on any exception.
+
+    Args:
+        execution: The worker and torch-thread settings for this call.
+        worker_setup: Picklable rebuild of ``(game, profile)`` for workers;
+            required when ``execution.workers > 1``.
+        ckpt_dir: The watched run's checkpoint directory.
+        config: The harness config (device, search budget, seed).
+
+    Yields:
+        ``(pool, torch_threads)``: the pool (``None`` when in-process) and the
+        intra-op thread count in effect.
 
     Raises:
         ValueError: If ``workers > 1`` and no picklable ``worker_setup`` was
