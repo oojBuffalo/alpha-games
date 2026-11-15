@@ -2459,6 +2459,61 @@ def test_cell_appender_appends_strictly_in_pair_order(tmp_path, monkeypatch):
             appender.add(_pair_record(bad))
 
 
+def test_pair_worker_pool_cleans_up_when_a_later_worker_fails_to_start(monkeypatch):
+    events: list[str] = []
+
+    class FakeQueue:
+        def cancel_join_thread(self):
+            events.append("cancel")
+
+        def close(self):
+            events.append("queue-close")
+
+    class FakeProcess:
+        count = 0
+
+        def __init__(self, *, name, **_):
+            self.name = name
+            self.started = False
+            self.exitcode = None
+
+        def start(self):
+            FakeProcess.count += 1
+            if FakeProcess.count == 2:
+                raise OSError("cannot fork")
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+        def terminate(self):
+            events.append(f"terminate {self.name}")
+
+        def join(self, timeout=None):
+            assert self.started, "joined a process that never started"
+            events.append(f"join {self.name}")
+
+    class FakeContext:
+        Queue = FakeQueue
+        Process = FakeProcess
+
+    monkeypatch.setattr(eval_run.multiprocessing, "get_context", lambda _: FakeContext())
+    with pytest.raises(OSError, match="cannot fork"):
+        eval_run._PairWorkerPool(
+            2,
+            _fast_worker_setup,
+            ckpt_dir=Path("ckpt"),
+            device="cpu",
+            eval_sims=1,
+            eval_seed=0,
+            torch_threads=1,
+        )
+    assert "terminate eval-pair-worker-0" in events
+    assert "join eval-pair-worker-0" in events
+    assert events.count("queue-close") == 2
+    assert not any("worker-1" in event for event in events)
+
+
 def test_serial_launch_records_its_execution_and_restores_torch_threads(tmp_path):
     run_dir = tmp_path / "run"
     _build_watched_run(run_dir, k_total=1)
@@ -2476,11 +2531,19 @@ def test_serial_launch_records_its_execution_and_restores_torch_threads(tmp_path
     assert torch.get_num_threads() == before
 
 
-def test_bench_candidate_with_workers_plays_the_same_sample(tmp_path):
+def test_bench_candidate_with_workers_plays_the_same_sample(tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
     _build_watched_run(run_dir, k_total=2)
     config = _eval_config(run_dir, pairs_per_cell=3)
     serial = bench_candidate(run_dir, config, FAST_PROFILE, GAME, n_pairs=2)
+    submitted: list[tuple[str, int]] = []
+    real_submit = eval_run._PairWorkerPool.submit
+
+    def recording_submit(self, cell_id, version, pair_index):
+        submitted.append((cell_id, pair_index))
+        real_submit(self, cell_id, version, pair_index)
+
+    monkeypatch.setattr(eval_run._PairWorkerPool, "submit", recording_submit)
     parallel = bench_candidate(
         run_dir,
         config,
@@ -2490,6 +2553,11 @@ def test_bench_candidate_with_workers_plays_the_same_sample(tmp_path):
         execution=_TWO_WORKERS,
         worker_setup=_fast_worker_setup,
     )
+    by_cell: dict[str, list[int]] = {}
+    for cell_id, pair_index in submitted:
+        by_cell.setdefault(cell_id, []).append(pair_index)
+    assert len(by_cell) == serial.cells_benched
+    assert all(sorted(indices) == [0, 1] for indices in by_cell.values())
     assert (parallel.workers, parallel.torch_threads) == (2, 1)
     assert serial.workers == 1
     assert parallel.games_played == serial.games_played == serial.cells_benched * 2 * 2
