@@ -246,10 +246,11 @@ class EvalConfig:
             evaluation evidence is never coupled to how training happened to
             be seeded. Every per-cell seed derives from this one value
             (:func:`cell_seed`).
-        device: Torch device string for eval inference. ``"cpu"`` in
-            production (the concurrent harness must not starve the learner's
-            GPU use -- M5 owns batched inference); ``"cuda"`` is allowed for
-            an offline re-scoring pass.
+        device: Torch device string for eval inference. ``"cuda"`` in
+            production (design doc §9 "Harness execution": the serial CPU
+            harness measured ~20x short of the publish cadence), gated by
+            pin 11's A/B on the GPU it shares with the learner; ``"cpu"``
+            remains valid (tests, and the fallback should that A/B breach).
         bootstrap_b: The task-7 bootstrap replicate count *B*. Must be
             admissible under the pinned order-statistic rank rule
             (``B % 40 == 39`` -- see ``core.eval_stats._validate_admissible_B``).
