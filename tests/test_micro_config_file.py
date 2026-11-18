@@ -69,6 +69,9 @@ EXPECTED: dict[str, Any] = {
         "dirichlet_eps": 0.25,
         "dirichlet_alpha_numerator": 10.8,
         "root_noise": True,
+        # "batch-1 leaf inference (the known M2.5/M3 configuration — recorded
+        # explicitly as the M5 lever, not optimized here)".
+        "leaf_batch_size": 1,
     },
     # "2,000 self-play games; batch 32; replay window 3,000 samples; pacing 1
     # learner step per completed game → 2,000 learner steps; base LR 0.02 with
@@ -211,6 +214,7 @@ def test_loader_parses_the_pinned_file():
         dirichlet_eps=0.25,
         dirichlet_alpha_numerator=10.8,
         root_noise=True,
+        leaf_batch_size=1,
     )
 
     assert cfg.training.games == 2000
@@ -515,6 +519,11 @@ def test_out_of_range_values_are_rejected():
         RunConfig.from_dict(raw)
 
     raw = _mutated()
+    raw["self_play"]["leaf_batch_size"] = 0
+    with pytest.raises(ValueError, match="self_play.leaf_batch_size must be > 0"):
+        RunConfig.from_dict(raw)
+
+    raw = _mutated()
     raw["self_play"]["dirichlet_eps"] = 1.5
     with pytest.raises(ValueError, match=r"dirichlet_eps must be in \[0, 1\]"):
         RunConfig.from_dict(raw)
@@ -572,3 +581,26 @@ def test_missing_file_fails_loudly(tmp_path: Path):
     """
     with pytest.raises(FileNotFoundError):
         load_run_config(tmp_path / "nope.json")
+
+
+def test_leaf_batch_size_is_required_and_unrelated_to_the_sim_budget():
+    """The key is mandatory in JSON; any value >= 1 is valid, whatever ``sims`` is.
+
+    A leaf batch is only an upper bound at the engine (capped by the remaining
+    budget, closed early on collision), so no relation to ``sims`` is validated.
+    """
+    raw = _mutated()
+    del raw["self_play"]["leaf_batch_size"]
+    with pytest.raises(ValueError, match=r"missing config keys \['leaf_batch_size'\]"):
+        RunConfig.from_dict(raw)
+
+    raw = _mutated()
+    raw["self_play"]["leaf_batch_size"] = raw["self_play"]["sims"] * 4
+    cfg = RunConfig.from_dict(raw)
+    assert cfg.self_play.leaf_batch_size == cfg.self_play.sims * 4
+
+    # Python-level construction keeps the recorded batch-1 baseline as its default.
+    default = SelfPlayConfig(
+        sims=64, k_temp=4, dirichlet_eps=0.25, dirichlet_alpha_numerator=10.8, root_noise=True
+    )
+    assert default.leaf_batch_size == 1

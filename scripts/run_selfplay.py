@@ -54,6 +54,7 @@ from core.run_identity import (  # noqa: E402
     generate_run_id,
     iso_now,
     load_launch_config,
+    read_stored_config,
     resolve_fork,
     resolve_resume,
     run_root,
@@ -302,9 +303,15 @@ def cmd_verify_acceptance(run_dir: Path | str) -> int:
 
     Returns:
         ``0`` if every check passed, ``1`` otherwise.
+
+    Raises:
+        FileNotFoundError: If ``run_dir`` has no stored ``config.json``.
+        ValueError: If the stored config is of a schema with no migration.
     """
     root = Path(run_dir)
-    launch_config = load_launch_config(root / "config.json")
+    # A stored config, not a launch JSON: read through the versioned reader, so
+    # a run launched under an older schema still verifies.
+    launch_config = read_stored_config(root)
     game = build_game_factory(launch_config.run)()
     report = verify_acceptance(root, game, launch_config.run)
     print(report.render())

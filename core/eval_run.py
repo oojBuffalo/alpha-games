@@ -138,7 +138,7 @@ from core.eval_store import (
 )
 from core.game import Game
 from core.mcts import Evaluator
-from core.metrics import _EPOCH_PATTERN, list_procs, metrics_dir
+from core.metrics import _EPOCH_PATTERN, list_procs, metrics_dir, parse_metrics_line
 from core.observability import CHECKPOINT_PUBLISHED_KIND, KIND_DELTA, SERIES_GAMES_COMPLETED
 from core.replay_shard import _atomic_write_json
 from core.run_identity import read_run_record, read_stored_config
@@ -2004,7 +2004,8 @@ class _MetricsTail:
             for line in chunk[:end].splitlines():
                 if line.strip():
                     try:
-                        self._ingest(json.loads(line))
+                        for record in parse_metrics_line(line):
+                            self._ingest(record)
                     except (ValueError, KeyError, TypeError):
                         logging.getLogger(__name__).warning(
                             "skipping malformed metrics line in %s", path
