@@ -242,6 +242,10 @@ class EpochMetricsWriter:
     def append(self, record: Mapping[str, Any]) -> None:
         """Append one record as a JSON line, durable before returning.
 
+        A failed earlier append can leave an unterminated line at the end of
+        the file; it is cut back to the last complete record first, so this
+        record starts on its own line.
+
         Args:
             record: A flat, JSON-serializable mapping. Copied, not mutated.
         """
@@ -273,7 +277,8 @@ class EpochMetricsWriter:
         file-size limit), the file is truncated back to its size before the
         call and the error re-raised, so no torn line is left behind. Once the
         complete line is written it is visible to readers and is kept: an
-        ``fsync`` failure is re-raised without removing it.
+        ``fsync`` failure is re-raised without removing it. An unterminated
+        tail whose own cut-back failed is cut first.
 
         Args:
             line: The line, without its newline.
@@ -282,6 +287,7 @@ class EpochMetricsWriter:
             OSError: If the write fails (the file is unchanged) or the
                 ``fsync`` fails (the complete line stays, unsynced).
         """
+        self._drop_torn_tail()
         view = memoryview((line + "\n").encode("utf-8"))
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
         try:
@@ -297,3 +303,44 @@ class EpochMetricsWriter:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def _drop_torn_tail(self) -> None:
+        """Truncate an unterminated last line a failed write could not cut back itself."""
+        with open(self.path, "rb+") as fh:
+            end = fh.seek(0, os.SEEK_END)
+            if end == 0:
+                return
+            fh.seek(end - 1)
+            if fh.read(1) == b"\n":
+                return
+            fh.seek(0)
+            fh.truncate(fh.read().rfind(b"\n") + 1)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def sync(self) -> None:
+        """Flush this epoch's file to stable storage (``fsync``).
+
+        For a caller that found a record a failed append had written in
+        full: the line is readable, but the failed ``fsync`` left it
+        unconfirmed.
+        """
+        with open(self.path, "rb") as fh:
+            os.fsync(fh.fileno())
+
+    def last_record(self) -> dict[str, Any] | None:
+        """Return the last record in this epoch's complete lines, or ``None``.
+
+        For a caller retrying an append that raised: the record may have
+        been written in full before the error (a failed ``fsync`` keeps the
+        line), and if so it is the last complete line.
+
+        Returns:
+            The last record of the newline-terminated lines (an empty group
+            holds none), or ``None`` if there is none.
+        """
+        for line in reversed(self.path.read_text(encoding="utf-8").split("\n")[:-1]):
+            records = parse_metrics_line(line) if line.strip() else []
+            if records:
+                return records[-1]
+        return None
