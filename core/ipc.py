@@ -833,6 +833,7 @@ class LaunchedRun:
             self._final_written += 1
             if record is self._spike_stop:
                 self._spike_stop_written = True
+            self._attempt = None
         self._ended = True
 
     def _write_spike_stop(self) -> None:
@@ -840,25 +841,27 @@ class LaunchedRun:
         if self._spike_stop is not None and not self._spike_stop_written:
             self._append_once(self._spike_stop)
             self._spike_stop_written = True
+            self._attempt = None
 
     def _append_once(self, record: dict[str, Any]) -> None:
         """Append ``record``, unless its own failed attempt already wrote it in full.
 
-        Only the record whose append last raised is checked, against the
-        file's last complete line: an append that raised after its line was
-        complete (a failed ``fsync``) leaves exactly that line last. Such a
-        line is synced before it counts as written.
+        Only the record last attempted and not yet marked done by its caller
+        is checked, against the file's last complete line: an append that
+        raised after its line was complete (a failed ``fsync``), or an
+        interrupt between the append and the caller's progress update,
+        leaves exactly that line last. Such a line is synced before it
+        counts as written. The caller clears the attempt once it has
+        recorded the record as written.
 
         Args:
             record: One finalization record, built once and reused by retries.
         """
         if self._attempt is record and self.metrics_writer.last_record() == record:
-            self.metrics_writer.sync()  # readable, but its own fsync failed
-            self._attempt = None
+            self.metrics_writer.sync()  # readable, but maybe never synced
             return
         self._attempt = record
         self.metrics_writer.append(record)
-        self._attempt = None
 
     def _stop_children(self, timeout: float) -> list[dict[str, Any]]:
         """Signal, join and, past the grace period, kill and reap every child.

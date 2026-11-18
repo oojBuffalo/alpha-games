@@ -1533,3 +1533,31 @@ def test_a_retry_syncs_a_last_record_whose_own_fsync_failed(tmp_path):
     launched.shutdown(0.0)
     assert writer.syncs == 1  # the line was there, unconfirmed: synced, not rewritten
     assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+def test_an_interrupt_after_the_spike_stop_append_does_not_duplicate_it(tmp_path, monkeypatch):
+    """Ctrl-C lands after the marker is durable and before the caller records that."""
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [3])
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _HeldProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+        spike_games=3,
+    )
+    append_once, fired = launched._append_once, []
+
+    def interrupted_after(record):
+        append_once(record)
+        if record["kind"] == KIND_SPIKE_STOP and not fired:
+            fired.append(True)
+            raise KeyboardInterrupt
+
+    launched._append_once = interrupted_after
+    launched.wait(poll_interval=0.0, shutdown_grace=0.0)  # wait absorbs the interrupt
+    assert _orchestrator_kinds(tmp_path) == [
+        KIND_SPIKE_STOP,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SEGMENT_END,
+    ]
