@@ -214,25 +214,27 @@ class MCTS:
         search, bit for bit, for an evaluator returning Python floats (see the module
         docstring for NumPy scalars).
 
-        A batch that fails (an ``Exception``) is abandoned whole. If the evaluator or
-        ``terminal_utility`` raises, or returns anything the engine cannot use (see
-        Raises), every descent of that batch is rolled back before the error propagates:
-        no virtual loss or in-flight mark is left, no leaf of the batch is expanded, and
-        none of it is counted. Every evaluation result and every terminal utility is
-        obtained and checked before the first leaf is filled, so one failure discards the
-        batch's well-formed results too, and filling and backing up then only assign and
-        add, which cannot fail. An exception raised inside a descent (by the adapter's
-        ``apply`` / ``legal_moves`` / ``is_terminal`` / ``current_player``) abandons the
-        batch the same way: the failing descent removes its own virtual loss first. The
-        tree stays searchable after any of these.
+        A failed evaluation abandons its batch whole and keeps the tree. If the
+        evaluator or ``terminal_utility`` raises an ``Exception``, or returns anything the
+        engine cannot use (see Raises), every descent of that batch is rolled back before
+        the error propagates: no virtual loss or in-flight mark is left, no leaf of the
+        batch is expanded, and none of it is counted. The tree survives only if that
+        rollback completes; an evaluator that raises a ``BaseException`` that is not an
+        ``Exception`` (``KeyboardInterrupt``) gets no rollback and discards it. Every
+        evaluation result and every terminal utility is obtained and checked before the
+        first leaf is filled, so one failure discards the batch's well-formed results
+        too. This rollback is exact because it runs only once every descent of the batch
+        has been recorded.
 
-        An interruption is different. A ``BaseException`` that is not an ``Exception``
-        (``KeyboardInterrupt``, ``SystemExit``) can arrive between any two steps — after a
-        reservation is made but before it is recorded, or half-way through a backup — so
-        wherever it lands in the search loop the tree is discarded (the root is unset)
-        before it propagates. Simulations already backed up, including earlier ones of
-        the interrupted batch, stay in ``completed_simulations``. Restart with
-        ``root_state`` or :meth:`set_root`.
+        Anything else that escapes the search loop discards the tree (the root is
+        unset) before it propagates: an exception raised by the adapter during a descent
+        (``apply`` / ``legal_moves`` / ``is_terminal`` / ``current_player``), any
+        exception or interruption (``KeyboardInterrupt``, a signal handler's exception)
+        that lands while descents are being collected or results committed, and one that
+        lands inside the rollback itself. There a reservation may be made but not yet
+        recorded, or a backup half done, so the tree cannot be trusted. Simulations
+        already backed up, including earlier ones of the interrupted batch, stay in
+        ``completed_simulations``. Restart with ``root_state`` or :meth:`set_root`.
 
         Args:
             num_simulations: Number of simulations (backed-up leaf visits) to perform.
@@ -268,20 +270,14 @@ class MCTS:
             self.set_root(root_state)
         if self.root is None:
             raise ValueError("no root set; pass root_state or call set_root first")
-        try:
-            return self._run_batches(remaining, batch_size)
-        except BaseException as exc:
-            if not isinstance(exc, Exception):
-                # An interruption may have landed between a reservation and its
-                # bookkeeping, or half-way through a backup: the tree can no longer be
-                # trusted, so it is dropped rather than left holding stale marks.
-                self.root = None
-            raise
+        return self._run_batches(remaining, batch_size)
 
     def _run_batches(self, remaining: int, batch_size: int) -> _Node:
         """Run batches from the current root until ``remaining`` simulations are spent.
 
         The search loop of :meth:`run`, which validates the arguments and sets the root.
+        The tree survives an exception only when the evaluation-phase rollback ran to the
+        end; whatever else escapes discards it (see :meth:`run`).
 
         Args:
             remaining: Simulations still to back up.
@@ -290,12 +286,13 @@ class MCTS:
         Returns:
             The root ``_Node``.
         """
-        while remaining > 0:
-            # Leaves are filled only once the batch has closed, so root priors cannot
-            # appear mid-batch: one noise check per batch is one check per descent.
-            self._maybe_noise_root()
-            batch: list[tuple[list[tuple[_Node, int]], _Node]] = []
-            try:
+        unwound = False  # set only once the evaluation-phase rollback has completed
+        try:
+            while remaining > 0:
+                # Leaves are filled only once the batch has closed, so root priors cannot
+                # appear mid-batch: one noise check per batch is one check per descent.
+                self._maybe_noise_root()
+                batch: list[tuple[list[tuple[_Node, int]], _Node]] = []
                 for _ in range(min(batch_size, remaining)):
                     path, leaf, collided = self._descend(apply_vloss=True)
                     if collided:
@@ -304,31 +301,39 @@ class MCTS:
                     batch.append((path, leaf))
                 if not batch:
                     raise RuntimeError("a batch opened onto a leaf that is already in flight")
-                results = iter(
-                    self._evaluate_leaves([leaf for _, leaf in batch if not leaf.is_terminal])
-                )
-                # terminal_utility is the batch's last adapter call: make it in here too.
-                terminal = [
-                    self._leaf_value(leaf, path, None) if leaf.is_terminal else None
-                    for path, leaf in batch
-                ]
-            except Exception:
-                # Nothing is filled yet, so abandoning the batch is exact: no virtual
-                # loss, no in-flight mark, no simulation counted.
-                for path, leaf in batch:
-                    self._rollback_vloss(path)
+                try:
+                    leaves = [leaf for _, leaf in batch if not leaf.is_terminal]
+                    results = iter(self._evaluate_leaves(leaves))
+                    # terminal_utility is the batch's last adapter call: make it here too.
+                    terminal = [
+                        self._leaf_value(leaf, path, None) if leaf.is_terminal else None
+                        for path, leaf in batch
+                    ]
+                except Exception:
+                    # Every descent is recorded in ``batch`` and nothing is filled yet, so
+                    # abandoning the batch is exact: no virtual loss, no in-flight mark,
+                    # no simulation counted.
+                    for path, leaf in batch:
+                        self._rollback_vloss(path)
+                        leaf.in_flight = False
+                        leaf.actions = []  # undo the deferral: a fresh node again
+                    unwound = True
+                    raise
+                # Every value is in hand and checked: the rest only assigns and adds.
+                for (path, leaf), resolved in zip(batch, terminal, strict=True):
+                    if resolved is None:
+                        value = self._fill_expand(leaf, *next(results))
+                        resolved = self._leaf_value(leaf, path, value)
+                    self._backup(path, *resolved)
                     leaf.in_flight = False
-                    leaf.actions = []  # undo the deferral: a fresh node again
-                raise
-            # Every value is in hand and checked: the rest only assigns and adds floats.
-            for (path, leaf), resolved in zip(batch, terminal, strict=True):
-                if resolved is None:
-                    value = self._fill_expand(leaf, *next(results))
-                    resolved = self._leaf_value(leaf, path, value)
-                self._backup(path, *resolved)
-                leaf.in_flight = False
-                self.completed_simulations += 1
-            remaining -= len(batch)
+                    self.completed_simulations += 1
+                remaining -= len(batch)
+        except BaseException:
+            if not unwound:
+                # A reservation may be made but unrecorded, or a backup half done: the
+                # tree can no longer be trusted, so it is dropped, not left with marks.
+                self.root = None
+            raise
         return self.root
 
     def advance(self, action: Action) -> None:
@@ -518,7 +523,9 @@ class MCTS:
         """Install an evaluation on a deferred leaf (the fill half of expansion).
 
         Completes the sparse ``{N, W, Q, P}`` expansion over the legal actions stored by
-        :meth:`_defer_expand`. It only assigns, so it cannot fail part-way.
+        :meth:`_defer_expand`. It only allocates and assigns, raising nothing of its own;
+        an asynchronous exception or ``MemoryError`` can still leave the node partly
+        filled, and :meth:`run` then discards the tree.
 
         Args:
             node: A node previously passed to :meth:`_defer_expand`.
@@ -644,34 +651,27 @@ class MCTS:
             traversed, and ``collided`` is True iff ``leaf`` was already in flight when
             this descent reached it (the descent then left the leaf untouched).
 
-        If an adapter call raises part-way, the virtual loss this descent applied is
-        removed before the exception propagates, and no leaf has been marked.
         """
         path: list[tuple[_Node, int]] = []
         node = self.root
         assert node is not None
-        try:
-            while True:
-                if node.is_terminal or not node.is_expanded:
-                    collided = node.in_flight
-                    if node.is_terminal:
-                        node.in_flight = True
-                    elif not collided:
-                        self._defer_expand(node)
-                    return path, node, collided
-                i = self._select_edge(node)
-                if apply_vloss:
-                    node.vloss[i] += self.virtual_loss
-                path.append((node, i))
-                child = node.children[i]
-                if child is None:
-                    child = self._make_node(self.game.apply(node.state, node.actions[i]))
-                    node.children[i] = child
-                node = child
-        except BaseException:
+        while True:
+            if node.is_terminal or not node.is_expanded:
+                collided = node.in_flight
+                if node.is_terminal:
+                    node.in_flight = True
+                elif not collided:
+                    self._defer_expand(node)
+                return path, node, collided
+            i = self._select_edge(node)
             if apply_vloss:
-                self._rollback_vloss(path)
-            raise
+                node.vloss[i] += self.virtual_loss
+            path.append((node, i))
+            child = node.children[i]
+            if child is None:
+                child = self._make_node(self.game.apply(node.state, node.actions[i]))
+                node.children[i] = child
+            node = child
 
     def _rollback_vloss(self, path: Sequence[tuple[_Node, int]]) -> None:
         """Remove one descent's virtual loss from ``path`` without backing anything up.

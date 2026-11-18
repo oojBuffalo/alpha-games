@@ -453,26 +453,32 @@ class _FlakyApplyConnect4(Connect4):
         return super().apply(state, action)
 
 
-def test_a_descent_that_raises_removes_its_own_virtual_loss():
+def test_a_descent_that_raises_discards_the_tree():
     game = _FlakyApplyConnect4()
     m = MCTS(game)
-    m.run(1, root_state=game.initial_state())  # expand the root
+    start = game.initial_state()
+    m.run(1, root_state=start)  # expand the root
     game.armed = True
 
-    # Column 0's descent joins the batch first; column 1's raises inside apply.
+    # Column 0's descent joins the batch first; column 1's raises inside apply, leaving
+    # virtual loss on its own partial path: the tree is dropped, not reused with it.
     with pytest.raises(RuntimeError, match="adapter hiccup"):
         m.run(4, batch_size=4)
 
+    assert m.root is None
     assert m.completed_simulations == 1
-    assert m.root.vloss == [0, 0, 0, 0] and m.root.N == [0, 0, 0, 0]
-    _assert_no_residue(m.root)
-
-    m.run(40, batch_size=4)  # the retry leaves nothing behind either
+    root = m.run(40, root_state=start, batch_size=4)
     assert m.completed_simulations == 41
-    _assert_no_residue(m.root)
+    _assert_no_residue(root)
 
 
-def test_an_interrupted_commit_discards_the_tree():
+# An interruption (not an Exception), what a signal handler may raise, and a synchronous
+# failure where none is expected: each discards the tree wherever it lands.
+ESCAPES = [KeyboardInterrupt, TimeoutError, MemoryError]
+
+
+@pytest.mark.parametrize("escape", ESCAPES)
+def test_a_failure_during_commit_discards_the_tree(escape):
     game = Connect4(4, 4, 3)
     m = MCTS(game)
     start = game.initial_state()
@@ -481,12 +487,12 @@ def test_an_interrupted_commit_discards_the_tree():
 
     def interrupted(*args):
         backups.append(1)
-        if len(backups) == 2:  # an interruption half-way through committing the batch
-            raise KeyboardInterrupt
+        if len(backups) == 2:  # a failure half-way through committing the batch
+            raise escape
         return backup(*args)
 
     m._backup = interrupted
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(escape):
         m.run(4, batch_size=4)
 
     # A half-committed tree is never offered for reuse: it is gone, not left with marks.
@@ -503,26 +509,29 @@ def test_an_interrupted_commit_discards_the_tree():
 
 
 class _InterruptingList(list):
-    """A list whose ``n``-th item assignment completes and then raises ``KeyboardInterrupt``.
+    """A list whose ``n``-th item assignment completes and then raises ``escape``.
 
     Args:
         items: The initial items.
         n: Which assignment (1-based) is interrupted, just after it takes effect.
+        escape: The exception type to raise.
     """
 
-    def __init__(self, items, n: int):
+    def __init__(self, items, n: int, escape: type[BaseException]):
         super().__init__(items)
         self.n = n
+        self.escape = escape
 
     def __setitem__(self, index, value):
         super().__setitem__(index, value)
         self.n -= 1
         if self.n == 0:
-            raise KeyboardInterrupt
+            raise self.escape
 
 
+@pytest.mark.parametrize("escape", ESCAPES)
 @pytest.mark.parametrize("where", ["after-descent", "after-vloss"])
-def test_an_interruption_during_collection_discards_the_tree(where):
+def test_a_failure_during_collection_discards_the_tree(where, escape):
     game = Connect4(4, 4, 3)
     m = MCTS(game)
     start = game.initial_state()
@@ -533,7 +542,7 @@ def test_an_interruption_during_collection_discards_the_tree(where):
         result = descend(**kwargs)
         descents.append(1)
         if len(descents) == 2:  # a reservation made but not yet recorded in the batch
-            raise KeyboardInterrupt
+            raise escape
         return result
 
     if where == "after-descent":
@@ -541,8 +550,8 @@ def test_an_interruption_during_collection_discards_the_tree(where):
     else:
         # The second descent's root-edge virtual loss lands, then the interruption
         # arrives before the descent records that edge in its path.
-        m.root.vloss = _InterruptingList(m.root.vloss, 2)
-    with pytest.raises(KeyboardInterrupt):
+        m.root.vloss = _InterruptingList(m.root.vloss, 2, escape)
+    with pytest.raises(escape):
         m.run(4, batch_size=4)
 
     assert m.root is None
@@ -550,6 +559,31 @@ def test_an_interruption_during_collection_discards_the_tree(where):
     m._descend = descend
     root = m.run(20, root_state=start, batch_size=4)
     assert m.completed_simulations == 21
+    _assert_no_residue(root)
+
+
+def test_an_interrupted_rollback_discards_the_tree():
+    game = Connect4(4, 4, 3)
+    calls = []
+
+    def failing(game, states):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("evaluator down")
+        return [(0.0, None)] * len(states)
+
+    m = MCTS(game, evaluate_batch=failing)
+    start = game.initial_state()
+    m.run(1, root_state=start)
+    m._rollback_vloss = lambda path: (_ for _ in ()).throw(KeyboardInterrupt)
+
+    # The evaluation failure starts an exact rollback, but it does not finish.
+    with pytest.raises(KeyboardInterrupt):
+        m.run(4, batch_size=4)
+
+    assert m.root is None
+    del m._rollback_vloss
+    root = m.run(20, root_state=start, batch_size=4)
     _assert_no_residue(root)
 
 
