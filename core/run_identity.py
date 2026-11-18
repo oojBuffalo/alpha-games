@@ -708,6 +708,13 @@ class Lineage:
         )
 
 
+#: The self-play storage policy every run record written by this code carries
+#: (:attr:`RunRecord.storage_policy`): under playout-cap randomization a
+#: fast-tier position is played but not stored (D12). A record without it was
+#: written before the drop existed, when a playout-cap run stored every ply.
+STORAGE_POLICY_D12_DROP = "d12_drop_fast_tier"
+
+
 @dataclass(frozen=True)
 class RunRecord:
     """One run's provenance metadata, stored as ``run_record.json``.
@@ -720,12 +727,18 @@ class RunRecord:
             (:data:`ENTRY_CONDITION`).
         lineage: This run's fork lineage, or ``None`` for a run launched
             fresh (not forked).
+        storage_policy: The storage policy the run's actors were written
+            under -- :data:`STORAGE_POLICY_D12_DROP` for every record this
+            code writes, ``None`` for a ``run_record.json`` that predates the
+            field. :func:`resolve_resume` refuses a playout-cap run whose
+            record is not D12 (its shards hold fast-tier positions).
     """
 
     run_id: str
     created_at: str
     entry_condition: Mapping[str, Any]
     lineage: Lineage | None = None
+    storage_policy: str | None = STORAGE_POLICY_D12_DROP
 
     def to_dict(self) -> dict[str, Any]:
         """Return this record as a plain, JSON-serializable dict."""
@@ -734,6 +747,7 @@ class RunRecord:
             "created_at": self.created_at,
             "entry_condition": dict(self.entry_condition),
             "lineage": self.lineage.to_dict() if self.lineage is not None else None,
+            "storage_policy": self.storage_policy,
         }
 
     @classmethod
@@ -752,6 +766,7 @@ class RunRecord:
             created_at=raw["created_at"],
             entry_condition=raw["entry_condition"],
             lineage=Lineage.from_dict(lineage_raw) if lineage_raw is not None else None,
+            storage_policy=raw.get("storage_policy"),
         )
 
 
@@ -983,7 +998,9 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
         FileNotFoundError: If ``run_dir`` has no recorded provenance.
         MaterialConfigDiffError: If any material field differs, naming every
             offending field -- including ``actor_inference_amp`` for a
-            schema-v1 run resumed on CUDA (fork it instead).
+            schema-v1 run resumed on CUDA, and ``self_play.storage_policy``
+            for a playout-cap run recorded before the D12 drop (fork either
+            instead).
         UnclassifiedFieldError: If either config carries an unclassified leaf
             field.
     """
@@ -997,6 +1014,14 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
     # float16 under the same run id. Off CUDA the autocast is a no-op.
     if document["schema_version"] == 1 and device_kind(new_launch_config.device) == "cuda":
         material["actor_inference_amp"] = (False, True)
+    # A playout-cap run recorded before D12 stored its fast-tier positions;
+    # resuming it here would mix both storage policies in one replay window.
+    # A fixed-tier run stores every ply under either policy.
+    if (
+        stored.run.self_play.playout_cap_randomization
+        and record.storage_policy != STORAGE_POLICY_D12_DROP
+    ):
+        material["self_play.storage_policy"] = (record.storage_policy, STORAGE_POLICY_D12_DROP)
     if material:
         raise MaterialConfigDiffError(material)
     return ResumeResolution(
