@@ -1004,9 +1004,10 @@ def _game_flushes(
 def _incomplete_series(window: list[dict[str, Any]]) -> set[str]:
     """Return the series a window's game flushes do not wholly record.
 
-    An actor appends a game's records one at a time, ``games_completed``
-    first (``core.actor``), so a flush read mid-write, or cut short by a
-    crash, counts its game but lacks later series. Such a flush is detected
+    An actor writes a game's records as one group, ``games_completed``
+    first (``core.actor``). A crash inside that write can still persist its
+    first lines and not the rest; such a flush counts its game but lacks
+    later series, or a sum the earlier lines promise. Such a flush is detected
     from what complete flushes must hold: each of ``_ALWAYS_FLUSHED_SERIES``,
     ``positions_evaluated``, ``inference_batches`` and the tier series is in
     every flush of the window or in none (a series in none has no record,

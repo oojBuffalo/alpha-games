@@ -200,8 +200,9 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
                 False,
                 "not evaluable: this run has playout-cap randomization on, so its "
                 "fast-search positions were dropped and two adjacent stored samples "
-                "sharing a mover no longer show a player moving twice running; the "
-                f"durable evidence is the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} "
+                "sharing a mover no longer show a player moving twice running; such "
+                "a run is outside this M3 check's scope, and the complete count is "
+                f"the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} "
                 "series, which this checklist does not read",
             )
         )

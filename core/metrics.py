@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -226,10 +226,25 @@ class EpochMetricsWriter:
         Args:
             record: A flat, JSON-serializable mapping. Copied, not mutated.
         """
-        line = json.dumps(dict(record), sort_keys=True)
+        self.append_many([record])
+
+    def append_many(self, records: Iterable[Mapping[str, Any]]) -> None:
+        """Append records as JSON lines in one write, all durable before returning.
+
+        One ``write`` and one ``fsync`` for the whole group, so a group that
+        must be read together (one game's accounting -- :mod:`core.actor`)
+        is never left half-appended by a failure between two of its records.
+        A failed earlier append can leave an unterminated line at the end of
+        the file; it is cut back to the last complete record first, so this
+        group starts on its own line.
+
+        Args:
+            records: Flat, JSON-serializable mappings. Copied, not mutated.
+        """
+        text = "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records)
         self._drop_torn_tail()
         with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
 
@@ -247,20 +262,16 @@ class EpochMetricsWriter:
             fh.flush()
             os.fsync(fh.fileno())
 
-    def contains(self, record: Mapping[str, Any]) -> bool:
-        """Return whether this epoch's file already holds ``record`` as a complete line.
+    def last_record(self) -> dict[str, Any] | None:
+        """Return the last complete record in this epoch's file, or ``None``.
 
         For a caller retrying an append that raised: the record may have
-        been written in full before the error (say, a failed ``fsync``).
-
-        Args:
-            record: The record that was being appended.
+        been written in full before the error (say, a failed ``fsync``), and
+        if so it is the last complete line.
 
         Returns:
-            Whether an equal record is in this instance's epoch file.
+            The parsed last newline-terminated line, or ``None`` if there is
+            none.
         """
-        target = dict(record)
-        for line in self.path.read_text().split("\n")[:-1]:
-            if line.strip() and json.loads(line) == target:
-                return True
-        return False
+        lines = [line for line in self.path.read_text().split("\n")[:-1] if line.strip()]
+        return json.loads(lines[-1]) if lines else None

@@ -33,7 +33,7 @@ from games.tictactoe import TicTacToe
 TTT = TicTacToe()
 
 
-def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT):
+def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT, plies=None):
     """Build one synthetic game's records, with a caller-chosen mover sequence.
 
     Args:
@@ -44,6 +44,9 @@ def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT)
             direct control over consecutive-mover (blocked-skip) sequences.
         model_version: Stamped on every record in this game.
         game: The adapter whose encoding the records carry.
+        plies: The ply index stamped on each record, one per mover; ``None``
+            (the default) numbers them ``0, 1, 2, ...`` -- a run that stored
+            every ply.
 
     Returns:
         A tuple of ``len(movers)`` ``SampleRecord``s.
@@ -62,13 +65,15 @@ def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT)
             ply=ply,
             game_id=(run_id, actor_id, game_index),
         )
-        for ply, mover in enumerate(movers)
+        for ply, mover in zip(range(len(movers)) if plies is None else plies, movers, strict=True)
     )
 
 
-def _write_game_shard(shard_dir, run_id, actor_id, seq, movers, model_version, game=TTT):
-    """Publish one synthetic single-game shard."""
-    records = _game_records(run_id, actor_id, seq, movers, model_version, game)
+def _write_game_shard(
+    shard_dir, run_id, actor_id, seq, movers, model_version, game=TTT, plies=None
+):
+    """Publish one synthetic single-game shard (``plies``: :func:`_game_records`)."""
+    records = _game_records(run_id, actor_id, seq, movers, model_version, game, plies)
     shard_id = shard_filename(run_id, actor_id, seq)
     write_shard(shard_dir / shard_id, game, records, run_id=run_id, actor_id=actor_id, seq=seq)
 
@@ -249,14 +254,15 @@ def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
     shard_dir = root / "shards"
     shard_dir.mkdir(parents=True)
     for i in range(_NUM_GAMES):
-        movers = [0, 1, 1] if i < _NUM_GAMES // 2 else [0, 1, 0]
+        # Plies 0, 1 and 3 of a strictly alternating game: ply 2 was dropped.
         model_version = 0 if i < _NUM_GAMES // 2 else 1
-        _write_game_shard(shard_dir, "run", "0", i, movers, model_version)
+        _write_game_shard(shard_dir, "run", "0", i, [0, 1, 1], model_version, plies=[0, 1, 3])
     _write_actor_metrics(root, num_games=_NUM_GAMES)
     _write_learner_metrics(root, learner_step=_LEARNER_STEP, published_versions=(0, 1))
     _write_checkpoints(root / "checkpoints", (0, 1))
 
-    # Read as an all-stored run, those shards pass: that reading is the M3 one.
+    # Read as an all-stored run, the stored-sample test takes the gap for a
+    # blocked skip and passes: the misreading the check must not make.
     stored_all = verify_acceptance(root, TTT, _run_config())
     assert stored_all.passed
 

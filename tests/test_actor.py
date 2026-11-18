@@ -896,3 +896,48 @@ def test_a_game_whose_shard_is_not_published_is_counted_by_no_series(tmp_path):
     (shard,) = sorted((tmp_path / "shards").glob("shard-*.npz"))
     stored = [v for s, v in flushed if s == SERIES_POSITIONS_STORED]
     assert stored == [len(read_shard(shard, TTT).records)]
+
+
+def test_a_failure_mid_flush_leaves_no_durable_part_of_the_games_series(tmp_path, monkeypatch):
+    """A game's series are durable together: a failure inside the group keeps none.
+
+    The failure is injected at the ``positions_stored`` record, after the
+    group's first records. A restarted actor then plays on, and the run's
+    played/stored/tier identities still hold over every game that flushed.
+    """
+    import core.metrics
+
+    real_dumps = core.metrics.json.dumps
+
+    def fail_at_positions_stored(obj, **kwargs):
+        if obj.get("series") == SERIES_POSITIONS_STORED:
+            raise OSError("disk full")
+        return real_dumps(obj, **kwargs)
+
+    shard_dir = tmp_path / "shards"
+    driver = make_driver(
+        shard_dir,
+        self_play=d6_cfg(),
+        max_games=1,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    )
+    monkeypatch.setattr(core.metrics.json, "dumps", fail_at_positions_stored)
+    with pytest.raises(OSError, match="disk full"):
+        driver.run()
+    monkeypatch.undo()
+    assert _series_values(tmp_path) == []  # not even the records before the failure
+
+    make_driver(
+        shard_dir,
+        self_play=d6_cfg(),
+        max_games=1,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_GAMES_COMPLETED] == 1
+    assert totals[SERIES_POSITIONS_STORED] == (
+        totals[SERIES_MOVES_FULL_512] + totals[SERIES_MOVES_MID_256]
+    )
+    assert totals[SERIES_POSITIONS_PLAYED] == (
+        totals[SERIES_POSITIONS_STORED] + totals[SERIES_MOVES_FAST_64]
+    )
