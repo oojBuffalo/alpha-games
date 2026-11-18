@@ -76,8 +76,12 @@ class AmpMode:
         one by accident.
 
         Returns:
-            The context manager to wrap forwards in; an exact no-op when
-            ``enabled`` is False.
+            The context manager to wrap forwards in. When ``enabled`` is False
+            it is an exact no-op for a caller not already under autocast; under
+            an enclosing autocast context for the same device type it
+            *disables* autocast for its own extent (torch's
+            ``enabled=False`` semantics), so the forward runs float32. The
+            production actor never opens an enclosing context.
         """
         return torch.autocast(device_type=self.device_type, enabled=self.enabled)
 
@@ -85,8 +89,11 @@ class AmpMode:
         """Whether autocast is live *right now* for this device type.
 
         Called from inside :meth:`autocast` this reports what actually
-        happened, which is what a report may state; called outside it reports
-        False whatever ``enabled`` says.
+        happened, which is what a report may state. It reads torch's
+        thread-local state, not this mode's own context: called outside
+        :meth:`autocast` it reports False whatever ``enabled`` says, unless an
+        enclosing autocast context for ``device_type`` is live, in which case
+        it reports True.
 
         Returns:
             torch's live autocast state for ``device_type``.
