@@ -879,7 +879,7 @@ def test_a_run_recorded_before_the_d12_drop_resumes_only_at_a_fixed_tier(tmp_pat
     assert excinfo.value.material == {"self_play.storage_policy": (None, STORAGE_POLICY_D12_DROP)}
     # The field is derived, not configured, so the message says how to go on.
     assert "recorded before the D12 drop" in str(excinfo.value)
-    fork = str(excinfo.value).split("--fork-from ", 1)[1].split(" instead of", 1)[0]
+    fork = str(excinfo.value).split("--fork-from=", 1)[1].split(" instead of", 1)[0]
     assert shlex.split(fork) == [str(root)]
     assert resolve_fork(root, lc, now=1_700_000_500.0).run_id != "run-1"  # the way forward
 

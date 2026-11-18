@@ -1035,7 +1035,7 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
             "self_play.storage_policy is not a config field: this playout-cap run was "
             "recorded before the D12 drop, so its shards hold fast-tier positions this "
             "code no longer stores. Continue it as a new run with "
-            f"--fork-from {shlex.quote(str(root))} instead of --resume"
+            f"--fork-from={shlex.quote(str(root))} instead of --resume"
         )
     if material:
         raise MaterialConfigDiffError(material, detail)
