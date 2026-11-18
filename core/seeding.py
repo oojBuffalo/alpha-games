@@ -10,9 +10,10 @@ and they are the whole point:
     parallel actors decorrelate by label and crash-resume needs no persisted RNG state.
 
 The single-process M2.5 label set is the purpose constants below: net init, Dirichlet
-(D7), ∝N move selection (D10), MCTS tie-breaks, the playout-cap tier draw (D6),
-symmetry-augmentation ``g`` (D9), and replay-window sampling. Pure stdlib, no torch/NumPy:
-net init consumes the derived int directly via ``torch.manual_seed``.
+(D7), ∝N move selection (D10), MCTS tie-breaks, symmetry-augmentation ``g`` (D9), and
+replay-window sampling. M5 adds one more, the playout-cap tier draw (D6), which a
+fixed-budget game never consumes. Pure stdlib, no torch/NumPy: net init consumes the
+derived int directly via ``torch.manual_seed``.
 
 M3 (issue #53) adds the multi-actor label family and durable-coordinate keying without
 reshaping this API: :meth:`GameRNGs.for_actor_game` derives ``("actor", actor_id, "game",

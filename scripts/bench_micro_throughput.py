@@ -339,9 +339,8 @@ class RunMeta:
             hash — Invariant 4).
         warmup_games: Games discarded before measurement.
         measure_games: Games in the measurement interval.
-        sims: ``self_play.sims``, which the report prints as sims/move. That is
-            the per-move count only with playout-cap randomization off (the
-            checked-in micro config); with it on, it is the always-full budget.
+        sims: Micro sims/move during the spike (``self_play.sims``; :func:`main`
+            refuses a playout-cap config, so it is the fixed per-move budget).
         date: Run date, ``YYYY-MM-DD``.
     """
 
@@ -1294,13 +1293,20 @@ def main(argv: list[str] | None = None) -> int:
 
     Raises:
         SystemExit: From :func:`require_official_hardware` when the hardware is
-            not the pinned 4060 Ti 16 GB and the opt-in flag is absent.
+            not the pinned 4060 Ti 16 GB and the opt-in flag is absent, or when
+            the config turns playout-cap randomization on (§12 M2.5 pins the
+            spike to a fixed budget, official or not).
         ValueError: From :func:`observed_amp` if the timed forwards and the
             leaf evaluations did not run at the same precision.
     """
     args = parse_args(argv)
     official, device = require_official_hardware(args.allow_unverified_hardware)
     cfg = load_run_config(args.config)
+    if cfg.self_play.playout_cap_randomization:
+        raise SystemExit(
+            "the M2.5 spike is pinned to fixed-budget self-play (§12 M2.5: no PCR); "
+            f"{args.config} turns playout-cap randomization on"
+        )
     warmup_games = (
         args.warmup_games if args.warmup_games is not None else cfg.throughput.warmup_games
     )

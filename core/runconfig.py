@@ -434,12 +434,26 @@ class SelfPlayConfig:
                 outside ``(0, 1)``, ``pcr_full_plies`` is negative, or
                 playout-cap randomization is on without
                 ``sims > pcr_mid_sims > pcr_fast_sims``.
+            TypeError: If ``playout_cap_randomization`` is not a bool, or
+                ``pcr_mid_sims``, ``pcr_fast_sims`` or ``pcr_full_plies`` is not
+                an int (a bool is not accepted as an int).
         """
         _positive(self.leaf_batch_size, "self_play.leaf_batch_size")
         _positive(self.sims, "self_play.sims")
         _non_negative(self.k_temp, "self_play.k_temp")
         _unit_interval(self.dirichlet_eps, "self_play.dirichlet_eps")
         _positive(self.dirichlet_alpha_numerator, "self_play.dirichlet_alpha_numerator")
+        # Direct construction bypasses the JSON reader's type checks; a float
+        # or bool tier budget would pass the range checks and the actor gate.
+        if type(self.playout_cap_randomization) is not bool:
+            raise TypeError(
+                "self_play.playout_cap_randomization: expected a bool, "
+                f"got {type(self.playout_cap_randomization).__name__}"
+            )
+        for name in ("pcr_mid_sims", "pcr_fast_sims", "pcr_full_plies"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"self_play.{name}: expected an int, got {type(value).__name__}")
         _positive(self.pcr_mid_sims, "self_play.pcr_mid_sims")
         _positive(self.pcr_fast_sims, "self_play.pcr_fast_sims")
         if not 0.0 < self.pcr_mid_probability < 1.0:
