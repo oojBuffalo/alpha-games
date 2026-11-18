@@ -3,8 +3,9 @@
 ``cfg.leaf_batch_size > 1`` routes every search through the engine's batched
 selection, one evaluation per collected leaf batch. Pinned here, at the game
 loop rather than the engine (``tests/test_batched_mcts_api.py`` owns the
-engine): games complete, a game is a pure function of seed and config, and the
-batched evaluator -- not the scalar one -- answers the leaves. No equivalence
+engine): games complete, a game is a pure function of seed and config for fixed
+evaluators, and the batched evaluator -- not the scalar one -- answers the
+leaves. No equivalence
 with the serial search is claimed: virtual loss steers a batch's descents
 apart, so the trajectories legitimately differ.
 
@@ -65,10 +66,12 @@ def test_a_batched_game_completes_and_is_deterministic_for_a_fixed_seed(name):
     sizes = []
 
     def spy(game_, states):
+        """Log the batch's leaf count, then answer it with the real batched evaluator."""
         sizes.append(len(states))
         return batched(game_, states)
 
     def play():
+        """Play the one fixed-seed game this test compares with itself."""
         return play_game(game, scalar, _cfg(4), GameRNGs.for_game(11, 0), evaluate_batch=spy)
 
     first = play()
@@ -89,6 +92,7 @@ def test_the_batched_evaluator_replaces_the_scalar_one():
     _, batched = _evaluators(game)
 
     def scalar_must_not_run(game_, state):
+        """Fail the test: with ``evaluate_batch`` supplied this is never called."""
         raise AssertionError("evaluate_batch supplied: the scalar evaluator is not used")
 
     result = play_game(
@@ -97,17 +101,36 @@ def test_the_batched_evaluator_replaces_the_scalar_one():
     assert game.is_terminal(result.terminal_state)
 
 
-def test_without_a_batched_evaluator_a_batch_maps_the_scalar_one_over_its_leaves():
+def test_without_a_batched_evaluator_a_batch_maps_the_scalar_one_over_its_leaves(monkeypatch):
     game = GAMES["tictactoe"]
-    scalar, batched = _evaluators(game)
-    calls = []
+    scalar, _ = _evaluators(game)
+    calls, phases = [], []
+
+    class LeafCounting(MCTS):
+        """Engine that logs how many leaves each evaluation phase is handed."""
+
+        def _evaluate_leaves(self, leaves):
+            """Record the phase's leaf count, then evaluate as usual.
+
+            Args:
+                leaves: The leaves the engine collected for this phase.
+
+            Returns:
+                The engine's own results for ``leaves``.
+            """
+            phases.append(len(leaves))
+            return super()._evaluate_leaves(leaves)
 
     def counting(game_, state):
+        """Log one scalar call per leaf, then answer it with the real evaluator."""
         calls.append(state)
         return scalar(game_, state)
 
+    monkeypatch.setattr(selfplay, "MCTS", LeafCounting)
     mapped = play_game(game, counting, _cfg(4), GameRNGs.for_game(3, 0))
-    assert calls and game.is_terminal(mapped.terminal_state)
+    assert game.is_terminal(mapped.terminal_state)
+    assert max(phases) > 1  # the search still collected several leaves per phase...
+    assert len(calls) == sum(phases)  # ...and answered each with one scalar call
     # The M0 path (no evaluator at all) batches too.
     assert game.is_terminal(play_game(game, None, _cfg(4), GameRNGs.for_game(3, 0)).terminal_state)
 
@@ -137,7 +160,19 @@ def _recording(engine, log):
     """
 
     class Recording(engine):
+        """``engine`` that logs, after every search, the π the game loop will store."""
+
         def run(self, num_simulations, root_state=None, *, batch_size=1):
+            """Search as ``engine`` does, then log the root's counts and residue.
+
+            Args:
+                num_simulations: Passed through to ``engine.run``.
+                root_state: Passed through to ``engine.run``.
+                batch_size: Passed through to ``engine.run``.
+
+            Returns:
+                The searched root, unchanged.
+            """
             fresh = not self.root.is_expanded
             carried = sum(self.root.N)  # subtree reuse: visits the promoted root arrives with
             root = super().run(num_simulations, root_state, batch_size=batch_size)

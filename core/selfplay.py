@@ -290,16 +290,19 @@ def play_game(
     Each search collects up to ``cfg.leaf_batch_size`` leaves per evaluation
     (§6.2 batched parallel selection). ``1`` is the serial search, bit for bit.
     Above ``1`` the trajectory legitimately differs from the serial one —
-    virtual loss steers a batch's descents apart — but stays a pure function of
-    the seed and config, and the stored counts are still the root's raw ``N``:
+    virtual loss steers a batch's descents apart — but, for fixed deterministic
+    evaluators (the same weights), stays a pure function of the seed and
+    config, and the stored counts are still the root's raw ``N``:
     virtual loss is fully backed out before a search returns.
 
     Args:
         game: The adapter to play. Game-specific behavior enters *only* here —
             this module never imports ``games/``.
         evaluator: Leaf evaluator for MCTS (``core.network.make_network_evaluator``
-            bridges the batch-1 network in). ``None`` runs the M0 engine: value
-            0.0 and uniform priors, which is what the stdlib-only tests use.
+            bridges the batch-1 network in). ``None`` together with
+            ``evaluate_batch=None`` runs the M0 engine: value 0.0 and uniform
+            priors, which is what the stdlib-only tests use. Unused when
+            ``evaluate_batch`` is supplied.
         cfg: The shared self-play scalars (``core.runconfig.SelfPlayConfig``);
             ``root_noise`` False disables the D7 hook entirely, and
             ``leaf_batch_size`` bounds the leaves per evaluation.
