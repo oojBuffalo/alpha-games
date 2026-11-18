@@ -1328,7 +1328,7 @@ def test_window_is_cuda_is_read_from_the_segment_the_window_ran_in(tmp_path):
     assert window.is_cuda is False
 
 
-@pytest.mark.parametrize("relaunch_at", [25.0, 50.0])
+@pytest.mark.parametrize("relaunch_at", [20.0, 25.0, 50.0])  # 20, 50: the boundary ties
 def test_window_spanning_a_relaunch_is_insufficient(tmp_path, relaunch_at):
     """Downtime between two launches must not dilute one window's wall-clock rates."""
     _every_series_run(tmp_path)  # the window is (20, 50]
@@ -1385,6 +1385,13 @@ def test_window_marks_a_partial_game_flush_insufficient_never_averaged(tmp_path)
     ):
         assert getattr(window, name) is None, name
         assert window.unavailable[name] == WINDOW_INCOMPLETE_FLUSH, name
+
+
+def test_window_whose_start_a_missing_warm_up_stored_count_could_move_is_insufficient(tmp_path):
+    """Game 1's flush lacks positions_stored, so the replay warm-up would be reached a game late."""
+    _seven_games_with(tmp_path, 1, omit=("positions_stored",))
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+    _assert_insufficient(window, WINDOW_INCOMPLETE_FLUSH)
 
 
 def test_window_marks_batch_buckets_that_miss_their_batches_insufficient(tmp_path):

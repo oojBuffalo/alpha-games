@@ -773,8 +773,10 @@ def reduce_run(run_dir: Path | str) -> ReducedRun:
 WINDOW_BOUND_BY_WARMUP_GAMES = "warmup_games"
 WINDOW_BOUND_BY_REPLAY_WARMUP = "replay_warmup_positions"
 
-# Insufficient-data reasons. The first three are window-level
+# Insufficient-data reasons. The first four are window-level
 # (``WindowedRun.reason``): no window exists, so no field holds a number.
+# ``WINDOW_INCOMPLETE_FLUSH`` is both: window-level when a flush at or before
+# the start is incomplete, per-field when one inside the window is.
 WINDOW_TOO_FEW_GAMES = "too_few_games_for_window"
 WINDOW_REPLAY_WARMUP_NOT_REACHED = "replay_warmup_positions_not_reached"
 WINDOW_ZERO_SPAN = "zero_span_window"
@@ -834,9 +836,13 @@ class WindowedRun:
             the start), :data:`WINDOW_REPLAY_WARMUP_NOT_REACHED` (cumulative
             stored positions never reached the threshold),
             :data:`WINDOW_ZERO_SPAN` (the start and the end carry one
-            timestamp) or :data:`WINDOW_SPANS_RELAUNCH` (a ``segment_start``
-            falls after the start and at or before the end: the span would
-            include the time between two launches) -- and every measurement
+            timestamp), :data:`WINDOW_SPANS_RELAUNCH` (a ``segment_start``
+            is stamped at or after the start and at or before the end: the
+            span would include the time between two launches; a tie with
+            either boundary counts, its order being ambiguous) or
+            :data:`WINDOW_INCOMPLETE_FLUSH` (a game flush at or before the
+            start lacks its ``positions_stored`` delta while others carry
+            one, so the start itself is in doubt) -- and every measurement
             is ``None``.
         unavailable: ``{field name: reason}`` for every measurement that is
             ``None``. Under a window-level verdict, every measurement mapped
@@ -1195,8 +1201,10 @@ def reduce_window(
     the start flush through the end flush are the window's games; a game is
     placed by its run-wide ordinal, so one that shares the start's timestamp
     but is ordered after it is inside. A window must lie inside one launch:
-    a ``segment_start`` after the start flush and at or before the end flush
-    gives :data:`WINDOW_SPANS_RELAUNCH`.
+    a ``segment_start`` stamped from the start flush's timestamp through the
+    end flush's gives :data:`WINDOW_SPANS_RELAUNCH`. A flush at or before
+    the start that lacks its ``positions_stored`` delta could have moved the
+    start, and gives :data:`WINDOW_INCOMPLETE_FLUSH` for the whole window.
 
     **Aggregation rules.** A summed (``delta``) field adds the window's
     games' flushes, whole. A flush is stamped when its game finishes, so a
@@ -1258,6 +1266,10 @@ def reduce_window(
     )
     if start is None:
         return _insufficient_window(binding)
+    # A flush missing its stored count at or before the start could have
+    # moved the start: the replay warm-up would then be read short.
+    if SERIES_POSITIONS_STORED in _incomplete_series([d for _ts, d in flushes[: start + 1]]):
+        return _insufficient_window(WINDOW_INCOMPLETE_FLUSH)
     target = cumulative_games[start] + measure_games
     end = next((i for i in range(start + 1, len(flushes)) if cumulative_games[i] >= target), None)
     if end is None:
@@ -1267,7 +1279,7 @@ def reduce_window(
     if span <= 0:
         return _insufficient_window(WINDOW_ZERO_SPAN)
     if any(
-        window_start < ts <= window_end and rec.get("kind") == KIND_SEGMENT_START
+        window_start <= ts <= window_end and rec.get("kind") == KIND_SEGMENT_START
         for ts, _proc, _seq, rec in ordered
     ):
         return _insufficient_window(WINDOW_SPANS_RELAUNCH)
