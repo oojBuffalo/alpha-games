@@ -80,14 +80,20 @@ Every game, in either shape, flushes ``positions_played`` and
 published. They differ only under playout-cap randomization, where the fast
 tier's positions are dropped (D12). With them goes
 ``consecutive_mover_transitions``, the game's count of plies whose mover
-also made the ply before: the actor persists no move sequence, and a shard
-with dropped plies cannot show a blocked skip, so this counter is the only
-durable record of one.
+also made the ply before, counted over the complete played sequence. A
+shard keeps each stored sample's ply and mover, so it still shows a skip
+whose two plies were both stored; a skip next to a dropped ply is recorded
+only by this counter, the one complete count of them.
 
 **The shard is published before the metrics are flushed.** A crash between
 the two leaves a durable game that no counter records, so the counters can
-under-count the shards but never over-count them; ``positions_stored`` is
-exact for every game that did flush.
+under-count the shards but never over-count them. A game's series are
+appended as one group in a single synced write
+(:meth:`~core.metrics.EpochMetricsWriter.append_many`), never one synced
+record at a time, so no failure between two of its records can leave the
+group's first records durable without the rest: the played/stored/tier
+identities hold over every game that flushed, and ``positions_stored`` is
+exact for each of them.
 """
 
 from __future__ import annotations
@@ -468,30 +474,24 @@ class ActorDriver:
         if self.metrics_writer is None:
             return
         now = time.time()
-        self.metrics_writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=now))
-        self.metrics_writer.append(delta_record(SERIES_SIMS_RUN, result.sims_run, timestamp=now))
-        self.metrics_writer.append(
-            delta_record(SERIES_POSITIONS_PLAYED, result.positions_played, timestamp=now)
-        )
-        self.metrics_writer.append(
-            delta_record(SERIES_POSITIONS_STORED, result.positions_stored, timestamp=now)
-        )
-        self.metrics_writer.append(
-            delta_record(
-                SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
-                result.consecutive_mover_transitions,
-                timestamp=now,
-            )
-        )
+        values = [
+            (SERIES_GAMES_COMPLETED, 1),
+            (SERIES_SIMS_RUN, result.sims_run),
+            (SERIES_POSITIONS_PLAYED, result.positions_played),
+            (SERIES_POSITIONS_STORED, result.positions_stored),
+            (SERIES_CONSECUTIVE_MOVER_TRANSITIONS, result.consecutive_mover_transitions),
+        ]
         tier_counts = dict(result.tier_counts)
-        for tier, series in _TIER_SERIES.items():
-            if tier in tier_counts:
-                self.metrics_writer.append(delta_record(series, tier_counts[tier], timestamp=now))
+        values += [
+            (series, tier_counts[tier])
+            for tier, series in _TIER_SERIES.items()
+            if tier in tier_counts
+        ]
         if self.position_counter is not None:
-            positions = self.position_counter.drain()
-            self.metrics_writer.append(
-                delta_record(SERIES_POSITIONS_EVALUATED, positions, timestamp=now)
-            )
+            values.append((SERIES_POSITIONS_EVALUATED, self.position_counter.drain()))
         if self.batch_counter is not None:
-            for series, value in self.batch_counter.drain().items():
-                self.metrics_writer.append(delta_record(series, value, timestamp=now))
+            values += self.batch_counter.drain().items()
+        # One write and one fsync for the whole group, never a durable prefix of it.
+        self.metrics_writer.append_many(
+            delta_record(series, value, timestamp=now) for series, value in values
+        )

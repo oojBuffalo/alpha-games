@@ -453,6 +453,12 @@ BUDGET = {"full": 512, "mid": 256, "fast": 64}
 
 @pytest.mark.parametrize("game", [TTT, MICRO], ids=["tictactoe-no-aux", "blokus-micro-with-aux"])
 def test_a_scripted_tier_sequence_stores_exactly_the_stored_tier_plies(game, searched):
+    """A scripted tier sequence stores only its full and mid plies, each one whole.
+
+    Args:
+        game: The adapter played, one without and one with aux targets.
+        searched: The fixture recording each ply's search budget.
+    """
     result = play_game(game, None, d6_cfg(), _scripted(SCRIPT))
 
     tiers = (("full", "full") + SCRIPT)[: result.plies]
@@ -576,6 +582,7 @@ def test_the_drop_only_filters_the_games_the_all_stored_loop_played(leaf_batch_s
 
 
 def test_played_and_stored_positions_reconcile_with_the_tier_counts_per_game():
+    """Per game, stored = full + mid samples and played = stored + fast plies."""
     results = _d6_golden_games(1)
     for result in results:
         counts = Counter(dict(result.tier_counts))
@@ -626,6 +633,13 @@ def _chain_game() -> PassGame:
     ids=["pcr-off", "all-mid", "all-fast", "mid-fast", "fast-mid"],
 )
 def test_transitions_are_counted_over_the_played_sequence_whatever_was_dropped(tiers, stored_pairs):
+    """The transition count is the played sequence's, whatever tiers were dropped.
+
+    Args:
+        tiers: The scripted tiers for plies 2 onward, or ``None`` to play with
+            playout-cap randomization off.
+        stored_pairs: How many adjacent stored samples share a mover.
+    """
     game = _chain_game()
     if tiers is None:
         result = play_game(game, None, fixed_cfg(), GameRNGs.for_actor_game(*D6_GAME))
@@ -641,12 +655,14 @@ def test_transitions_are_counted_over_the_played_sequence_whatever_was_dropped(t
 
 
 def test_a_forced_consecutive_move_is_one_transition():
+    """A forced blocked skip counts exactly one transition."""
     result = play_game(consecutive_trap_game(), None, d6_cfg(), GameRNGs.for_actor_game(*D6_GAME))
     assert [sample.mover for sample in result.samples] == [0, 0]
     assert result.consecutive_mover_transitions == 1
 
 
 def test_a_strictly_alternating_game_has_no_transitions():
+    """Strictly alternating D6 games count zero transitions despite their drops."""
     results = _d6_golden_games(1)
     assert all(result.positions_stored < result.positions_played for result in results)
     assert [result.consecutive_mover_transitions for result in results] == [0] * len(results)
