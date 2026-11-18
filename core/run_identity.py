@@ -195,14 +195,21 @@ class UnclassifiedFieldError(Exception):
 class MaterialConfigDiffError(ValueError):
     """Raised by :func:`resolve_resume` when the passed config differs materially.
 
+    Args:
+        material: The offending fields, dotted path -> ``(stored, new)``.
+        detail: Optional guidance appended to the message, for a field the
+            launch config cannot change (one :func:`resolve_resume` derives
+            from the run's provenance rather than reads from a config).
+
     Attributes:
         material: The offending fields, dotted path -> ``(stored, new)``.
     """
 
-    def __init__(self, material: Mapping[str, tuple[Any, Any]]) -> None:
+    def __init__(self, material: Mapping[str, tuple[Any, Any]], detail: str | None = None) -> None:
         self.material = dict(material)
         fields = ", ".join(sorted(self.material))
-        super().__init__(f"resume refused: material config field(s) differ: {fields}")
+        message = f"resume refused: material config field(s) differ: {fields}"
+        super().__init__(f"{message}. {detail}" if detail else message)
 
 
 def device_kind(device: str) -> str:
@@ -1017,13 +1024,20 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
     # A playout-cap run recorded before D12 stored its fast-tier positions;
     # resuming it here would mix both storage policies in one replay window.
     # A fixed-tier run stores every ply under either policy.
+    detail = None
     if (
         stored.run.self_play.playout_cap_randomization
         and record.storage_policy != STORAGE_POLICY_D12_DROP
     ):
         material["self_play.storage_policy"] = (record.storage_policy, STORAGE_POLICY_D12_DROP)
+        detail = (
+            "self_play.storage_policy is not a config field: this playout-cap run was "
+            "recorded before the D12 drop, so its shards hold fast-tier positions this "
+            "code no longer stores. Continue it as a new run with --fork-from "
+            f"{root} instead of --resume"
+        )
     if material:
-        raise MaterialConfigDiffError(material)
+        raise MaterialConfigDiffError(material, detail)
     return ResumeResolution(
         run_id=record.run_id,
         run_root=root,
