@@ -20,9 +20,13 @@ construction: :class:`EpochMetricsWriter` picks the next unused epoch for
 instance (a process restart, by definition) always opens a brand-new file
 rather than reopening a stale one.
 
-**Records are flat JSON, one per line, durable before the call returns.**
-:meth:`EpochMetricsWriter.append` opens the file in append mode, writes one
-``json.dumps`` line, and ``flush``\\ es + ``fsync``\\ s before returning --
+**Records are flat JSON, newline-terminated lines, durable before the call
+returns.** A line is either one record (:meth:`EpochMetricsWriter.append`) or
+a JSON array of records written together as one group
+(:meth:`EpochMetricsWriter.append_many`; :func:`parse_metrics_line` expands
+either form). A line is readable only once its newline is on disk: a final
+line without one is a write still in progress or cut short, and every reader
+skips it. Each call writes its line and ``fsync``\\ s before returning --
 not the temp-name-then-``os.replace`` whole-file pattern
 ``core.replay_shard``/``core.checkpoint`` use for *replaceable* artifacts,
 because an append-only log is never replaced, only grown; the durability
@@ -151,6 +155,25 @@ def list_procs(run_dir: Path | str) -> frozenset[str]:
     return frozenset(procs)
 
 
+def parse_metrics_line(line: str | bytes) -> list[dict[str, Any]]:
+    """Parse one complete metrics line into its records.
+
+    A line is either one record (:meth:`EpochMetricsWriter.append`) or a JSON
+    array of records written as one group (:meth:`EpochMetricsWriter.append_many`).
+
+    Args:
+        line: One newline-free line of an epoch file.
+
+    Returns:
+        The line's records, in order.
+
+    Raises:
+        ValueError: If the line is not valid JSON.
+    """
+    parsed = json.loads(line)
+    return parsed if isinstance(parsed, list) else [parsed]
+
+
 def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any]]:
     """Yield every record ``proc`` has ever durably appended, across all epochs.
 
@@ -164,6 +187,10 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
     Args:
         run_dir: The run's root directory.
         proc: The process name.
+
+    A line holding a JSON array is one :meth:`EpochMetricsWriter.append_many`
+    group and yields its records in order. A final line with no newline is an
+    incomplete write (still in progress, or cut short) and is skipped.
 
     Yields:
         Each record, parsed from JSON, oldest first.
@@ -179,9 +206,11 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         if m is not None and m.group("proc") == proc:
             epoch_files.append((int(m.group("epoch")), p))
     for _, path in sorted(epoch_files):
-        for line in path.read_text().splitlines():
+        # The last split element is "" after a complete final line, or the
+        # unterminated tail of an incomplete write: either way, not a record.
+        for line in path.read_text().split("\n")[:-1]:
             if line.strip():
-                yield json.loads(line)
+                yield from parse_metrics_line(line)
 
 
 class EpochMetricsWriter:
@@ -216,35 +245,55 @@ class EpochMetricsWriter:
         Args:
             record: A flat, JSON-serializable mapping. Copied, not mutated.
         """
-        self.append_many([record])
+        self._write_line(json.dumps(dict(record), sort_keys=True))
 
     def append_many(self, records: Iterable[Mapping[str, Any]]) -> None:
-        """Append several records in one write, durable before returning.
+        """Append several records as one line, durable before returning.
 
-        The group is written and synced as one unit, so a reader never
-        sees only some of a group's records (records that are only meaningful
-        together, such as one game's counters). If the write fails part-way
-        (a short write on a full disk or a file-size limit), the file is
-        truncated back to its size before the call and the error re-raised,
-        so no partial group or torn line is left behind.
+        The group is one JSON array on one line, so a reader sees all of it or
+        none of it (records that are only meaningful together, such as one
+        game's counters): :func:`iter_epoch_records` expands a complete array
+        and ignores a final line with no newline -- what a short write, or a
+        process killed during one, leaves behind, and what a concurrent reader
+        sees mid-write.
 
         Args:
             records: Flat, JSON-serializable mappings. Copied, not mutated.
 
         Raises:
-            OSError: If the write or ``fsync`` fails; the file is unchanged.
+            OSError: If the write fails (the file is unchanged) or the
+                ``fsync`` fails (the complete line stays, unsynced).
         """
-        data = "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records)
-        view = memoryview(data.encode("utf-8"))
+        self._write_line(json.dumps([dict(record) for record in records], sort_keys=True))
+
+    def _write_line(self, line: str) -> None:
+        """Append one newline-terminated line, durable before returning.
+
+        If the write fails part-way (a short write on a full disk or a
+        file-size limit), the file is truncated back to its size before the
+        call and the error re-raised, so no torn line is left behind. Once the
+        complete line is written it is visible to readers and is kept: an
+        ``fsync`` failure is re-raised without removing it.
+
+        Args:
+            line: The line, without its newline.
+
+        Raises:
+            OSError: If the write fails (the file is unchanged) or the
+                ``fsync`` fails (the complete line stays, unsynced).
+        """
+        view = memoryview((line + "\n").encode("utf-8"))
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
         try:
             start = os.lseek(fd, 0, os.SEEK_END)
             try:
                 while view:
                     view = view[os.write(fd, view) :]
-                os.fsync(fd)
             except BaseException:
                 os.ftruncate(fd, start)
                 raise
+            # Not rolled back on failure: the complete line may already have
+            # been read by an incremental reader (core.eval_run's metrics tail).
+            os.fsync(fd)
         finally:
             os.close(fd)

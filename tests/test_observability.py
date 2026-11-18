@@ -680,13 +680,17 @@ def test_a_failed_group_append_leaves_no_partial_group(tmp_path, monkeypatch):
     writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
     before = writer.path.read_bytes()
     real_write = os.write
-    calls = []
+    calls, seen_mid_write = [], []
 
     def short_then_full(fd, data):
-        """Really write all but the last 10 bytes once, then fail as a full file does."""
+        """Really write all but the last 10 bytes once, then fail as a full file does.
+
+        Between the two, a concurrent reader snapshots the run.
+        """
         calls.append(len(data))
         if len(calls) == 1:
-            return real_write(fd, bytes(data[:-10]))  # ends mid-line
+            return real_write(fd, bytes(data[:-10]))  # ends mid-group
+        seen_mid_write.append(dict(reduce_run(tmp_path).totals))
         raise OSError(errno.EFBIG, "File too large")
 
     monkeypatch.setattr(metrics_module.os, "write", short_then_full)
@@ -700,5 +704,35 @@ def test_a_failed_group_append_leaves_no_partial_group(tmp_path, monkeypatch):
     monkeypatch.undo()
 
     assert len(calls) == 2  # the prefix really reached the file before the failure
+    # The partial group was invisible to the concurrent reader.
+    (mid,) = seen_mid_write
+    assert mid[SERIES_GAMES_COMPLETED] == 1 and mid[SERIES_POSITIONS_EVALUATED] == 0
+    assert mid.get(SERIES_INFERENCE_BATCHES, 0) == 0
     assert writer.path.read_bytes() == before
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1
+
+    # A writer killed after a short write never rolls back: the unterminated
+    # tail stays on disk, and is still not read as records.
+    writer.append_many(group)
+    complete = writer.path.read_bytes()
+    with open(writer.path, "ab") as fh:
+        fh.write(complete[len(before) : -10])
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_GAMES_COMPLETED] == 2  # the complete group, once
+    assert totals[SERIES_INFERENCE_BATCHES] == 10
+
+
+def test_an_fsync_failure_keeps_the_complete_line_readers_may_have_seen(tmp_path, monkeypatch):
+    """Rolling back an already-visible line would let a tail reader overcount."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+
+    def failing_fsync(fd):
+        """Fail as a device I/O error does, after the line is fully written."""
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(metrics_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="Input/output error"):
+        writer.append_many([delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0)])
+    monkeypatch.undo()
+
     assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1
