@@ -165,7 +165,8 @@ class SpikeResult:
     Attributes:
         games: Games completed in the measurement interval.
         plies: Plies played across those games.
-        sims: Simulations run across those games (``plies * sims_per_move``).
+        sims: Simulations run across those games: the sum of each measured
+            game's ``GameResult.sims_run``.
         net_evals: Leaf network evaluations counted by the wrapping evaluator.
         learner_steps: Learner steps taken inside the interval.
         legal_at_eval: Legal-set sizes seen at evaluated leaves, summed.
@@ -338,7 +339,8 @@ class RunMeta:
             hash — Invariant 4).
         warmup_games: Games discarded before measurement.
         measure_games: Games in the measurement interval.
-        sims: Micro sims/move during the spike.
+        sims: Micro sims/move during the spike (``self_play.sims``; :func:`main`
+            refuses a playout-cap config, so it is the fixed per-move budget).
         date: Run date, ``YYYY-MM-DD``.
     """
 
@@ -706,7 +708,7 @@ def run_spike(
         device=str(device),
     )
 
-    plies = net_evals = legal = amp_evals = measured_steps = 0
+    plies = sims = net_evals = legal = amp_evals = measured_steps = 0
     self_play_seconds = train_seconds = 0.0
     started = 0.0
     # The learner-step index is monotonic across warm-up and measurement — it
@@ -717,7 +719,7 @@ def run_spike(
         measuring = index >= warmup_games
         if index == warmup_games:
             # Discard everything the warm-up accumulated, then start the clock.
-            plies = net_evals = legal = amp_evals = measured_steps = 0
+            plies = sims = net_evals = legal = amp_evals = measured_steps = 0
             self_play_seconds = train_seconds = 0.0
             started = time.perf_counter()
 
@@ -755,6 +757,7 @@ def run_spike(
 
         if measuring:
             plies += result.plies
+            sims += result.sims_run
             net_evals += counters[0]
             legal += counters[1]
             amp_evals += counters[2]
@@ -773,7 +776,7 @@ def run_spike(
     return SpikeResult(
         games=measure_games,
         plies=plies,
-        sims=plies * cfg.self_play.sims,
+        sims=sims,
         net_evals=net_evals,
         learner_steps=measured_steps,
         legal_at_eval=legal,
@@ -1290,13 +1293,21 @@ def main(argv: list[str] | None = None) -> int:
 
     Raises:
         SystemExit: From :func:`require_official_hardware` when the hardware is
-            not the pinned 4060 Ti 16 GB and the opt-in flag is absent.
+            not the pinned 4060 Ti 16 GB and the opt-in flag is absent; or from
+            this function itself when the config turns playout-cap
+            randomization on (§12 M2.5 pins the spike to a fixed budget,
+            official or not).
         ValueError: From :func:`observed_amp` if the timed forwards and the
             leaf evaluations did not run at the same precision.
     """
     args = parse_args(argv)
     official, device = require_official_hardware(args.allow_unverified_hardware)
     cfg = load_run_config(args.config)
+    if cfg.self_play.playout_cap_randomization:
+        raise SystemExit(
+            "the M2.5 spike is pinned to fixed-budget self-play (§12 M2.5: no PCR); "
+            f"{args.config} turns playout-cap randomization on"
+        )
     warmup_games = (
         args.warmup_games if args.warmup_games is not None else cfg.throughput.warmup_games
     )

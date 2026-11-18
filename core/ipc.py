@@ -424,8 +424,8 @@ def run_actor_process(
 
     Args:
         game_factory: Builds this process's adapter instance.
-        self_play: The D6 validate-tier self-play scalars
-            (``core.actor.validate_actor_self_play_config``).
+        self_play: The self-play scalars, in one of the two D6 shapes an
+            actor runs (``core.actor.validate_actor_self_play_config``).
         run_id: This run's identity (constant across every actor/the learner).
         actor_id: This actor's durable identity within the run.
         shard_dir: Directory this actor's shards and writer-state file
@@ -690,7 +690,8 @@ def launch_run(
         game_factory: Builds each process's own adapter instance (called
             once per process, not shared).
         run_config: The learner's full protocol.
-        self_play: Every actor's D6 validate-tier self-play scalars.
+        self_play: Every actor's self-play scalars, in one of the two D6
+            shapes an actor runs.
         run_id: This run's identity.
         num_actors: Number of actor processes to start. Ignored if
             ``actor_ids`` is given.

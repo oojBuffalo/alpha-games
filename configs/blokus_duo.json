@@ -6,13 +6,18 @@
   "game_config": "FULL_CONFIG",
 
   "self_play": {
-    "_doc": "D6 M3 validate tier: fixed 128 sims, no playout-cap randomization (core.actor.VALIDATE_TIER_SIMS). D10 k_temp = 8 (plies 0-7 sample ~N, argmax after). D7 root Dirichlet ε = 0.25, α-numerator 10.8 (alpha = 10.8 / #legal moves at the root). leaf_batch_size 1 = serial leaf inference, the recorded M3 configuration (section 12 M5 batches it).",
+    "_doc": "D6 M3 validate tier: fixed 128 sims, no playout-cap randomization (core.actor.VALIDATE_TIER_SIMS). D10 k_temp = 8 (plies 0-7 sample ~N, argmax after). D7 root Dirichlet ε = 0.25, α-numerator 10.8 (alpha = 10.8 / #legal moves at the root). leaf_batch_size 1 = serial leaf inference, the recorded M3 configuration (section 12 M5 batches it). playout_cap_randomization false = every ply searched at the fixed sims; the four pcr_* scalars are the D6 schedule (plies 0-1 at sims; plies >= 2: mid 256 with probability 0.25, else fast 64), inert while the flag is off. With the flag on, sims is the always-full tier (512 at D6).",
     "sims": 128,
     "k_temp": 8,
     "dirichlet_eps": 0.25,
     "dirichlet_alpha_numerator": 10.8,
     "root_noise": true,
-    "leaf_batch_size": 1
+    "leaf_batch_size": 1,
+    "playout_cap_randomization": false,
+    "pcr_mid_sims": 256,
+    "pcr_fast_sims": 64,
+    "pcr_mid_probability": 0.25,
+    "pcr_full_plies": 2
   },
 
   "training": {
@@ -66,7 +71,7 @@
 
   "num_actors": 4,
   "device": "cuda",
-  "schema_version": 2,
+  "schema_version": 3,
   "runtime": {
     "refresh_poll_interval": 1.0,
     "pacing_poll_interval": 1.0,

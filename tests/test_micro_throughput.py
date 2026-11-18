@@ -27,6 +27,7 @@ exactly the mechanical part of the gate:
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import subprocess
 import sys
@@ -522,6 +523,43 @@ def test_run_spike_evaluates_leaves_under_the_runs_amp_setting():
     assert off.amp is False  # ...and a disabled mode really is a no-op
 
 
+def test_run_spike_sums_each_measured_games_own_simulations(monkeypatch):
+    """Under playout-cap randomization ``plies * sims`` is not the count searched.
+
+    One warm-up game and two measured ones: the total is the measured games'
+    drawn budgets, summed -- not the last game's, and not the warm-up's too.
+    """
+    import dataclasses
+
+    from core.runconfig import MICRO_RUN_CONFIG_PATH, load_run_config
+    from core.seeding import GameRNGs
+    from core.selfplay import draw_tier
+
+    base = load_run_config(MICRO_RUN_CONFIG_PATH)
+    self_play = dataclasses.replace(
+        base.self_play, playout_cap_randomization=True, sims=12, pcr_mid_sims=6, pcr_fast_sims=2
+    )
+    cfg = dataclasses.replace(base, self_play=self_play)
+    played = []
+    play_game = BENCH.play_game
+    monkeypatch.setattr(
+        BENCH, "play_game", lambda *a, **kw: played.append(play_game(*a, **kw)) or played[-1]
+    )
+    cpu = torch.device("cpu")
+    spike = BENCH.run_spike(
+        cfg, BENCH.build_game(cfg), cpu, 1, 2, BENCH.AmpMode("cpu", False), verbose=False
+    )
+
+    def drawn(index: int) -> int:
+        """Sum game ``index``'s budgets, redrawn from its own tier stream."""
+        tier_rng = GameRNGs.for_game(cfg.run_seed, index).pcr_tier
+        plies = range(played[index].plies)
+        return sum(draw_tier(self_play, ply, tier_rng).sims for ply in plies)
+
+    assert len(played) == 3 and spike.plies == played[1].plies + played[2].plies
+    assert spike.sims == drawn(1) + drawn(2) != spike.plies * self_play.sims
+
+
 # --- main's assembly: metadata provenance and persisted evidence ----------------
 
 
@@ -631,3 +669,30 @@ def test_resolve_out_path_defaults_only_official_runs(monkeypatch, tmp_path):
     explicit = tmp_path / "elsewhere.md"
     assert BENCH.resolve_out_path(explicit, official=True) == explicit
     assert BENCH.resolve_out_path(explicit, official=False) == explicit
+
+
+@pytest.mark.parametrize("official", [True, False])
+def test_main_refuses_a_playout_cap_config(monkeypatch, tmp_path, official):
+    """§12 M2.5 pins the spike to a fixed budget: a PCR config never reaches a verdict."""
+    real_load = BENCH.load_run_config
+
+    def load_pcr(path):
+        """Load ``path`` through the real parser and switch it to the D6 budget.
+
+        Args:
+            path: The config path ``main`` passes.
+
+        Returns:
+            The parsed config with playout-cap randomization on and ``sims`` 512.
+        """
+        cfg = real_load(path)
+        return dataclasses.replace(
+            cfg,
+            self_play=dataclasses.replace(cfg.self_play, playout_cap_randomization=True, sims=512),
+        )
+
+    monkeypatch.setattr(BENCH, "load_run_config", load_pcr)
+    argv = [] if official else ["--allow-unverified-hardware"]
+    with pytest.raises(SystemExit, match="no PCR"):
+        drive_main(monkeypatch, tmp_path, official=official, argv=argv)
+    assert list(tmp_path.rglob("*")) == []  # no report, signed or provisional
