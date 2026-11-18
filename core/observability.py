@@ -778,11 +778,40 @@ WINDOW_BOUND_BY_REPLAY_WARMUP = "replay_warmup_positions"
 WINDOW_TOO_FEW_GAMES = "too_few_games_for_window"
 WINDOW_REPLAY_WARMUP_NOT_REACHED = "replay_warmup_positions_not_reached"
 WINDOW_ZERO_SPAN = "zero_span_window"
+WINDOW_SPANS_RELAUNCH = "window_spans_relaunch"
 # The rest are per-field (``WindowedRun.unavailable``), inside a sound window.
 WINDOW_FEWER_THAN_TWO_RECORDS = "fewer_than_two_records"
 WINDOW_NO_RECORD = "no_record"
 WINDOW_ZERO_DENOMINATOR = "zero_denominator"
 WINDOW_TOTAL_DECREASED = "total_decreased"
+WINDOW_INCOMPLETE_FLUSH = "incomplete_game_flush"
+
+# The delta series an actor writes for every finished game (``core.actor``).
+_ALWAYS_FLUSHED_SERIES = (
+    SERIES_SIMS_RUN,
+    SERIES_POSITIONS_PLAYED,
+    SERIES_POSITIONS_STORED,
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
+)
+_TIER_SERIES = (SERIES_MOVES_FULL_512, SERIES_MOVES_MID_256, SERIES_MOVES_FAST_64)
+_TIER_FIELDS = ("moves_full_512", "moves_mid_256", "moves_fast_64", "mid_tier_fraction")
+_BATCH_FIELDS = (
+    "inference_batches",
+    "inference_batch_sizes",
+    "mean_batch_fill",
+    "batch_fill_percentiles",
+)
+# The ``WindowedRun`` fields each flushed series feeds; ``"tiers"`` stands for
+# the three playout-cap tier series together.
+_FIELDS_OF_SERIES = {
+    SERIES_SIMS_RUN: ("sims_per_sec",),
+    SERIES_POSITIONS_PLAYED: ("played_positions_per_game",),
+    SERIES_POSITIONS_STORED: ("stored_positions_per_hour", "stored_positions_per_game"),
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS: ("consecutive_mover_transitions",),
+    SERIES_POSITIONS_EVALUATED: ("net_evals_per_sec", "mean_batch_fill"),
+    SERIES_INFERENCE_BATCHES: _BATCH_FIELDS,
+    "tiers": _TIER_FIELDS,
+}
 
 # The percentiles of forward-pass size ``WindowedRun.batch_fill_percentiles`` reports.
 WINDOW_BATCH_FILL_PERCENTILES = (10, 50, 90)
@@ -803,9 +832,12 @@ class WindowedRun:
             :data:`WINDOW_TOO_FEW_GAMES` (the warm-up game count was never
             reached, or fewer than ``measure_games`` games completed after
             the start), :data:`WINDOW_REPLAY_WARMUP_NOT_REACHED` (cumulative
-            stored positions never reached the threshold) or
+            stored positions never reached the threshold),
             :data:`WINDOW_ZERO_SPAN` (the start and the end carry one
-            timestamp) -- and every measurement is ``None``.
+            timestamp) or :data:`WINDOW_SPANS_RELAUNCH` (a ``segment_start``
+            falls after the start and at or before the end: the span would
+            include the time between two launches) -- and every measurement
+            is ``None``.
         unavailable: ``{field name: reason}`` for every measurement that is
             ``None``. Under a window-level verdict, every measurement mapped
             to :attr:`reason`. Inside a sound window, the per-field reasons:
@@ -817,8 +849,11 @@ class WindowedRun:
             endpoint readings its difference needs do not exist),
             :data:`WINDOW_TOTAL_DECREASED` (the ``learner_step`` total went
             backwards inside the window, so no endpoint difference counts
-            its steps) and :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose
-            series are present but whose denominator summed to zero).
+            its steps), :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose
+            series are present but whose denominator summed to zero) and
+            :data:`WINDOW_INCOMPLETE_FLUSH` (a game flush in the window lacks
+            or under-records a series the field is built from -- a flush read
+            mid-write or cut short by a crash; ``_incomplete_series``).
         window_start: Timestamp of the start flush (:func:`reduce_window`).
         window_end: Timestamp of the end flush.
         start_game_ordinal: Run-wide cumulative ``games_completed`` through
@@ -890,7 +925,8 @@ class WindowedRun:
             record reading otherwise makes it ``False``.
         is_cuda: The ``is_cuda`` field of the last ``segment_start`` record
             at or before ``window_end``: whether the launch the window ran
-            in had a real CUDA device.
+            in had a real CUDA device. A window lies inside one launch
+            (:data:`WINDOW_SPANS_RELAUNCH`), so that record covers all of it.
     """
 
     reason: str | None
@@ -955,6 +991,48 @@ def _game_flushes(
         deltas = flushes[-1][1]
         deltas[series] = deltas.get(series, 0) + rec["value"]
     return flushes
+
+
+def _incomplete_series(window: list[dict[str, Any]]) -> set[str]:
+    """Return the series a window's game flushes do not wholly record.
+
+    An actor appends a game's records one at a time, ``games_completed``
+    first (``core.actor``), so a flush read mid-write, or cut short by a
+    crash, counts its game but lacks later series. Such a flush is detected
+    from what complete flushes must hold: each of ``_ALWAYS_FLUSHED_SERIES``,
+    ``positions_evaluated``, ``inference_batches`` and the tier series is in
+    every flush of the window or in none (a series in none has no record,
+    which is reported as such, not as incomplete); size buckets sum to
+    ``inference_batches``; tier counts sum to ``positions_played``.
+
+    Args:
+        window: The per-series deltas of each game flush in the window.
+
+    Returns:
+        The series (``"tiers"`` for the tier series together) whose window
+        sums are not supported, each a key of ``_FIELDS_OF_SERIES``.
+    """
+    present = {
+        series: [series in d for d in window]
+        for series in (
+            *_ALWAYS_FLUSHED_SERIES,
+            SERIES_POSITIONS_EVALUATED,
+            SERIES_INFERENCE_BATCHES,
+        )
+    }
+    present["tiers"] = [any(series in d for series in _TIER_SERIES) for d in window]
+    incomplete = {series for series, flags in present.items() if any(flags) != all(flags)}
+    for d in window:
+        batches = d.get(SERIES_INFERENCE_BATCHES)
+        if batches is not None and batches != sum(
+            d.get(series, 0) for series in _INFERENCE_BATCH_SIZE_SERIES
+        ):
+            incomplete.add(SERIES_INFERENCE_BATCHES)
+        if any(series in d for series in _TIER_SERIES) and d.get(SERIES_POSITIONS_PLAYED) != sum(
+            d.get(series, 0) for series in _TIER_SERIES
+        ):
+            incomplete.add("tiers")
+    return incomplete
 
 
 def _window_start(
@@ -1101,6 +1179,13 @@ def reduce_window(
     returns measurements and data-sufficiency verdicts only -- no floor, no
     pass or fail.
 
+    **Scope.** This reads a bounded spike run's metrics (``--spike-games``).
+    It is not §9 pin 11's paired OFF/ON A/B: that protocol times each arm on
+    a monotonic clock from the final warm-up completion, while this reads
+    the records' wall-clock (``time.time``) timestamps and its start can be
+    moved past the warm-up games by the replay warm-up. Its output is not
+    pin-11 evidence.
+
     **The window.** Run-wide: every actor's finished games, merged in the
     pinned record order, each game one flush (:func:`_game_flushes`). It
     starts at the later of two conditions (:func:`_window_start`) and ends at
@@ -1109,7 +1194,9 @@ def reduce_window(
     are read on one clock, the metrics records' timestamps. The games after
     the start flush through the end flush are the window's games; a game is
     placed by its run-wide ordinal, so one that shares the start's timestamp
-    but is ordered after it is inside.
+    but is ordered after it is inside. A window must lie inside one launch:
+    a ``segment_start`` after the start flush and at or before the end flush
+    gives :data:`WINDOW_SPANS_RELAUNCH`.
 
     **Aggregation rules.** A summed (``delta``) field adds the window's
     games' flushes, whole. A flush is stamped when its game finishes, so a
@@ -1125,7 +1212,8 @@ def reduce_window(
     **Insufficient data is an explicit verdict.** A window that cannot be
     formed returns a named :attr:`WindowedRun.reason` and no number; a field
     whose own series cannot support it is ``None`` with its reason in
-    :attr:`WindowedRun.unavailable`.
+    :attr:`WindowedRun.unavailable`; that includes a field fed by a game
+    flush that is only partly written (:data:`WINDOW_INCOMPLETE_FLUSH`).
 
     Args:
         run_dir: The run's root directory (``core.metrics.metrics_dir``).
@@ -1178,6 +1266,11 @@ def reduce_window(
     span = window_end - window_start
     if span <= 0:
         return _insufficient_window(WINDOW_ZERO_SPAN)
+    if any(
+        window_start < ts <= window_end and rec.get("kind") == KIND_SEGMENT_START
+        for ts, _proc, _seq, rec in ordered
+    ):
+        return _insufficient_window(WINDOW_SPANS_RELAUNCH)
 
     sums: dict[str, Any] = {}
     for _ts, deltas in flushes[start + 1 : end + 1]:
@@ -1212,9 +1305,8 @@ def reduce_window(
     )
     learner_steps = None if step_at_start is None or steps_decreased else steps[-1] - steps[0]
 
-    tiers = (SERIES_MOVES_FULL_512, SERIES_MOVES_MID_256, SERIES_MOVES_FAST_64)
-    has_tiers = any(series in sums for series in tiers)
-    full, mid, fast = (sums.get(series, 0) if has_tiers else None for series in tiers)
+    has_tiers = any(series in sums for series in _TIER_SERIES)
+    full, mid, fast = (sums.get(series, 0) if has_tiers else None for series in _TIER_SERIES)
     batches = sums.get(SERIES_INFERENCE_BATCHES)
     sizes = (
         None
@@ -1270,6 +1362,10 @@ def reduce_window(
         reasons["batch_fill_percentiles"] = WINDOW_ZERO_DENOMINATOR
         if SERIES_POSITIONS_EVALUATED in sums:
             reasons["mean_batch_fill"] = WINDOW_ZERO_DENOMINATOR
+    for series in _incomplete_series([deltas for _ts, deltas in flushes[start + 1 : end + 1]]):
+        for name in _FIELDS_OF_SERIES[series]:
+            values[name] = None
+            reasons[name] = WINDOW_INCOMPLETE_FLUSH
     unavailable = {
         name: reasons.get(name, WINDOW_NO_RECORD) for name, value in values.items() if value is None
     }

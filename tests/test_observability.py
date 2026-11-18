@@ -48,8 +48,10 @@ from core.observability import (
     WINDOW_BOUND_BY_REPLAY_WARMUP,
     WINDOW_BOUND_BY_WARMUP_GAMES,
     WINDOW_FEWER_THAN_TWO_RECORDS,
+    WINDOW_INCOMPLETE_FLUSH,
     WINDOW_NO_RECORD,
     WINDOW_REPLAY_WARMUP_NOT_REACHED,
+    WINDOW_SPANS_RELAUNCH,
     WINDOW_TOO_FEW_GAMES,
     WINDOW_TOTAL_DECREASED,
     WINDOW_ZERO_DENOMINATOR,
@@ -1318,11 +1320,22 @@ def test_window_actor_amp_is_live_only_if_every_actor_record_through_the_window_
 
 
 def test_window_is_cuda_is_read_from_the_segment_the_window_ran_in(tmp_path):
-    _every_series_run(tmp_path)  # opens a CUDA segment at t=0
+    _every_series_run(tmp_path)  # opens a CUDA segment at t=0; the window is (20, 50]
     orch = EpochMetricsWriter(tmp_path, "orchestrator")
-    orch.append(segment_start_record(device="cpu", timestamp=25.0))  # a CPU relaunch mid-window
+    orch.append(segment_start_record(device="cpu", timestamp=15.0))  # a CPU relaunch in warm-up
     window = reduce_window(tmp_path, warmup_games=2, measure_games=3, replay_warmup_positions=18)
+    assert window.reason is None
     assert window.is_cuda is False
+
+
+@pytest.mark.parametrize("relaunch_at", [25.0, 50.0])
+def test_window_spanning_a_relaunch_is_insufficient(tmp_path, relaunch_at):
+    """Downtime between two launches must not dilute one window's wall-clock rates."""
+    _every_series_run(tmp_path)  # the window is (20, 50]
+    orch = EpochMetricsWriter(tmp_path, "orchestrator")
+    orch.append(segment_start_record(device="cuda", timestamp=relaunch_at))
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=3, replay_warmup_positions=18)
+    _assert_insufficient(window, WINDOW_SPANS_RELAUNCH)
 
 
 def test_window_per_game_field_whose_series_is_absent_is_named_never_zero(tmp_path):
@@ -1337,6 +1350,62 @@ def test_window_per_game_field_whose_series_is_absent_is_named_never_zero(tmp_pa
     for name in fields:
         assert getattr(window, name) is None, name
         assert window.unavailable[name] == WINDOW_NO_RECORD, name
+
+
+def _seven_games_with(tmp_path, game, **flush_kwargs):
+    """:func:`_seven_games`, with ``flush_kwargs`` applied to run-wide game ``game`` only."""
+    actors = [EpochMetricsWriter(tmp_path, "actor-0"), EpochMetricsWriter(tmp_path, "actor-1")]
+    for k in range(1, 8):
+        base = {"evals": 50, "extra": [("inference_batches", 2), ("inference_batch_size_1", 2)]}
+        _flush_game(actors[k % 2], 10.0 * k, **(base | (flush_kwargs if k == game else {})))
+
+
+def test_window_marks_a_partial_game_flush_insufficient_never_averaged(tmp_path):
+    """A flush cut short after ``games_completed`` counts its game but lacks its other series."""
+    # The window is (40, 60]: games 5 and 6. Game 6's flush stops after sims_run.
+    _seven_games_with(
+        tmp_path,
+        6,
+        omit=("positions_played", "positions_stored", "positions_evaluated", "inference_batches"),
+    )
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.reason is None
+    assert window.games_in_window == 2
+    assert window.sims_per_sec == pytest.approx((100 + 100) / 20)
+    for name in (
+        "stored_positions_per_game",
+        "stored_positions_per_hour",
+        "played_positions_per_game",
+        "net_evals_per_sec",
+        "inference_batches",
+        "inference_batch_sizes",
+        "mean_batch_fill",
+        "batch_fill_percentiles",
+    ):
+        assert getattr(window, name) is None, name
+        assert window.unavailable[name] == WINDOW_INCOMPLETE_FLUSH, name
+
+
+def test_window_marks_batch_buckets_that_miss_their_batches_insufficient(tmp_path):
+    _seven_games_with(tmp_path, 5, extra=[("inference_batches", 2)])  # bucket record lost
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.net_evals_per_sec == pytest.approx(100 / 20)
+    for name in ("inference_batches", "inference_batch_sizes", "mean_batch_fill"):
+        assert window.unavailable[name] == WINDOW_INCOMPLETE_FLUSH, name
+
+
+def test_window_marks_tier_counts_that_miss_the_played_count_insufficient(tmp_path):
+    actors = [EpochMetricsWriter(tmp_path, "actor-0"), EpochMetricsWriter(tmp_path, "actor-1")]
+    for k in range(1, 8):
+        tiers = [("moves_full_512", 2), ("moves_mid_256", 3 if k != 5 else 0)]
+        _flush_game(actors[k % 2], 10.0 * k, extra=tiers)  # 5 played; game 5 short of its mid tier
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.played_positions_per_game == pytest.approx(5.0)
+    for name in ("moves_full_512", "moves_mid_256", "moves_fast_64", "mid_tier_fraction"):
+        assert window.unavailable[name] == WINDOW_INCOMPLETE_FLUSH, name
 
 
 def test_window_ignores_a_delta_that_belongs_to_no_finished_game(tmp_path):
