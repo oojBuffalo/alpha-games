@@ -596,18 +596,33 @@ def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwrit
         read_stored_config_document(root)
 
 
-def test_a_v1_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
-    """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
+def test_a_v1_cuda_run_refuses_resume_because_its_actors_ran_fp32(tmp_path):
+    """A v1 CUDA actor had no autocast; resuming it now would switch precision."""
     root = _v1_run_dir(tmp_path)
     live = load_launch_config(ROOT / "configs" / "blokus_duo.json")
+    assert live.device == "cuda" and live.run.self_play.leaf_batch_size == 1
+
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, live)
+    assert set(excinfo.value.material) == {"actor_inference_amp"}
+
+
+def test_a_v1_cpu_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
+    """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
+    root = _v1_run_dir(tmp_path)
+    doc = json.loads(V1_CONFIG_FIXTURE.read_text())
+    doc["device"] = "cpu"
+    (root / "config.json").write_text(json.dumps(doc))
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["device"] = "cpu"
+    live = LaunchConfig.from_dict(live_raw)
     assert live.run.self_play.leaf_batch_size == 1
 
     assert resolve_resume(root, live).effective_config == live
 
-    batched_raw = live.to_dict()
-    batched_raw["self_play"]["leaf_batch_size"] = 4
+    live_raw["self_play"]["leaf_batch_size"] = 4
     with pytest.raises(MaterialConfigDiffError) as excinfo:
-        resolve_resume(root, LaunchConfig.from_dict(batched_raw))
+        resolve_resume(root, LaunchConfig.from_dict(live_raw))
     assert set(excinfo.value.material) == {"self_play.leaf_batch_size"}
 
 
