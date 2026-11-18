@@ -728,8 +728,10 @@ def test_an_older_document_already_carrying_a_pcr_key_is_rejected_not_overwritte
 def test_a_fixed_sim_run_resumes_under_the_live_config_and_refuses_a_pcr_one(tmp_path, fixture):
     """An old fixed-sim run dir never continues under the D6 schedule.
 
-    Both sides run on CPU: a schema-v1 run is refused on CUDA before any
-    self-play field is compared (its actors ran float32).
+    Both sides run on CPU, which isolates the self-play differences: on CUDA
+    a schema-v1 run also differs in the material ``actor_inference_amp`` (its
+    actors ran float32), so even the matching fixed-sim baseline would not
+    resume there.
     """
     root = _v1_run_dir(tmp_path, fixture=fixture)
     doc = json.loads(fixture.read_text())
