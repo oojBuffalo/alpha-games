@@ -44,9 +44,9 @@ import torch
 
 from core.actor import ActorDriver
 from core.checkpoint import load_checkpoint, resume_path
-from core.ipc import DEFAULT_SHUTDOWN_GRACE_SECONDS, build_actor_refresh
+from core.ipc import DEFAULT_SHUTDOWN_GRACE_SECONDS, LaunchedRun, build_actor_refresh
 from core.learner import LearnerDriver
-from core.metrics import iter_epoch_records
+from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.network import NetworkConfig
 from core.observability import (
     KIND_SEGMENT_END,
@@ -54,6 +54,7 @@ from core.observability import (
     KIND_SPIKE_STOP,
     SERIES_GAMES_COMPLETED,
     SERIES_LEARNER_STEP,
+    delta_record,
     reduce_run,
     reduce_window,
 )
@@ -415,16 +416,27 @@ def _wait_bounded(launched, timeout: float) -> bool:
 
     Returns:
         Whether ``wait_for_completion`` returned within ``timeout``.
+
+    Raises:
+        BaseException: Whatever ``wait_for_completion`` raised, re-raised here.
     """
-    thread = threading.Thread(
-        target=rs.wait_for_completion, args=(launched,), kwargs={"poll_interval": 0.05}, daemon=True
-    )
+    raised: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            rs.wait_for_completion(launched, poll_interval=0.05)
+        except BaseException as exc:  # re-raised on the test thread below
+            raised.append(exc)
+
+    thread = threading.Thread(target=target, daemon=True)
     thread.start()
     thread.join(timeout)
     if thread.is_alive():
         for process in launched.all_processes():
             process.kill()
         return False
+    if raised:
+        raise raised[0]
     return True
 
 
@@ -641,6 +653,87 @@ def test_each_launch_mode_hands_the_stop_arguments_to_the_run_it_starts(
     ((kwargs, run),) = launches
     assert kwargs["spike_games"] == 7  # the target reaches the run that enforces it
     assert run.wait_args == (rs.DEFAULT_WAIT_POLL_INTERVAL, 42.0)  # and the grace its wait
+
+
+class _GoneProcess:
+    """A stand-in child that has already exited."""
+
+    name = "gone"
+    pid = 0
+    exitcode = 0
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        del timeout
+
+
+def _launch_playing(monkeypatch, games):
+    """Replace ``launch_run`` with one whose single actor durably finishes ``games`` games.
+
+    The stand-in run's children have exited by the time it is returned, so
+    its real :meth:`~core.ipc.LaunchedRun.wait` polls once and reads the
+    run directory's final total.
+
+    Returns:
+        The list of run directories each launch was given.
+    """
+    run_dirs = []
+
+    def fake_launch_run(*, run_dir, spike_games, **kwargs):
+        del kwargs
+        run_dirs.append(Path(run_dir))
+        actor = EpochMetricsWriter(run_dir, "actor-0")  # a new epoch on a resumed run
+        for _ in range(games):
+            actor.append(delta_record(SERIES_GAMES_COMPLETED, 1))
+        return LaunchedRun(
+            ctx=None,
+            learner=_GoneProcess(),
+            actors={0: _GoneProcess()},
+            metrics_writer=EpochMetricsWriter(run_dir, "orchestrator"),
+            spike_games=spike_games,
+        )
+
+    monkeypatch.setattr(rs, "launch_run", fake_launch_run)
+    return run_dirs
+
+
+def _spike_stops(run_dir):
+    return [rec for rec in _orchestrator_records(run_dir) if rec["kind"] == KIND_SPIKE_STOP]
+
+
+@pytest.mark.parametrize(("target", "new_games"), [(5, 2), (3, 0)])
+def test_a_resumed_spike_run_counts_the_games_of_its_earlier_launches(
+    tmp_path, monkeypatch, target, new_games
+):
+    """The target is run-wide: a parent's 3 durable games count, even when they alone meet it."""
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    _launch_playing(monkeypatch, 3)
+    rs.cmd_launch(cfg, now=1_700_000_000.0)
+    parent = _only_run_dir(tmp_path)
+    assert _spike_stops(parent) == []
+
+    _launch_playing(monkeypatch, new_games)
+    rs.cmd_resume(cfg, parent, spike_games=target)
+
+    (stop,) = _spike_stops(parent)
+    assert (stop["target"], stop["games_completed"]) == (target, 3 + new_games)
+
+
+def test_a_forked_spike_run_does_not_count_its_parents_games(tmp_path, monkeypatch):
+    cfg = _write_config(tmp_path / "cfg.json", _base_raw(tmp_path))
+    _launch_playing(monkeypatch, 3)
+    rs.cmd_launch(cfg, now=1_700_000_000.0)
+    parent = _only_run_dir(tmp_path)
+
+    run_dirs = _launch_playing(monkeypatch, 1)
+    rs.cmd_fork(cfg, parent, spike_games=3, now=1_700_000_500.0)
+
+    (child,) = run_dirs
+    assert child != parent
+    assert _spike_stops(child) == []  # 1 game of its own: the parent's 3 are not its games
+    assert reduce_run(child).totals[SERIES_GAMES_COMPLETED] == 1
 
 
 @pytest.mark.parametrize("mode", ["launch", "resume", "fork"])
