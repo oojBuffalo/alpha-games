@@ -27,6 +27,7 @@ exactly the mechanical part of the gate:
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import subprocess
 import sys
@@ -668,3 +669,30 @@ def test_resolve_out_path_defaults_only_official_runs(monkeypatch, tmp_path):
     explicit = tmp_path / "elsewhere.md"
     assert BENCH.resolve_out_path(explicit, official=True) == explicit
     assert BENCH.resolve_out_path(explicit, official=False) == explicit
+
+
+@pytest.mark.parametrize("official", [True, False])
+def test_main_refuses_a_playout_cap_config(monkeypatch, tmp_path, official):
+    """§12 M2.5 pins the spike to a fixed budget: a PCR config never reaches a verdict."""
+    real_load = BENCH.load_run_config
+
+    def load_pcr(path):
+        """Load ``path`` through the real parser and switch it to the D6 budget.
+
+        Args:
+            path: The config path ``main`` passes.
+
+        Returns:
+            The parsed config with playout-cap randomization on and ``sims`` 512.
+        """
+        cfg = real_load(path)
+        return dataclasses.replace(
+            cfg,
+            self_play=dataclasses.replace(cfg.self_play, playout_cap_randomization=True, sims=512),
+        )
+
+    monkeypatch.setattr(BENCH, "load_run_config", load_pcr)
+    argv = [] if official else ["--allow-unverified-hardware"]
+    with pytest.raises(SystemExit, match="no PCR"):
+        drive_main(monkeypatch, tmp_path, official=official, argv=argv)
+    assert list(tmp_path.rglob("*")) == []  # no report, signed or provisional

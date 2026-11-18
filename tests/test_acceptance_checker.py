@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from core.acceptance import _REQUIRED_POSITIVE_SERIES, MIN_COMPLETED_GAMES, verify_acceptance
 from core.metrics import EpochMetricsWriter
 from core.observability import (
@@ -78,11 +80,21 @@ def _write_game_shard(
     write_shard(shard_dir / shard_id, game, records, run_id=run_id, actor_id=actor_id, seq=seq)
 
 
-def _run_config_stub(*, batch_size, publish_interval, playout_cap_randomization=False):
-    """A minimal duck-typed run-config stand-in (mirrors ``tests/test_learner.py``)."""
+def _run_config_stub(*, batch_size, publish_interval, sims=128, pcr=False):
+    """A minimal duck-typed run-config stand-in (mirrors ``tests/test_learner.py``).
+
+    Args:
+        batch_size: ``training.batch_size``.
+        publish_interval: ``training.publish_interval``.
+        sims: ``self_play.sims`` (M3's validate tier by default).
+        pcr: ``self_play.playout_cap_randomization``.
+
+    Returns:
+        The stand-in.
+    """
     return SimpleNamespace(
         training=SimpleNamespace(batch_size=batch_size, publish_interval=publish_interval),
-        self_play=SimpleNamespace(playout_cap_randomization=playout_cap_randomization),
+        self_play=SimpleNamespace(sims=sims, playout_cap_randomization=pcr),
     )
 
 
@@ -272,7 +284,7 @@ def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
         delta_record(SERIES_CONSECUTIVE_MOVER_TRANSITIONS, 3)
     )
     schedule_on = _run_config_stub(
-        batch_size=_BATCH_SIZE, publish_interval=_PUBLISH_INTERVAL, playout_cap_randomization=True
+        batch_size=_BATCH_SIZE, publish_interval=_PUBLISH_INTERVAL, sims=512, pcr=True
     )
     report = verify_acceptance(root, TTT, schedule_on)
     check = _check(report, name)
@@ -283,9 +295,13 @@ def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
         f"the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} series, which this checklist does not read"
     )
     assert "[FAIL] " + name in report.render()
-    # Every other check reads exactly as it did.
-    others = [(c.name, c.passed, c.detail) for c in report.checks if c.name != name]
-    assert others == [(c.name, c.passed, c.detail) for c in stored_all.checks if c.name != name]
+    # The run also fails M3's fixed-budget gate; every other check reads exactly as it did.
+    tier = "self-play at the fixed-128-sim validate tier (D6)"
+    assert not _check(report, tier).passed
+    others = [(c.name, c.passed, c.detail) for c in report.checks if c.name not in (name, tier)]
+    assert others == [
+        (c.name, c.passed, c.detail) for c in stored_all.checks if c.name not in (name, tier)
+    ]
 
 
 def test_fails_when_no_reload_observed(tmp_path):
@@ -367,3 +383,19 @@ def test_fails_gracefully_on_an_empty_run_directory(tmp_path):
     report = verify_acceptance(root, TTT, _run_config())
     assert not report.passed
     assert not _check(report, f"at least {MIN_COMPLETED_GAMES} completed games").passed
+
+
+@pytest.mark.parametrize(("sims", "pcr"), [(512, True), (64, False), (128, True)])
+def test_fails_when_the_run_was_not_at_the_fixed_128_validate_tier(tmp_path, sims, pcr):
+    """An otherwise passing run is not M3 evidence unless it searched fixed 128 (D6)."""
+    root = _build_passing_run(tmp_path)
+    cfg = _run_config_stub(
+        batch_size=_BATCH_SIZE, publish_interval=_PUBLISH_INTERVAL, sims=sims, pcr=pcr
+    )
+    report = verify_acceptance(root, TTT, cfg)
+    assert not report.passed
+    assert not _check(report, "self-play at the fixed-128-sim validate tier (D6)").passed
+    # A playout-cap run also fails the blocked-skip check as not evaluable.
+    assert [c.name for c in report.checks if not c.passed] == [
+        "self-play at the fixed-128-sim validate tier (D6)"
+    ] + (["at least one consecutive-mover (blocked-skip) sequence"] if pcr else [])

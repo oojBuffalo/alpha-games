@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.actor import VALIDATE_TIER_SIMS
 from core.checkpoint import list_published_versions
 from core.game import Game
 from core.observability import (
@@ -159,12 +160,13 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
             ``games.registry`` by the caller).
         run_config: The run's protocol (``core.run_identity.read_stored_config
             (run_dir).run``), for ``training.batch_size``/``publish_interval``
-            and ``self_play.playout_cap_randomization``. With that flag on,
-            the consecutive-mover check is reported failed as not evaluable:
-            its stored-sample test is invalid once fast-search positions are
-            dropped (:func:`_consecutive_mover_game`), and this checklist
-            does not read the ``consecutive_mover_transitions`` series that
-            replaces it.
+            and the self-play budget, which M3 pins at the fixed-128 validate
+            tier (D6) with playout-cap randomization off. With that flag on,
+            the consecutive-mover check is also reported failed as not
+            evaluable: its stored-sample test is invalid once fast-search
+            positions are dropped (:func:`_consecutive_mover_game`), and this
+            checklist does not read the ``consecutive_mover_transitions``
+            series that replaces it.
 
     Returns:
         The full checklist. Never raises for a failing run -- a check that
@@ -175,6 +177,16 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
     shard_dir = run_dir / "shards"
     ckpt_dir = run_dir / "checkpoints"
     checks: list[CheckResult] = []
+
+    self_play = run_config.self_play
+    checks.append(
+        CheckResult(
+            f"self-play at the fixed-{VALIDATE_TIER_SIMS}-sim validate tier (D6)",
+            not self_play.playout_cap_randomization and self_play.sims == VALIDATE_TIER_SIMS,
+            f"sims={self_play.sims}, "
+            f"playout_cap_randomization={self_play.playout_cap_randomization}",
+        )
+    )
 
     by_game = _scan_shards(shard_dir, game)
     num_games = len(by_game)
