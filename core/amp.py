@@ -2,7 +2,9 @@
 
 Self-play leaf inference runs under the same CUDA-only autocast rule the train
 step follows (``core.train.make_scaler`` / ``core.train.train_step``): live on
-CUDA, an exact no-op everywhere else. The rule is *derived from the device* --
+CUDA, and on the actor path (no enclosing autocast) an exact no-op everywhere
+else -- :meth:`AmpMode.autocast` states what it does under an enclosing
+context. The rule is *derived from the device* --
 :meth:`AmpMode.resolve` is the one place it is decided -- and is deliberately
 not a config field: precision is how a run executes on its hardware, not part
 of the protocol it records.
@@ -45,9 +47,11 @@ class AmpMode:
 
     Attributes:
         device_type: Torch device type the context is entered for.
-        enabled: Whether autocast is live. CUDA only — the same rule as
-            ``core.train.make_scaler`` / ``core.train.train_step``, so AMP is an
-            exact no-op off CUDA and the CPU battery computes plain float32.
+        enabled: The *requested* setting: whether :meth:`autocast` turns
+            autocast on (True) or off (False) for its extent. Not the live
+            state -- :meth:`observed` reads that. CUDA only, the same rule as
+            ``core.train.make_scaler`` / ``core.train.train_step``, so off CUDA
+            the actor path computes plain float32 (the CPU battery).
     """
 
     device_type: str
