@@ -253,8 +253,15 @@ class EpochMetricsWriter:
         exposes none of the group, not a prefix of it -- the guarantee one
         game's accounting needs (:mod:`core.actor`).
 
+        If the write fails part-way (a short write on a full disk or a
+        file-size limit), the file is truncated back to its size before the
+        call and the error re-raised (:meth:`_write_line`).
+
         Args:
             records: Flat, JSON-serializable mappings. Copied, not mutated.
+
+        Raises:
+            OSError: If the write or ``fsync`` fails; the file is unchanged.
         """
         group = {"kind": RECORD_GROUP_KIND, "records": [dict(record) for record in records]}
         self._write_line(json.dumps(group, sort_keys=True))

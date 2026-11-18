@@ -20,12 +20,15 @@ Four layers, cheapest first:
 from __future__ import annotations
 
 import dataclasses
+import errno
 import math
+import os
 import time
 from types import SimpleNamespace
 
 import pytest
 
+from core import metrics as metrics_module
 from core.actor import VALIDATE_TIER_SIMS, ActorDriver
 from core.checkpoint import list_published_versions
 from core.ipc import build_actor_pacing, build_actor_refresh
@@ -39,7 +42,9 @@ from core.observability import (
     KIND_SEGMENT_END,
     KIND_SEGMENT_START,
     KIND_TOTAL,
+    SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
+    SERIES_POSITIONS_EVALUATED,
     InferenceBatchCounter,
     PositionCounter,
     ReducedRun,
@@ -674,3 +679,33 @@ def test_live_path_smoke_a_real_single_process_run_reduces_to_sane_numbers(tmp_p
         assert learner_step >= 0
         assert positions_evaluated >= 0
         assert gpu_hours >= 0
+
+
+def test_a_failed_group_append_leaves_no_partial_group(tmp_path, monkeypatch):
+    """A short write rolls the file back: no prefix of the group, no torn line."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+    writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
+    before = writer.path.read_bytes()
+    real_write = os.write
+    calls = []
+
+    def short_then_full(fd, data):
+        """Really write all but the last 10 bytes once, then fail as a full file does."""
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, bytes(data[:-10]))  # ends mid-line
+        raise OSError(errno.EFBIG, "File too large")
+
+    monkeypatch.setattr(metrics_module.os, "write", short_then_full)
+    group = [
+        delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=2.0),
+        delta_record(SERIES_POSITIONS_EVALUATED, 20, timestamp=2.0),
+        delta_record(SERIES_INFERENCE_BATCHES, 10, timestamp=2.0),
+    ]
+    with pytest.raises(OSError, match="File too large"):
+        writer.append_many(group)
+    monkeypatch.undo()
+
+    assert len(calls) == 2  # the prefix really reached the file before the failure
+    assert writer.path.read_bytes() == before
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1

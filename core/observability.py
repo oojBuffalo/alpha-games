@@ -30,7 +30,11 @@ name and aggregation rule below is frozen, not an implementation detail.
   leaf count fell in that bucket. A bucket series is written only when its
   count is non-zero, so an absent one reads as zero. The buckets sum to
   ``inference_batches``; mean batch fill is ``positions_evaluated /
-  inference_batches`` exactly, and the buckets bound any percentile of it.
+  inference_batches`` exactly over actor epochs that carry both series --
+  every epoch written since M5. A run resumed from a schema-v1 directory also
+  holds earlier epochs with ``positions_evaluated`` and no batch series, so
+  its fill must be computed over the batch-carrying epochs only. The buckets
+  bound any percentile of it.
   The *per-tier move* series (§12 M5) are actor-owned deltas of the same
   standing -- flushed at the game boundary, not required of an M3 run:
   :data:`SERIES_MOVES_FULL_512`, :data:`SERIES_MOVES_MID_256` and
