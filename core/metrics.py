@@ -329,17 +329,18 @@ class EpochMetricsWriter:
             os.fsync(fh.fileno())
 
     def last_record(self) -> dict[str, Any] | None:
-        """Return the last record of the last complete line in this epoch's file.
+        """Return the last record in this epoch's complete lines, or ``None``.
 
         For a caller retrying an append that raised: the record may have
         been written in full before the error (a failed ``fsync`` keeps the
         line), and if so it is the last complete line.
 
         Returns:
-            The last record of the last newline-terminated line, or ``None``
-            if there is none.
+            The last record of the newline-terminated lines (an empty group
+            holds none), or ``None`` if there is none.
         """
-        lines = [
-            line for line in self.path.read_text(encoding="utf-8").split("\n")[:-1] if line.strip()
-        ]
-        return parse_metrics_line(lines[-1])[-1] if lines else None
+        for line in reversed(self.path.read_text(encoding="utf-8").split("\n")[:-1]):
+            records = parse_metrics_line(line) if line.strip() else []
+            if records:
+                return records[-1]
+        return None

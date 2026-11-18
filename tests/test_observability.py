@@ -1538,3 +1538,14 @@ def test_an_fsync_failure_keeps_the_complete_line_readers_may_have_seen(tmp_path
     monkeypatch.undo()
 
     assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1
+
+
+def test_last_record_skips_empty_groups(tmp_path):
+    """An empty group is a complete line with no record; the lookup passes over it."""
+    writer = EpochMetricsWriter(tmp_path, "orchestrator")
+    writer.append_many([])
+    assert writer.last_record() is None
+    record = delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0)
+    writer.append(record)
+    writer.append_many([])
+    assert writer.last_record() == record
