@@ -32,7 +32,11 @@ name and aggregation rule below is frozen, not an implementation detail.
   leaf count fell in that bucket. A bucket series is written only when its
   count is non-zero, so an absent one reads as zero. The buckets sum to
   ``inference_batches``; mean batch fill is ``positions_evaluated /
-  inference_batches`` exactly, and the buckets bound any percentile of it.
+  inference_batches`` exactly over actor epochs that carry both series --
+  every epoch written since M5. A run resumed from a schema-v1 directory also
+  holds earlier epochs with ``positions_evaluated`` and no batch series, so
+  its fill must be computed over the batch-carrying epochs only. The buckets
+  bound any percentile of it.
   The *per-tier move* series (§12 M5) are actor-owned deltas of the same
   standing -- flushed at the game boundary, not required of an M3 run:
   :data:`SERIES_MOVES_FULL_512`, :data:`SERIES_MOVES_MID_256` and
@@ -860,7 +864,7 @@ class WindowedRun:
             series are present but whose denominator summed to zero) and
             :data:`WINDOW_INCOMPLETE_FLUSH` (a game flush in the window lacks
             or under-records a series the field is built from -- possible in
-            logs written before a game's records became one ``record_group``
+            logs written before a game's records became one
             line; ``_incomplete_series``).
         window_start: Timestamp of the start flush (:func:`reduce_window`).
         window_end: Timestamp of the end flush.
@@ -1005,7 +1009,7 @@ def _game_flushes(
 def _incomplete_series(window: list[dict[str, Any]]) -> set[str]:
     """Return the series a window's game flushes do not wholly record.
 
-    An actor now writes a game's records as one ``record_group`` line
+    An actor now writes a game's records as one line
     (``core.metrics.EpochMetricsWriter.append_many``), which a reader sees
     whole or not at all. An older log wrote them as separate lines,
     ``games_completed`` first, so a crash between two lines could keep a

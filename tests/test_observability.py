@@ -20,13 +20,16 @@ Four layers, cheapest first:
 from __future__ import annotations
 
 import dataclasses
+import errno
 import math
+import os
 import time
 from types import SimpleNamespace
 
 import pytest
 
 from core import learner as learner_module
+from core import metrics as metrics_module
 from core.actor import VALIDATE_TIER_SIMS, ActorDriver
 from core.checkpoint import list_published_versions
 from core.ipc import build_actor_pacing, build_actor_refresh
@@ -42,8 +45,10 @@ from core.observability import (
     KIND_SHUTDOWN_FORCED,
     KIND_SPIKE_STOP,
     KIND_TOTAL,
+    SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_LEARNER_STEP,
+    SERIES_POSITIONS_EVALUATED,
     SERIES_REPLAY_RATIO,
     WINDOW_BOUND_BY_REPLAY_WARMUP,
     WINDOW_BOUND_BY_WARMUP_GAMES,
@@ -1469,3 +1474,67 @@ def test_window_batch_fill_percentile_is_the_nearest_rank_rounded_up(tmp_path):
     # Batches were counted but the leaves were not: missing data, not a zero denominator.
     assert window.mean_batch_fill is None
     assert window.unavailable["mean_batch_fill"] == WINDOW_NO_RECORD
+
+
+def test_a_failed_group_append_leaves_no_partial_group(tmp_path, monkeypatch):
+    """A short write rolls the file back: no prefix of the group, no torn line."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+    writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
+    before = writer.path.read_bytes()
+    real_write = os.write
+    calls, seen_mid_write = [], []
+
+    def short_then_full(fd, data):
+        """Really write all but the last 10 bytes once, then fail as a full file does.
+
+        Between the two, a concurrent reader snapshots the run.
+        """
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, bytes(data[:-10]))  # ends mid-group
+        seen_mid_write.append(dict(reduce_run(tmp_path).totals))
+        raise OSError(errno.EFBIG, "File too large")
+
+    monkeypatch.setattr(metrics_module.os, "write", short_then_full)
+    group = [
+        delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=2.0),
+        delta_record(SERIES_POSITIONS_EVALUATED, 20, timestamp=2.0),
+        delta_record(SERIES_INFERENCE_BATCHES, 10, timestamp=2.0),
+    ]
+    with pytest.raises(OSError, match="File too large"):
+        writer.append_many(group)
+    monkeypatch.undo()
+
+    assert len(calls) == 2  # the prefix really reached the file before the failure
+    # The partial group was invisible to the concurrent reader.
+    (mid,) = seen_mid_write
+    assert mid[SERIES_GAMES_COMPLETED] == 1 and mid[SERIES_POSITIONS_EVALUATED] == 0
+    assert mid.get(SERIES_INFERENCE_BATCHES, 0) == 0
+    assert writer.path.read_bytes() == before
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1
+
+    # A writer killed after a short write never rolls back: the unterminated
+    # tail stays on disk, and is still not read as records.
+    writer.append_many(group)
+    complete = writer.path.read_bytes()
+    with open(writer.path, "ab") as fh:
+        fh.write(complete[len(before) : -10])
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_GAMES_COMPLETED] == 2  # the complete group, once
+    assert totals[SERIES_INFERENCE_BATCHES] == 10
+
+
+def test_an_fsync_failure_keeps_the_complete_line_readers_may_have_seen(tmp_path, monkeypatch):
+    """Rolling back an already-visible line would let a tail reader overcount."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+
+    def failing_fsync(fd):
+        """Fail as a device I/O error does, after the line is fully written."""
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(metrics_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="Input/output error"):
+        writer.append_many([delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0)])
+    monkeypatch.undo()
+
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1

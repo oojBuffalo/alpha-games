@@ -27,12 +27,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
 from core.run_identity import (
     LAUNCH_SCHEMA_VERSION,
+    STORAGE_POLICY_D12_DROP,
     LaunchConfig,
     Lineage,
     MaterialConfigDiffError,
@@ -636,18 +638,33 @@ def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwrit
         read_stored_config_document(root)
 
 
-def test_a_v1_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
-    """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
+def test_a_v1_cuda_run_refuses_resume_because_its_actors_ran_fp32(tmp_path):
+    """A v1 CUDA actor had no autocast; resuming it now would switch precision."""
     root = _v1_run_dir(tmp_path)
     live = load_launch_config(ROOT / "configs" / "blokus_duo.json")
+    assert live.device == "cuda" and live.run.self_play.leaf_batch_size == 1
+
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, live)
+    assert set(excinfo.value.material) == {"actor_inference_amp"}
+
+
+def test_a_v1_cpu_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
+    """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
+    root = _v1_run_dir(tmp_path)
+    doc = json.loads(V1_CONFIG_FIXTURE.read_text())
+    doc["device"] = "cpu"
+    (root / "config.json").write_text(json.dumps(doc))
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["device"] = "cpu"
+    live = LaunchConfig.from_dict(live_raw)
     assert live.run.self_play.leaf_batch_size == 1
 
     assert resolve_resume(root, live).effective_config == live
 
-    batched_raw = live.to_dict()
-    batched_raw["self_play"]["leaf_batch_size"] = 4
+    live_raw["self_play"]["leaf_batch_size"] = 4
     with pytest.raises(MaterialConfigDiffError) as excinfo:
-        resolve_resume(root, LaunchConfig.from_dict(batched_raw))
+        resolve_resume(root, LaunchConfig.from_dict(live_raw))
     assert set(excinfo.value.material) == {"self_play.leaf_batch_size"}
 
 
@@ -711,9 +728,20 @@ def test_an_older_document_already_carrying_a_pcr_key_is_rejected_not_overwritte
 
 @pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
 def test_a_fixed_sim_run_resumes_under_the_live_config_and_refuses_a_pcr_one(tmp_path, fixture):
-    """An old fixed-sim run dir never continues under the D6 schedule."""
+    """An old fixed-sim run dir never continues under the D6 schedule.
+
+    Both sides run on CPU, which isolates the self-play differences: on CUDA
+    a schema-v1 run also differs in the material ``actor_inference_amp`` (its
+    actors ran float32), so even the matching fixed-sim baseline would not
+    resume there.
+    """
     root = _v1_run_dir(tmp_path, fixture=fixture)
-    live = load_launch_config(ROOT / "configs" / "blokus_duo.json")
+    doc = json.loads(fixture.read_text())
+    doc["device"] = "cpu"
+    (root / "config.json").write_text(json.dumps(doc))
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["device"] = "cpu"
+    live = LaunchConfig.from_dict(live_raw)
     assert live.run.self_play.playout_cap_randomization is False
 
     assert resolve_resume(root, live).effective_config == live
@@ -807,6 +835,53 @@ def test_resolve_resume_has_no_override_flag_anywhere_in_its_signature():
     params = inspect.signature(resolve_resume).parameters
     assert "override" not in params
     assert "force" not in params
+
+
+def _drop_storage_policy(root: Path) -> None:
+    """Rewrite ``run_record.json`` as a record written before the D12 drop existed.
+
+    Args:
+        root: The run directory.
+    """
+    path = root / "run_record.json"
+    raw = json.loads(path.read_text())
+    del raw["storage_policy"]
+    path.write_text(json.dumps(raw))
+
+
+@pytest.mark.parametrize("pcr", [False, True], ids=["fixed-tier", "playout-cap"])
+def test_a_run_recorded_before_the_d12_drop_resumes_only_at_a_fixed_tier(tmp_path, pcr):
+    """A pre-D12 playout-cap run stored its fast plies, so it must be forked, not resumed.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        pcr: Whether the stored run has playout-cap randomization on.
+    """
+    raw = _launch_raw()
+    if pcr:
+        _override_pcr_on(raw)
+    raw["run_dir"] = str(tmp_path / "old PCR runs")  # a path the shell must quote
+    lc = LaunchConfig.from_dict(raw)
+    root = run_root(lc, "run-1")
+    write_provenance(
+        root, lc, RunRecord(run_id="run-1", created_at="2026-01-01T00:00:00Z", entry_condition={})
+    )
+    assert read_run_record(root).storage_policy == STORAGE_POLICY_D12_DROP
+    assert resolve_resume(root, lc).run_id == "run-1"  # a D12 record resumes either way
+
+    _drop_storage_policy(root)
+    assert read_run_record(root).storage_policy is None
+    if not pcr:
+        assert resolve_resume(root, lc).run_id == "run-1"  # every ply stored either way
+        return
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, lc)
+    assert excinfo.value.material == {"self_play.storage_policy": (None, STORAGE_POLICY_D12_DROP)}
+    # The field is derived, not configured, so the message says how to go on.
+    assert "recorded before the D12 drop" in str(excinfo.value)
+    fork = str(excinfo.value).split("--fork-from=", 1)[1].split(" instead of", 1)[0]
+    assert shlex.split(fork) == [str(root)]
+    assert resolve_fork(root, lc, now=1_700_000_500.0).run_id != "run-1"  # the way forward
 
 
 def test_resolve_resume_missing_run_dir_raises(tmp_path):

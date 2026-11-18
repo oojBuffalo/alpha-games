@@ -38,7 +38,10 @@ terminal leaves take ``terminal_utility`` inside the loop without reaching the e
     at least one simulation.
   * ``completed_simulations`` counts backed-up simulations, as distinct from descents
     attempted; the budget is spent against it, exactly.
-  * ``batch_size = 1`` is the serial search, bit for bit. Batching changes selection only
+  * ``batch_size = 1`` is the serial search, bit for bit, for an evaluator returning
+    Python floats (every leaf value is now backed up as a Python ``float``, so one
+    returning a NumPy ``float32`` accumulates in double precision where the serial engine
+    accumulated in ``float32``). Batching changes selection only
     through the in-flight virtual-loss term: PUCT (D11), root noise (D7) and subtree
     reuse are as in the serial engine.
 """
@@ -47,6 +50,7 @@ from __future__ import annotations
 
 import math
 import numbers
+import operator
 import random
 from collections.abc import Callable, Sequence
 
@@ -115,9 +119,11 @@ class MCTS:
         evaluate: Optional leaf evaluator ``(game, state) -> (value, priors)`` used at
             non-terminal leaves. ``None`` (M0) means value ``0.0`` and uniform priors.
             The network plugs in here at M2 — the same seam, no new abstraction. The
-            value must be a real scalar (a ``numbers.Real``: a Python number or a NumPy
-            scalar). Arrays and tensors are rejected, 0-d and one-element ones included,
-            so an evaluator hands over ``.item()``; this holds for ``evaluate_batch`` too.
+            value must be a real scalar in ``[-1, 1]`` (a ``numbers.Real``: a Python number
+            or a NumPy scalar; it is backed up as a Python ``float``) — the v1 range of
+            the ``tanh`` value head and of ``terminal_utility``. Arrays and tensors are
+            rejected, 0-d and one-element ones included, so an evaluator hands over
+            ``.item()``; this holds for ``evaluate_batch`` too.
         evaluate_batch: Optional batched leaf evaluator ``(game, states) -> results``,
             returning one ``(value, priors)`` per state in order. When supplied it
             evaluates every batch (of any size) in one call and ``evaluate`` is not
@@ -205,18 +211,30 @@ class MCTS:
         descent's virtual loss is rolled back in full and it spends none of the budget;
         there is no retry. A batch's first descent cannot collide, so every batch
         completes at least one simulation. With ``batch_size = 1`` this is the serial
-        search, bit for bit.
+        search, bit for bit, for an evaluator returning Python floats (see the module
+        docstring for NumPy scalars).
 
-        A batch that fails is abandoned whole. If the evaluator or ``terminal_utility``
-        raises, or returns anything the engine cannot use (see Raises), every descent of
-        that batch is rolled back before the error propagates: no virtual loss or
-        in-flight mark is left, no leaf of the batch is expanded, and none of it is
-        counted. Every evaluation result and every terminal utility is obtained and
-        checked before the first leaf is filled, so one failure discards the batch's
-        well-formed results too, and filling and backing up then only assign and add.
-        What remains uncovered is an exception raised inside a descent (by the adapter's
-        ``apply`` / ``legal_moves`` / ``is_terminal`` / ``current_player``): the batch is
-        still abandoned, but that one descent's own path keeps its virtual loss.
+        A failed evaluation abandons its batch whole and keeps the tree. If the
+        evaluator or ``terminal_utility`` raises an ``Exception``, or returns anything the
+        engine cannot use (see Raises), every descent of that batch is rolled back before
+        the error propagates: no virtual loss or in-flight mark is left, no leaf of the
+        batch is expanded, and none of it is counted. The tree survives only if that
+        rollback completes; an evaluator that raises a ``BaseException`` that is not an
+        ``Exception`` (``KeyboardInterrupt``) gets no rollback and discards it. Every
+        evaluation result and every terminal utility is obtained and checked before the
+        first leaf is filled, so one failure discards the batch's well-formed results
+        too. This rollback is exact because it runs only once every descent of the batch
+        has been recorded.
+
+        Anything else that escapes the search loop discards the tree (the root is
+        unset) before it propagates: an exception raised by the adapter during a descent
+        (``apply`` / ``legal_moves`` / ``is_terminal`` / ``current_player``), any
+        exception or interruption (``KeyboardInterrupt``, a signal handler's exception)
+        that lands while descents are being collected or results committed, and one that
+        lands inside the rollback itself. There a reservation may be made but not yet
+        recorded, or a backup half done, so the tree cannot be trusted. Simulations
+        already backed up, including earlier ones of the interrupted batch, stay in
+        ``completed_simulations``. Restart with ``root_state`` or :meth:`set_root`.
 
         Args:
             num_simulations: Number of simulations (backed-up leaf visits) to perform.
@@ -230,28 +248,51 @@ class MCTS:
 
         Raises:
             ValueError: If ``batch_size < 1``, if no root is set, if ``evaluate_batch``
-                returns a different number of results than it was given states, or if a
-                result is an iterable of the wrong length for a ``(value, priors)`` pair.
-            TypeError: If a leaf value — evaluated, or from ``terminal_utility`` — is not
-                a real number, or a result is not iterable at all. Malformed priors raise
+                returns a different number of results than it was given states, if a
+                result is an iterable of the wrong length for a ``(value, priors)`` pair,
+                or if a leaf value lies outside ``[-1, 1]`` (NaN included) or a normalized
+                prior is not finite.
+            TypeError: If ``num_simulations`` or ``batch_size`` is not an integer, if a
+                leaf value — evaluated, or from ``terminal_utility`` — is not a real
+                number, or if a result is not iterable at all. Malformed priors raise
                 whatever the softmax over them raises (typically also ``TypeError``).
             OverflowError: If a leaf value is a real number too large for a float.
             RuntimeError: If a batch opens onto a leaf that is already in flight — a
                 stale mark, which neither a completed nor an abandoned batch leaves behind.
         """
+        # Both counts are checked before anything is touched, so a non-integer budget
+        # cannot commit part of a search before it is rejected.
+        remaining = operator.index(num_simulations)
+        batch_size = operator.index(batch_size)
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1; got {batch_size}")
         if root_state is not None:
             self.set_root(root_state)
         if self.root is None:
             raise ValueError("no root set; pass root_state or call set_root first")
-        remaining = num_simulations
-        while remaining > 0:
-            # Leaves are filled only once the batch has closed, so root priors cannot
-            # appear mid-batch: one noise check per batch is one check per descent.
-            self._maybe_noise_root()
-            batch: list[tuple[list[tuple[_Node, int]], _Node]] = []
-            try:
+        return self._run_batches(remaining, batch_size)
+
+    def _run_batches(self, remaining: int, batch_size: int) -> _Node:
+        """Run batches from the current root until ``remaining`` simulations are spent.
+
+        The search loop of :meth:`run`, which validates the arguments and sets the root.
+        The tree survives an exception only when the evaluation-phase rollback ran to the
+        end; whatever else escapes discards it (see :meth:`run`).
+
+        Args:
+            remaining: Simulations still to back up.
+            batch_size: Maximum number of leaves per evaluation (``>= 1``).
+
+        Returns:
+            The root ``_Node``.
+        """
+        unwound = False  # set only once the evaluation-phase rollback has completed
+        try:
+            while remaining > 0:
+                # Leaves are filled only once the batch has closed, so root priors cannot
+                # appear mid-batch: one noise check per batch is one check per descent.
+                self._maybe_noise_root()
+                batch: list[tuple[list[tuple[_Node, int]], _Node]] = []
                 for _ in range(min(batch_size, remaining)):
                     path, leaf, collided = self._descend(apply_vloss=True)
                     if collided:
@@ -260,30 +301,39 @@ class MCTS:
                     batch.append((path, leaf))
                 if not batch:
                     raise RuntimeError("a batch opened onto a leaf that is already in flight")
-                results = iter(
-                    self._evaluate_leaves([leaf for _, leaf in batch if not leaf.is_terminal])
-                )
-                # terminal_utility is the batch's last adapter call: make it in here too.
-                terminal = [
-                    self._leaf_value(leaf, path, None) if leaf.is_terminal else None
-                    for path, leaf in batch
-                ]
-            except BaseException:
-                # Nothing is filled yet, so abandoning the batch is exact: no virtual
-                # loss, no in-flight mark, no simulation counted.
-                for path, leaf in batch:
-                    self._rollback_vloss(path)
+                try:
+                    leaves = [leaf for _, leaf in batch if not leaf.is_terminal]
+                    results = iter(self._evaluate_leaves(leaves))
+                    # terminal_utility is the batch's last adapter call: make it here too.
+                    terminal = [
+                        self._leaf_value(leaf, path, None) if leaf.is_terminal else None
+                        for path, leaf in batch
+                    ]
+                except Exception:
+                    # Every descent is recorded in ``batch`` and nothing is filled yet, so
+                    # abandoning the batch is exact: no virtual loss, no in-flight mark,
+                    # no simulation counted.
+                    for path, leaf in batch:
+                        self._rollback_vloss(path)
+                        leaf.in_flight = False
+                        leaf.actions = []  # undo the deferral: a fresh node again
+                    unwound = True
+                    raise
+                # Every value is in hand and checked: the rest only assigns and adds.
+                for (path, leaf), resolved in zip(batch, terminal, strict=True):
+                    if resolved is None:
+                        value = self._fill_expand(leaf, *next(results))
+                        resolved = self._leaf_value(leaf, path, value)
+                    self._backup(path, *resolved)
                     leaf.in_flight = False
-                    leaf.actions = []  # undo the deferral: a fresh node again
-                raise
-            # Every value is in hand and checked: the rest only assigns and adds floats.
-            for (path, leaf), resolved in zip(batch, terminal, strict=True):
-                if resolved is None:
-                    resolved = self._leaf_value(leaf, path, self._fill_expand(leaf, *next(results)))
-                self._backup(path, *resolved)
-                leaf.in_flight = False
-                self.completed_simulations += 1
-            remaining -= len(batch)
+                    self.completed_simulations += 1
+                remaining -= len(batch)
+        except BaseException:
+            if not unwound:
+                # A reservation may be made but unrecorded, or a backup half done: the
+                # tree can no longer be trusted, so it is dropped, not left with marks.
+                self.root = None
+            raise
         return self.root
 
     def advance(self, action: Action) -> None:
@@ -401,8 +451,10 @@ class MCTS:
             normalized over that leaf's legal actions (:meth:`_priors`).
 
         Raises:
-            ValueError: If ``evaluate_batch`` returns the wrong number of results, or a
-                result is an iterable of the wrong length for a ``(value, priors)`` pair.
+            ValueError: If ``evaluate_batch`` returns the wrong number of results, if a
+                result is an iterable of the wrong length for a ``(value, priors)`` pair,
+                or if a value lies outside ``[-1, 1]`` (NaN included) or the logits give
+                non-finite priors.
             TypeError: If a value is not a real number, or a result is not iterable.
             OverflowError: If a value is a real number too large for a float.
         """
@@ -427,26 +479,31 @@ class MCTS:
 
     @staticmethod
     def _checked(value: float) -> float:
-        """Return a leaf value unchanged once it is known to back up without failing.
+        """Return a leaf value as a Python float in ``[-1, 1]``, ready to back up.
 
         Backup negates the value and adds it to a float; this is where a value that
-        cannot do that is rejected, while no statistic has been touched yet. The value is
-        checked, never coerced, so what is backed up is exactly what was returned.
+        cannot do that is rejected, while no statistic has been touched yet. Converting
+        to ``float`` here means backup never negates a foreign scalar type (a NumPy
+        unsigned integer would wrap around instead of changing sign).
 
         Args:
             value: A leaf value from the evaluator or from ``terminal_utility``.
 
         Returns:
-            ``value`` itself.
+            ``float(value)``.
 
         Raises:
             TypeError: If ``value`` is not a ``numbers.Real`` (an array or a tensor is
                 not, even a 0-d one).
-            OverflowError: If ``value`` is too large to be added to a float.
+            OverflowError: If ``value`` is too large for a float.
+            ValueError: If ``value`` lies outside the v1 range ``[-1, 1]`` (NaN and the
+                infinities included), which also keeps every accumulated ``W`` finite.
         """
         if not isinstance(value, numbers.Real):
             raise TypeError(f"a leaf value must be a real number; got {value!r}")
-        value + 0.0  # discard-only probe: a huge int or Fraction overflows here
+        value = float(value)  # a huge int or Fraction overflows here
+        if not -1.0 <= value <= 1.0:  # False for NaN as well
+            raise ValueError(f"a leaf value must be a finite number in [-1, 1]; got {value!r}")
         return value
 
     def _defer_expand(self, node: _Node) -> None:
@@ -466,7 +523,9 @@ class MCTS:
         """Install an evaluation on a deferred leaf (the fill half of expansion).
 
         Completes the sparse ``{N, W, Q, P}`` expansion over the legal actions stored by
-        :meth:`_defer_expand`. It only assigns, so it cannot fail part-way.
+        :meth:`_defer_expand`. It only allocates and assigns, raising nothing of its own;
+        an asynchronous exception or ``MemoryError`` can still leave the node partly
+        filled, and :meth:`run` then discards the tree.
 
         Args:
             node: A node previously passed to :meth:`_defer_expand`.
@@ -489,7 +548,12 @@ class MCTS:
         return value
 
     def _priors(self, actions: Sequence[Action], raw: dict[Action, float] | None) -> list[float]:
-        """Return normalized priors over ``actions`` (uniform if none / flag set)."""
+        """Return normalized priors over ``actions`` (uniform if none / flag set).
+
+        Raises:
+            ValueError: If the logits do not give finite priors (a NaN logit, a
+                positive-infinite one, or all of them negative-infinite).
+        """
         n = len(actions)
         if raw is None or self.uniform_prior:
             return [1.0 / n] * n
@@ -498,7 +562,10 @@ class MCTS:
         m = max(logits)
         exps = [math.exp(z - m) for z in logits]
         s = sum(exps)
-        return [e / s for e in exps]
+        priors = [e / s for e in exps]
+        if not all(math.isfinite(p) for p in priors):
+            raise ValueError(f"priors must be finite; logits {logits!r} gave {priors!r}")
+        return priors
 
     def _maybe_noise_root(self) -> None:
         """Mix D7 Dirichlet noise into the current root's priors, once per root incarnation.
@@ -583,6 +650,7 @@ class MCTS:
             ``(path, leaf, collided)``: ``path`` is the list of ``(node, edge_index)``
             traversed, and ``collided`` is True iff ``leaf`` was already in flight when
             this descent reached it (the descent then left the leaf untouched).
+
         """
         path: list[tuple[_Node, int]] = []
         node = self.root

@@ -466,7 +466,8 @@ class ActorDriver:
         ``positions_evaluated`` is drained from ``position_counter`` and
         omitted entirely when none was supplied -- never a fabricated zero.
         The inference-batch deltas are drained from ``batch_counter`` under
-        the same rule.
+        the same rule. The whole game's records go
+        out in one ``EpochMetricsWriter.append_many`` write.
 
         Args:
             result: The just-finished game.
@@ -491,7 +492,9 @@ class ActorDriver:
             values.append((SERIES_POSITIONS_EVALUATED, self.position_counter.drain()))
         if self.batch_counter is not None:
             values += self.batch_counter.drain().items()
-        # One write and one fsync for the whole group, never a durable prefix of it.
+        # One write for the whole game, never a durable prefix of it: mean fill,
+        # the bucket histogram and the played/stored/tier identities never see
+        # a game whose flush was cut off part-way.
         self.metrics_writer.append_many(
             delta_record(series, value, timestamp=now) for series, value in values
         )
