@@ -1394,6 +1394,33 @@ def test_window_whose_start_a_missing_warm_up_stored_count_could_move_is_insuffi
     _assert_insufficient(window, WINDOW_INCOMPLETE_FLUSH)
 
 
+def test_window_keeps_a_game_bound_start_a_missing_stored_count_cannot_move(tmp_path):
+    """Game 2 alone proves the replay warm-up met before game 4, whatever game 1 stored."""
+    actor = EpochMetricsWriter(tmp_path, "actor-0")
+    for k in range(1, 6):
+        _flush_game(actor, 10.0 * k, omit=("positions_stored",) if k == 1 else ())
+    window = reduce_window(tmp_path, warmup_games=4, measure_games=1, replay_warmup_positions=5)
+
+    assert window.reason is None
+    assert window.binding_condition == WINDOW_BOUND_BY_WARMUP_GAMES
+    assert (window.start_game_ordinal, window.end_game_ordinal) == (4, 5)
+
+
+def test_window_learner_baseline_is_never_borrowed_from_an_earlier_launch(tmp_path):
+    """A crash left step 8 on disk; the relaunched learner resumed at 7 and stepped to 8."""
+    _seven_games(tmp_path)  # the window is (40, 60]
+    orch = EpochMetricsWriter(tmp_path, "orchestrator")
+    orch.append(segment_start_record(device="cpu", timestamp=0.0))
+    EpochMetricsWriter(tmp_path, "learner").append(total_record("learner_step", 8, timestamp=30.0))
+    orch.append(segment_start_record(device="cpu", timestamp=35.0))  # the relaunch, in warm-up
+    EpochMetricsWriter(tmp_path, "learner").append(total_record("learner_step", 8, timestamp=55.0))
+    window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)
+
+    assert window.reason is None
+    assert window.learner_steps_in_window is None
+    assert window.unavailable["learner_steps_in_window"] == WINDOW_FEWER_THAN_TWO_RECORDS
+
+
 def test_window_marks_batch_buckets_that_miss_their_batches_insufficient(tmp_path):
     _seven_games_with(tmp_path, 5, extra=[("inference_batches", 2)])  # bucket record lost
     window = reduce_window(tmp_path, warmup_games=2, measure_games=2, replay_warmup_positions=18)

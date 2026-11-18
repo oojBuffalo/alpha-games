@@ -775,8 +775,8 @@ WINDOW_BOUND_BY_REPLAY_WARMUP = "replay_warmup_positions"
 
 # Insufficient-data reasons. The first four are window-level
 # (``WindowedRun.reason``): no window exists, so no field holds a number.
-# ``WINDOW_INCOMPLETE_FLUSH`` is both: window-level when a flush at or before
-# the start is incomplete, per-field when one inside the window is.
+# ``WINDOW_INCOMPLETE_FLUSH`` is both: window-level when a missing stored count
+# could move the start, per-field when a flush inside the window is incomplete.
 WINDOW_TOO_FEW_GAMES = "too_few_games_for_window"
 WINDOW_REPLAY_WARMUP_NOT_REACHED = "replay_warmup_positions_not_reached"
 WINDOW_ZERO_SPAN = "zero_span_window"
@@ -840,9 +840,9 @@ class WindowedRun:
             is stamped at or after the start and at or before the end: the
             span would include the time between two launches; a tie with
             either boundary counts, its order being ambiguous) or
-            :data:`WINDOW_INCOMPLETE_FLUSH` (a game flush at or before the
-            start lacks its ``positions_stored`` delta while others carry
-            one, so the start itself is in doubt) -- and every measurement
+            :data:`WINDOW_INCOMPLETE_FLUSH` (a game flush lacks its
+            ``positions_stored`` delta while others carry one, and its
+            unknown count could change the start or its binding condition) -- and every measurement
             is ``None``.
         unavailable: ``{field name: reason}`` for every measurement that is
             ``None``. Under a window-level verdict, every measurement mapped
@@ -851,7 +851,8 @@ class WindowedRun:
             usable record: none in the window for a summed series, none at
             or before the window end for a latest-value one),
             :data:`WINDOW_FEWER_THAN_TWO_RECORDS` (the ``learner_step``
-            series has no record at or before the window start, so the two
+            series has no record at or before the window start within the
+            window's own launch -- after its ``segment_start`` -- so the two
             endpoint readings its difference needs do not exist),
             :data:`WINDOW_TOTAL_DECREASED` (the ``learner_step`` total went
             backwards inside the window, so no endpoint difference counts
@@ -882,7 +883,8 @@ class WindowedRun:
             deltas, per second.
         learner_steps_in_window: The ``learner_step`` total series' endpoint
             difference: its last value at or before ``window_end`` minus its
-            last value at or before ``window_start``. Never a sum of the
+            last value at or before ``window_start`` recorded in the window's
+            own launch (after that launch's ``segment_start``). Never a sum of the
             series' values, which are each already cumulative. The two
             readings may be one record: no step completed in the window, an
             exact ``0`` (the learner writes one record per step). Unavailable
@@ -1047,6 +1049,7 @@ def _window_start(
     *,
     warmup_games: int,
     replay_warmup_positions: int,
+    first_missing_stored: int | None = None,
 ) -> tuple[int | None, str]:
     """Apply the window-start rule -- the one place it is written (§12 M5).
 
@@ -1069,11 +1072,16 @@ def _window_start(
         warmup_games: Condition (a)'s game count.
         replay_warmup_positions: Condition (b)'s stored-position count,
             at least 1.
+        first_missing_stored: Index of the first flush lacking its
+            ``positions_stored`` delta while other flushes carry one, or
+            ``None``. Its unknown count could have met (b) at any flush from
+            there on, so when that could change the start or the binding
+            condition the verdict is :data:`WINDOW_INCOMPLETE_FLUSH`.
 
     Returns:
         ``(index of the start flush, which condition bound it)`` -- (b) when
         one flush meets both -- or ``(None, the insufficient-data reason)``
-        when a condition is never met.
+        when a condition is never met or the start is in doubt.
     """
     games_at = next((i for i, n in enumerate(cumulative_games) if n >= warmup_games), None)
     if games_at is None:
@@ -1081,6 +1089,14 @@ def _window_start(
     stored_at = next(
         (i for i, n in enumerate(cumulative_stored) if n >= replay_warmup_positions), None
     )
+    # (b) truly met somewhere in [first_missing_stored, stored_at]: only a
+    # range lying wholly before (a) leaves the start and the binding fixed.
+    if (
+        first_missing_stored is not None
+        and (stored_at is None or first_missing_stored < stored_at)
+        and (stored_at is None or stored_at >= games_at)
+    ):
+        return None, WINDOW_INCOMPLETE_FLUSH
     if stored_at is None:
         return None, WINDOW_REPLAY_WARMUP_NOT_REACHED
     if stored_at >= games_at:
@@ -1202,9 +1218,10 @@ def reduce_window(
     placed by its run-wide ordinal, so one that shares the start's timestamp
     but is ordered after it is inside. A window must lie inside one launch:
     a ``segment_start`` stamped from the start flush's timestamp through the
-    end flush's gives :data:`WINDOW_SPANS_RELAUNCH`. A flush at or before
-    the start that lacks its ``positions_stored`` delta could have moved the
-    start, and gives :data:`WINDOW_INCOMPLETE_FLUSH` for the whole window.
+    end flush's gives :data:`WINDOW_SPANS_RELAUNCH`. A flush lacking its
+    ``positions_stored`` delta whose unknown count could change the start or
+    its binding condition gives :data:`WINDOW_INCOMPLETE_FLUSH` for the
+    whole window (:func:`_window_start`).
 
     **Aggregation rules.** A summed (``delta``) field adds the window's
     games' flushes, whole. A flush is stamped when its game finishes, so a
@@ -1258,18 +1275,18 @@ def reduce_window(
         cumulative_games.append(games)
         cumulative_stored.append(stored)
 
+    has_stored = [SERIES_POSITIONS_STORED in deltas for _ts, deltas in flushes]
     start, binding = _window_start(
         cumulative_games,
         cumulative_stored,
         warmup_games=warmup_games,
         replay_warmup_positions=replay_warmup_positions,
+        first_missing_stored=(
+            has_stored.index(False) if any(has_stored) and not all(has_stored) else None
+        ),
     )
     if start is None:
         return _insufficient_window(binding)
-    # A flush missing its stored count at or before the start could have
-    # moved the start: the replay warm-up would then be read short.
-    if SERIES_POSITIONS_STORED in _incomplete_series([d for _ts, d in flushes[: start + 1]]):
-        return _insufficient_window(WINDOW_INCOMPLETE_FLUSH)
     target = cumulative_games[start] + measure_games
     end = next((i for i in range(start + 1, len(flushes)) if cumulative_games[i] >= target), None)
     if end is None:
@@ -1303,7 +1320,19 @@ def reduce_window(
         return sums[series] / (span / unit_seconds) if series in sums else None
 
     games_in_window = cumulative_games[end] - cumulative_games[start]
-    step_at_start = _last_at_or_before(ordered, KIND_TOTAL, SERIES_LEARNER_STEP, window_start)
+    # The baseline must come from the window's own launch: an earlier
+    # launch's total can be ahead of the step a learner resumed from.
+    launch_at = max(
+        (
+            i
+            for i, (ts, _proc, _seq, rec) in enumerate(ordered)
+            if ts <= window_start and rec.get("kind") == KIND_SEGMENT_START
+        ),
+        default=-1,
+    )
+    step_at_start = _last_at_or_before(
+        ordered[launch_at + 1 :], KIND_TOTAL, SERIES_LEARNER_STEP, window_start
+    )
     # The reading at the start, then every reading inside the window, in order.
     steps = [step_at_start] + [
         rec["value"]
