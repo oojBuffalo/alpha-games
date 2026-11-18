@@ -20,14 +20,22 @@ construction: :class:`EpochMetricsWriter` picks the next unused epoch for
 instance (a process restart, by definition) always opens a brand-new file
 rather than reopening a stale one.
 
-**Records are flat JSON, one per line, durable before the call returns.**
-:meth:`EpochMetricsWriter.append` opens the file in append mode, writes one
-``json.dumps`` line, and ``flush``\\ es + ``fsync``\\ s before returning --
-not the temp-name-then-``os.replace`` whole-file pattern
+**Each line is one flat record or one record group, durable before the call
+returns.** :meth:`EpochMetricsWriter.append` writes one flat ``json.dumps``
+record as a line; :meth:`EpochMetricsWriter.append_many` writes one
+``record_group`` line carrying several flat records that must be read
+together (one game's accounting -- :mod:`core.actor`). A raw reader must
+expand group lines; :func:`iter_epoch_records` does, so it always yields
+flat records. Either call ``fsync``\ s before returning -- not the
+temp-name-then-``os.replace`` whole-file pattern
 ``core.replay_shard``/``core.checkpoint`` use for *replaceable* artifacts,
-because an append-only log is never replaced, only grown; the durability
-property this module needs is "once ``append`` returns, the record survives
-a crash," which a synced append gives directly. This is also what makes
+because an append-only log is never replaced, only grown by completed
+lines: a write that fails part-way is truncated back to the file's prior
+size before the error propagates, and a line counts only once its
+terminating newline is on disk, so a write a crash cut short is never read
+and a group is read whole or not at all. The durability property this
+module needs is "once ``append`` returns, the record survives a crash,"
+which a synced append gives directly. This is also what makes
 "exactly one marker per version" provable across a crash at any point: a
 caller that checks :func:`iter_epoch_records` for an already-appended record
 before appending again (:mod:`core.learner`'s publish path) can never
@@ -41,12 +49,8 @@ Every documented record carries a ``kind`` field naming what it is (e.g.
 latest-value observation), or ``total`` (a coordinator-owned exact
 cumulative) per the design-doc taxonomy -- issue #62 defines and enforces
 that taxonomy for its own series; this module does not interpret record
-contents, only their durable storage and retrieval -- with one exception of
-its own: a group of records that must be read together is appended as one
-``record_group`` line (:meth:`EpochMetricsWriter.append_many`), which
-:func:`iter_epoch_records` expands back into its records. A line counts only
-once its terminating newline is on disk, so a write cut short by a crash is
-never read, and a group is read whole or not at all.
+contents, only their durable storage and retrieval (the ``record_group``
+frame above is this module's own, not a record kind).
 """
 
 from __future__ import annotations
