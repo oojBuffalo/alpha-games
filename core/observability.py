@@ -30,7 +30,11 @@ name and aggregation rule below is frozen, not an implementation detail.
   leaf count fell in that bucket. A bucket series is written only when its
   count is non-zero, so an absent one reads as zero. The buckets sum to
   ``inference_batches``; mean batch fill is ``positions_evaluated /
-  inference_batches`` exactly, and the buckets bound any percentile of it.
+  inference_batches`` exactly over actor epochs that carry both series --
+  every epoch written since M5. A run resumed from a schema-v1 directory also
+  holds earlier epochs with ``positions_evaluated`` and no batch series, so
+  its fill must be computed over the batch-carrying epochs only. The buckets
+  bound any percentile of it.
 * ``"gauge"`` -- a latest-value observation, never summed: loss components,
   the D5 replay ratio (learner-owned). Only the most recent record in run
   time order matters. :data:`SERIES_ACTOR_AMP_ACTIVE` is the one actor-owned

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from core import actor as actor_module
 from core.actor import (
     VALIDATE_TIER_SIMS,
     ActorDriver,
@@ -531,7 +532,7 @@ def test_above_leaf_batch_size_one_the_search_uses_the_batched_evaluator(tmp_pat
     assert max(batch_sizes) == 2 and all(1 <= n <= 2 for n in batch_sizes)
 
 
-def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path):
+def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path, monkeypatch):
     """No batched evaluator on offer: the engine maps the scalar one over each batch."""
     calls = []
 
@@ -540,9 +541,19 @@ def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path):
         calls.append(state)
         return 0.0, None
 
+    sizes = []
+    real_play_game = actor_module.play_game
+
+    def play_game_spy(game, evaluator, self_play, *args, **kwargs):
+        """Record the leaf batch size the actor hands the game loop, then play."""
+        sizes.append(self_play.leaf_batch_size)
+        return real_play_game(game, evaluator, self_play, *args, **kwargs)
+
+    monkeypatch.setattr(actor_module, "play_game", play_game_spy)
     driver = make_driver(tmp_path, refresh=lambda: (scalar, 1), max_games=1, leaf_batch_size=4)
     assert len(driver.run()) == 1
     assert calls
+    assert sizes == [4]  # the fallback still searches in batches of up to four
 
 
 def test_a_batched_game_is_reproducible_from_its_durable_coordinates(tmp_path):
