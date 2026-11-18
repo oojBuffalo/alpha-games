@@ -20,22 +20,18 @@ construction: :class:`EpochMetricsWriter` picks the next unused epoch for
 instance (a process restart, by definition) always opens a brand-new file
 rather than reopening a stale one.
 
-**Each line is one flat record or one record group, durable before the call
-returns.** :meth:`EpochMetricsWriter.append` writes one flat ``json.dumps``
-record as a line; :meth:`EpochMetricsWriter.append_many` writes one
-``record_group`` line carrying several flat records that must be read
-together (one game's accounting -- :mod:`core.actor`). A raw reader must
-expand group lines; :func:`iter_epoch_records` does, so it always yields
-flat records. Both methods call ``fsync`` before returning -- not the
-temp-name-then-``os.replace`` whole-file pattern
+**Records are flat JSON, newline-terminated lines, durable before the call
+returns.** A line is either one record (:meth:`EpochMetricsWriter.append`) or
+a JSON array of records written together as one group
+(:meth:`EpochMetricsWriter.append_many`; :func:`parse_metrics_line` expands
+either form). A line is readable only once its newline is on disk: a final
+line without one is a write still in progress or cut short, and every reader
+skips it. Each call writes its line and ``fsync``\\ s before returning --
+not the temp-name-then-``os.replace`` whole-file pattern
 ``core.replay_shard``/``core.checkpoint`` use for *replaceable* artifacts,
-because an append-only log is never replaced, only grown by completed
-lines: a write that fails part-way is truncated back to the file's prior
-size before the error propagates, and a line counts only once its
-terminating newline is on disk, so a write a crash cut short is never read
-and a group is read whole or not at all. The durability property this
-module needs is "once ``append`` returns, the record survives a crash,"
-which a synced append gives directly. This is also what makes
+because an append-only log is never replaced, only grown; the durability
+property this module needs is "once ``append`` returns, the record survives
+a crash," which a synced append gives directly. This is also what makes
 "exactly one marker per version" provable across a crash at any point: a
 caller that checks :func:`iter_epoch_records` for an already-appended record
 before appending again (:mod:`core.learner`'s publish path) can never
@@ -49,8 +45,7 @@ Every documented record carries a ``kind`` field naming what it is (e.g.
 latest-value observation), or ``total`` (a coordinator-owned exact
 cumulative) per the design-doc taxonomy -- issue #62 defines and enforces
 that taxonomy for its own series; this module does not interpret record
-contents, only their durable storage and retrieval (the ``record_group``
-frame above is this module's own, not a record kind).
+contents at all, only their durable storage and retrieval.
 """
 
 from __future__ import annotations
@@ -64,9 +59,6 @@ from typing import Any
 
 _METRICS_DIRNAME = "metrics"
 _EPOCH_PATTERN = re.compile(r"^(?P<proc>.+)-(?P<epoch>\d+)\.jsonl$")
-
-#: ``kind`` of the one line :meth:`EpochMetricsWriter.append_many` writes per group.
-RECORD_GROUP_KIND = "record_group"
 
 
 def metrics_dir(run_dir: Path | str) -> Path:
@@ -163,6 +155,25 @@ def list_procs(run_dir: Path | str) -> frozenset[str]:
     return frozenset(procs)
 
 
+def parse_metrics_line(line: str | bytes) -> list[dict[str, Any]]:
+    """Parse one complete metrics line into its records.
+
+    A line is either one record (:meth:`EpochMetricsWriter.append`) or a JSON
+    array of records written as one group (:meth:`EpochMetricsWriter.append_many`).
+
+    Args:
+        line: One newline-free line of an epoch file.
+
+    Returns:
+        The line's records, in order.
+
+    Raises:
+        ValueError: If the line is not valid JSON.
+    """
+    parsed = json.loads(line)
+    return parsed if isinstance(parsed, list) else [parsed]
+
+
 def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any]]:
     """Yield every record ``proc`` has ever durably appended, across all epochs.
 
@@ -177,9 +188,9 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         run_dir: The run's root directory.
         proc: The process name.
 
-    A group appended by :meth:`EpochMetricsWriter.append_many` is yielded
-    as its records, in order, and only whole: an unterminated final line is
-    skipped, so a crash mid-append never exposes part of a group.
+    A line holding a JSON array is one :meth:`EpochMetricsWriter.append_many`
+    group and yields its records in order. A final line with no newline is an
+    incomplete write (still in progress, or cut short) and is skipped.
 
     Yields:
         Each record, parsed from JSON, oldest first.
@@ -195,19 +206,11 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         if m is not None and m.group("proc") == proc:
             epoch_files.append((int(m.group("epoch")), p))
     for _, path in sorted(epoch_files):
-        # A line counts only once its newline is on disk: the text after the
-        # last newline is a write still in flight or one a crash cut short,
-        # and is never yielded (a record group is all one line, so this also
-        # never yields part of a group).
-        *lines, _tail = path.read_text(encoding="utf-8").split("\n")
-        for line in lines:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if record.get("kind") == RECORD_GROUP_KIND:
-                yield from record["records"]
-            else:
-                yield record
+        # The last split element is "" after a complete final line, or the
+        # unterminated tail of an incomplete write: either way, not a record.
+        for line in path.read_text().split("\n")[:-1]:
+            if line.strip():
+                yield from parse_metrics_line(line)
 
 
 class EpochMetricsWriter:
@@ -245,46 +248,52 @@ class EpochMetricsWriter:
         self._write_line(json.dumps(dict(record), sort_keys=True))
 
     def append_many(self, records: Iterable[Mapping[str, Any]]) -> None:
-        """Append records as one group, durable whole or not at all.
+        """Append several records as one line, durable before returning.
 
-        The group is written as a single ``record_group`` line that
-        :func:`iter_epoch_records` expands back into its records. A reader
-        counts a line only once its newline is on disk, so a crash mid-write
-        exposes none of the group, not a prefix of it -- the guarantee one
-        game's accounting needs (:mod:`core.actor`).
-
-        If the write fails part-way (a short write on a full disk or a
-        file-size limit), the file is truncated back to its size before the
-        call and the error re-raised (:meth:`_write_line`).
+        The group is one JSON array on one line, so a reader sees all of it or
+        none of it (records that are only meaningful together, such as one
+        game's counters): :func:`iter_epoch_records` expands a complete array
+        and ignores a final line with no newline -- what a short write, or a
+        process killed during one, leaves behind, and what a concurrent reader
+        sees mid-write.
 
         Args:
             records: Flat, JSON-serializable mappings. Copied, not mutated.
 
         Raises:
-            OSError: If the write or ``fsync`` fails; the file is unchanged.
+            OSError: If the write fails (the file is unchanged) or the
+                ``fsync`` fails (the complete line stays, unsynced).
         """
-        group = {"kind": RECORD_GROUP_KIND, "records": [dict(record) for record in records]}
-        self._write_line(json.dumps(group, sort_keys=True))
+        self._write_line(json.dumps([dict(record) for record in records], sort_keys=True))
 
     def _write_line(self, line: str) -> None:
-        """Append ``line`` and a newline, fsynced; on failure, cut the file back.
+        """Append one newline-terminated line, durable before returning.
 
-        A failed write is truncated away before the error propagates, so a
-        writer that carries on never appends after a partial line.
+        If the write fails part-way (a short write on a full disk or a
+        file-size limit), the file is truncated back to its size before the
+        call and the error re-raised, so no torn line is left behind. Once the
+        complete line is written it is visible to readers and is kept: an
+        ``fsync`` failure is re-raised without removing it.
 
         Args:
-            line: One JSON document with no newline in it.
+            line: The line, without its newline.
+
+        Raises:
+            OSError: If the write fails (the file is unchanged) or the
+                ``fsync`` fails (the complete line stays, unsynced).
         """
-        data = memoryview((line + "\n").encode("utf-8"))
+        view = memoryview((line + "\n").encode("utf-8"))
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
         try:
-            start = os.fstat(fd).st_size
+            start = os.lseek(fd, 0, os.SEEK_END)
             try:
-                while data:
-                    data = data[os.write(fd, data) :]
-                os.fsync(fd)
+                while view:
+                    view = view[os.write(fd, view) :]
             except BaseException:
                 os.ftruncate(fd, start)
                 raise
+            # Not rolled back on failure: the complete line may already have
+            # been read by an incremental reader (core.eval_run's metrics tail).
+            os.fsync(fd)
         finally:
             os.close(fd)

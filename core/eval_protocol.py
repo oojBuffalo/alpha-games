@@ -84,7 +84,7 @@ LIVENESS_MAX_THROUGHPUT_DEGRADATION = 0.05
 #: liveness report beside the thresholds -- pin 10's stated exception, never
 #: part of the hashed registry. Bump on any change to how lag or throughput is
 #: observed.
-LIVENESS_OBSERVATION_RULE_VERSION = 1
+LIVENESS_OBSERVATION_RULE_VERSION = 2
 
 #: Rung-8 historical-opponent selection rule (tasks/m4/001 pin 5): a candidate's
 #: opponents are ``{v - 1, v - ceil(K / RUNG8_LAG_DIVISOR), RUNG8_EARLIEST_VERSION}``,
