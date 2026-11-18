@@ -1459,3 +1459,22 @@ def test_a_wait_retried_after_shutdown_began_does_not_judge_the_target_again(tmp
     assert launched.games_completed() == 2  # the target is met now, but did not stop the run
     launched.wait(poll_interval=0.0, shutdown_grace=0.0)
     assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]
+
+
+def test_two_identical_forced_records_are_both_written(tmp_path, monkeypatch):
+    """Records equal in every field (one clock tick, one name and pid) are still distinct."""
+    import core.observability as observability
+
+    monkeypatch.setattr(observability.time, "time", lambda: 1234.5)
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _HeldProcess(), 1: _HeldProcess()},  # same name and pid
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    launched.shutdown(0.0)
+    assert _orchestrator_kinds(tmp_path) == [
+        KIND_SHUTDOWN_FORCED,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SEGMENT_END,
+    ]

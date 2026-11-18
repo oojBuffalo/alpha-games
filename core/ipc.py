@@ -648,7 +648,10 @@ class LaunchedRun:
     spike_games: int | None = None
     _ended: bool = field(default=False, init=False, repr=False)
     _spike_stop: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _spike_stop_written: bool = field(default=False, init=False, repr=False)
     _final_records: list[dict[str, Any]] | None = field(default=None, init=False, repr=False)
+    _final_written: int = field(default=0, init=False, repr=False)
+    _attempt: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
@@ -733,8 +736,7 @@ class LaunchedRun:
         if self._final_records is not None:
             # A retry after a failed finalization write: the run is already
             # stopped, so the target is not judged again.
-            if self._spike_stop is not None:
-                self._append_once(self._spike_stop)
+            self._write_spike_stop()
             self.shutdown(shutdown_grace)
             return
         try:
@@ -748,7 +750,7 @@ class LaunchedRun:
                             self._spike_stop = spike_stop_record(
                                 target=self.spike_games, games_completed=completed
                             )
-                        self._append_once(self._spike_stop)
+                        self._write_spike_stop()
                         break
                     if not (actors_alive and learner_alive):
                         break
@@ -818,18 +820,33 @@ class LaunchedRun:
             return
         if self._final_records is None:
             self._final_records = self._stop_children(timeout)
-        for record in self._final_records:
-            self._append_once(record)
+        while self._final_written < len(self._final_records):
+            self._append_once(self._final_records[self._final_written])
+            self._final_written += 1
         self._ended = True
 
+    def _write_spike_stop(self) -> None:
+        """Write the decided ``spike_stop`` record, if any and not yet written."""
+        if self._spike_stop is not None and not self._spike_stop_written:
+            self._append_once(self._spike_stop)
+            self._spike_stop_written = True
+
     def _append_once(self, record: dict[str, Any]) -> None:
-        """Append ``record`` unless an earlier, failed attempt already wrote it in full.
+        """Append ``record``, unless its own failed attempt already wrote it in full.
+
+        Only the record whose append last raised is checked, against the
+        file's last complete line: an append that raised after its line was
+        complete (a failed ``fsync``) leaves exactly that line last.
 
         Args:
             record: One finalization record, built once and reused by retries.
         """
-        if not self.metrics_writer.contains(record):
-            self.metrics_writer.append(record)
+        if self._attempt is record and self.metrics_writer.last_record() == record:
+            self._attempt = None
+            return
+        self._attempt = record
+        self.metrics_writer.append(record)
+        self._attempt = None
 
     def _stop_children(self, timeout: float) -> list[dict[str, Any]]:
         """Signal, join and, past the grace period, kill and reap every child.
