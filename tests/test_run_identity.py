@@ -24,14 +24,17 @@ Four layers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
 from core.run_identity import (
     LAUNCH_SCHEMA_VERSION,
+    STORAGE_POLICY_D12_DROP,
     LaunchConfig,
     Lineage,
     MaterialConfigDiffError,
@@ -39,12 +42,14 @@ from core.run_identity import (
     RuntimeConfig,
     UnclassifiedFieldError,
     compute_config_hash,
+    compute_document_hash,
     device_kind,
     diff_launch_configs,
     generate_run_id,
     load_launch_config,
     read_run_record,
     read_stored_config,
+    read_stored_config_document,
     resolve_fork,
     resolve_resume,
     run_root,
@@ -53,6 +58,32 @@ from core.run_identity import (
 from core.runconfig import MICRO_RUN_CONFIG_PATH, RunConfig
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# A genuine schema-v1 stored ``config.json``: ``configs/blokus_duo.json`` as the
+# M3-era code (main at 2026-08-24, the acceptance-run tree) parsed and wrote it
+# through ``write_provenance`` -- no ``self_play.leaf_batch_size``, and no
+# evaluation-protocol stamps either (those arrived with M4).
+V1_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v1.json"
+
+# ``compute_config_hash`` of that config as the same M3-era code computed it at
+# launch -- the digest whose first 12 hex chars a real run id of that era ends in.
+V1_LAUNCH_TIME_HASH = "1f18e71e6f6b73f649e2d2c05107aca832773dd88d56de9a6e8964ad8ff536a3"
+
+# A genuine schema-v2 stored ``config.json``: ``configs/blokus_duo.json`` as the
+# batched-leaf-inference branch (at commit c77fd68) parsed and wrote it through
+# ``write_provenance`` -- ``self_play.leaf_batch_size`` present, no
+# playout-cap-randomization keys.
+V2_CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "run_identity" / "config_v2.json"
+
+# The five ``self_play`` keys schema v3 adds, and the values a document of an
+# older schema migrates to: PCR off, the D6 scalars as inert defaults.
+PCR_OFF_DEFAULTS = {
+    "playout_cap_randomization": False,
+    "pcr_mid_sims": 256,
+    "pcr_fast_sims": 64,
+    "pcr_mid_probability": 0.25,
+    "pcr_full_plies": 2,
+}
 
 
 def _base_raw():
@@ -196,6 +227,12 @@ MATERIAL_FIELDS = (
     "self_play.dirichlet_eps",
     "self_play.dirichlet_alpha_numerator",
     "self_play.root_noise",
+    "self_play.leaf_batch_size",
+    "self_play.playout_cap_randomization",
+    "self_play.pcr_mid_sims",
+    "self_play.pcr_fast_sims",
+    "self_play.pcr_mid_probability",
+    "self_play.pcr_full_plies",
     "training.games",
     "training.learner_steps",
     "training.steps_per_game",
@@ -261,6 +298,19 @@ def _bump(value):
     raise TypeError(f"cannot bump {value!r}")
 
 
+def _override_pcr_on(raw: dict) -> None:
+    """Turn playout-cap randomization on in place, keeping the config valid.
+
+    The flag alone is not schema-valid on the micro base: PCR on needs
+    ``sims`` above the mid tier, so the always-full budget moves with it.
+
+    Args:
+        raw: A launch-config dict, mutated in place.
+    """
+    raw["self_play"]["playout_cap_randomization"] = True
+    raw["self_play"]["sims"] = 512
+
+
 def _override_training_games(raw: dict) -> None:
     raw["training"]["games"] += 1
     raw["training"]["learner_steps"] = raw["training"]["games"] * raw["training"]["steps_per_game"]
@@ -284,6 +334,10 @@ def _override_training_steps_per_game(raw: dict) -> None:
 FIELD_OVERRIDES = {
     "game_config": lambda raw: _set_dotted(raw, "game_config", "FULL_CONFIG"),
     "self_play.dirichlet_eps": lambda raw: _set_dotted(raw, "self_play.dirichlet_eps", 0.5),
+    "self_play.playout_cap_randomization": _override_pcr_on,
+    "self_play.pcr_mid_probability": lambda raw: _set_dotted(
+        raw, "self_play.pcr_mid_probability", 0.5
+    ),
     "training.games": _override_training_games,
     "training.learner_steps": _override_training_learner_steps,
     "training.steps_per_game": _override_training_steps_per_game,
@@ -501,6 +555,222 @@ def test_read_stored_config_missing_directory_raises(tmp_path):
 
 
 # ==============================================================================
+# 3b. The versioned stored-config reader (schema v1 -> live)
+# ==============================================================================
+
+
+def _v1_run_dir(
+    tmp_path, run_id="blokus_duo-20260825T000000000000-1f18e71e6f6b", fixture=V1_CONFIG_FIXTURE
+) -> Path:
+    """A run directory carrying a genuine older ``config.json``, byte for byte."""
+    root = tmp_path / run_id
+    root.mkdir(parents=True)
+    (root / "config.json").write_bytes(fixture.read_bytes())
+    (root / "run_record.json").write_text(
+        json.dumps(
+            RunRecord(
+                run_id=run_id, created_at="2026-08-25T00:00:00Z", entry_condition={}
+            ).to_dict()
+        )
+    )
+    return root
+
+
+def test_the_v1_fixture_is_a_genuine_v1_document():
+    raw = json.loads(V1_CONFIG_FIXTURE.read_text())
+    assert raw["schema_version"] == 1 < LAUNCH_SCHEMA_VERSION
+    assert "leaf_batch_size" not in raw["self_play"]
+
+
+def test_versioned_reader_migrates_a_v1_document_and_returns_it_untouched(tmp_path):
+    root = _v1_run_dir(tmp_path)
+    raw, lc = read_stored_config_document(root)
+
+    assert raw == json.loads(V1_CONFIG_FIXTURE.read_text())  # as stored, not migrated
+    assert lc.schema_version == LAUNCH_SCHEMA_VERSION
+    assert lc.run.self_play.leaf_batch_size == 1  # the recorded batch-1 baseline
+    assert lc.run.self_play.sims == raw["self_play"]["sims"]
+    assert read_stored_config(root) == lc  # the one read path
+    # Reading never rewrites the stored document.
+    assert (root / "config.json").read_bytes() == V1_CONFIG_FIXTURE.read_bytes()
+
+
+def test_strict_launch_loader_rejects_the_same_v1_document():
+    """The split: a stored v1 document migrates; a v1 *launch* JSON is refused."""
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        load_launch_config(V1_CONFIG_FIXTURE)
+
+
+def test_a_live_version_document_reads_identically_through_both_paths(tmp_path):
+    root, lc = _write_run(tmp_path)
+    raw, stored = read_stored_config_document(root)
+    assert stored == lc == load_launch_config(root / "config.json")
+    assert raw == lc.to_dict()
+
+
+@pytest.mark.parametrize("version", [LAUNCH_SCHEMA_VERSION + 1, 0, True, "1", None])
+def test_versioned_reader_rejects_a_version_it_has_no_migration_for(tmp_path, version):
+    root, lc = _write_run(tmp_path)
+    doc = lc.to_dict()
+    doc["schema_version"] = version
+    (root / "config.json").write_text(json.dumps(doc))
+    # The strict parser's own two errors, and nothing else: a ``true`` that looked
+    # up the v1 migration step would fail (or pass) for an unrelated reason.
+    expected = "schema_version mismatch|schema_version: expected an int"
+    with pytest.raises((ValueError, TypeError), match=expected):
+        read_stored_config_document(root)
+
+
+@pytest.mark.parametrize("value", [8, 1])
+def test_a_v1_document_already_carrying_leaf_batch_size_is_rejected_not_overwritten(
+    tmp_path, value
+):
+    """The migration fills what v1 could not say; the key's presence is the error.
+
+    Rejected whatever the value -- including ``1``, the value the migration
+    itself would fill: a v1 document cannot carry the key at all.
+    """
+    root = _v1_run_dir(tmp_path)
+    doc = json.loads(V1_CONFIG_FIXTURE.read_text())
+    doc["self_play"]["leaf_batch_size"] = value
+    (root / "config.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="leaf_batch_size"):
+        read_stored_config_document(root)
+
+
+def test_a_v1_cuda_run_refuses_resume_because_its_actors_ran_fp32(tmp_path):
+    """A v1 CUDA actor had no autocast; resuming it now would switch precision."""
+    root = _v1_run_dir(tmp_path)
+    live = load_launch_config(ROOT / "configs" / "blokus_duo.json")
+    assert live.device == "cuda" and live.run.self_play.leaf_batch_size == 1
+
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, live)
+    assert set(excinfo.value.material) == {"actor_inference_amp"}
+
+
+def test_a_v1_cpu_run_resumes_under_the_live_config_and_refuses_a_batched_one(tmp_path):
+    """The migrated object serves the material diff: batch 1 matches, batch 4 does not."""
+    root = _v1_run_dir(tmp_path)
+    doc = json.loads(V1_CONFIG_FIXTURE.read_text())
+    doc["device"] = "cpu"
+    (root / "config.json").write_text(json.dumps(doc))
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["device"] = "cpu"
+    live = LaunchConfig.from_dict(live_raw)
+    assert live.run.self_play.leaf_batch_size == 1
+
+    assert resolve_resume(root, live).effective_config == live
+
+    live_raw["self_play"]["leaf_batch_size"] = 4
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, LaunchConfig.from_dict(live_raw))
+    assert set(excinfo.value.material) == {"self_play.leaf_batch_size"}
+
+
+def test_the_v2_fixture_is_a_genuine_v2_document():
+    raw = json.loads(V2_CONFIG_FIXTURE.read_text())
+    assert raw["schema_version"] == 2 < LAUNCH_SCHEMA_VERSION
+    assert raw["self_play"]["leaf_batch_size"] == 1
+    assert not set(PCR_OFF_DEFAULTS) & set(raw["self_play"])
+
+
+@pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
+def test_an_older_document_migrates_to_pcr_off_with_sims_carried_through(tmp_path, fixture):
+    """Every run before schema v3 searched each ply at the fixed ``sims``."""
+    root = _v1_run_dir(tmp_path, fixture=fixture)
+    raw, lc = read_stored_config_document(root)
+
+    assert raw == json.loads(fixture.read_text())  # as stored, not migrated
+    assert lc.schema_version == LAUNCH_SCHEMA_VERSION == 3
+    migrated = lc.run.self_play
+    assert {key: getattr(migrated, key) for key in PCR_OFF_DEFAULTS} == PCR_OFF_DEFAULTS
+    assert migrated.sims == raw["self_play"]["sims"] == 128
+    assert migrated.leaf_batch_size == 1
+    assert (root / "config.json").read_bytes() == fixture.read_bytes()
+
+
+def test_a_batched_v2_run_keeps_its_leaf_batch_size_through_migration(tmp_path):
+    """The v2 -> v3 step must not reset ``leaf_batch_size`` to the v1 default."""
+    root = _v1_run_dir(tmp_path, fixture=V2_CONFIG_FIXTURE)
+    doc = json.loads(V2_CONFIG_FIXTURE.read_text())
+    doc["self_play"]["leaf_batch_size"] = 8
+    (root / "config.json").write_text(json.dumps(doc))
+
+    _, lc = read_stored_config_document(root)
+    assert lc.run.self_play.leaf_batch_size == 8
+
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["self_play"]["leaf_batch_size"] = 8
+    live = LaunchConfig.from_dict(live_raw)
+    assert resolve_resume(root, live).effective_config == live
+
+
+def test_strict_launch_loader_rejects_the_v2_document():
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        load_launch_config(V2_CONFIG_FIXTURE)
+
+
+@pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
+@pytest.mark.parametrize("key", sorted(PCR_OFF_DEFAULTS))
+def test_an_older_document_already_carrying_a_pcr_key_is_rejected_not_overwritten(
+    tmp_path, fixture, key
+):
+    """Refused from v1 as from v2, in words that name no version the file lacks."""
+    root = _v1_run_dir(tmp_path, fixture=fixture)
+    doc = json.loads(fixture.read_text())
+    doc["self_play"][key] = PCR_OFF_DEFAULTS[key]
+    (root / "config.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match=f"older than schema 3 .*{key}") as raised:
+        read_stored_config_document(root)
+    assert "schema_version 2" not in str(raised.value)
+
+
+@pytest.mark.parametrize("fixture", [V1_CONFIG_FIXTURE, V2_CONFIG_FIXTURE], ids=["v1", "v2"])
+def test_a_fixed_sim_run_resumes_under_the_live_config_and_refuses_a_pcr_one(tmp_path, fixture):
+    """An old fixed-sim run dir never continues under the D6 schedule.
+
+    Both sides run on CPU, which isolates the self-play differences: on CUDA
+    a schema-v1 run also differs in the material ``actor_inference_amp`` (its
+    actors ran float32), so even the matching fixed-sim baseline would not
+    resume there.
+    """
+    root = _v1_run_dir(tmp_path, fixture=fixture)
+    doc = json.loads(fixture.read_text())
+    doc["device"] = "cpu"
+    (root / "config.json").write_text(json.dumps(doc))
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["device"] = "cpu"
+    live = LaunchConfig.from_dict(live_raw)
+    assert live.run.self_play.playout_cap_randomization is False
+
+    assert resolve_resume(root, live).effective_config == live
+
+    pcr_raw = live.to_dict()
+    pcr_raw["self_play"].update(sims=512, playout_cap_randomization=True)
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, LaunchConfig.from_dict(pcr_raw))
+    assert set(excinfo.value.material) == {
+        "self_play.sims",
+        "self_play.playout_cap_randomization",
+    }
+
+    # The schedule scalars are material on their own, PCR on or off.
+    scalars_raw = live.to_dict()
+    scalars_raw["self_play"].update(
+        pcr_mid_sims=200, pcr_fast_sims=32, pcr_mid_probability=0.5, pcr_full_plies=4
+    )
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, LaunchConfig.from_dict(scalars_raw))
+    assert set(excinfo.value.material) == {
+        "self_play.pcr_mid_sims",
+        "self_play.pcr_fast_sims",
+        "self_play.pcr_mid_probability",
+        "self_play.pcr_full_plies",
+    }
+
+
+# ==============================================================================
 # 4. Resume / fork resolution
 # ==============================================================================
 
@@ -567,6 +837,53 @@ def test_resolve_resume_has_no_override_flag_anywhere_in_its_signature():
     assert "force" not in params
 
 
+def _drop_storage_policy(root: Path) -> None:
+    """Rewrite ``run_record.json`` as a record written before the D12 drop existed.
+
+    Args:
+        root: The run directory.
+    """
+    path = root / "run_record.json"
+    raw = json.loads(path.read_text())
+    del raw["storage_policy"]
+    path.write_text(json.dumps(raw))
+
+
+@pytest.mark.parametrize("pcr", [False, True], ids=["fixed-tier", "playout-cap"])
+def test_a_run_recorded_before_the_d12_drop_resumes_only_at_a_fixed_tier(tmp_path, pcr):
+    """A pre-D12 playout-cap run stored its fast plies, so it must be forked, not resumed.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        pcr: Whether the stored run has playout-cap randomization on.
+    """
+    raw = _launch_raw()
+    if pcr:
+        _override_pcr_on(raw)
+    raw["run_dir"] = str(tmp_path / "old PCR runs")  # a path the shell must quote
+    lc = LaunchConfig.from_dict(raw)
+    root = run_root(lc, "run-1")
+    write_provenance(
+        root, lc, RunRecord(run_id="run-1", created_at="2026-01-01T00:00:00Z", entry_condition={})
+    )
+    assert read_run_record(root).storage_policy == STORAGE_POLICY_D12_DROP
+    assert resolve_resume(root, lc).run_id == "run-1"  # a D12 record resumes either way
+
+    _drop_storage_policy(root)
+    assert read_run_record(root).storage_policy is None
+    if not pcr:
+        assert resolve_resume(root, lc).run_id == "run-1"  # every ply stored either way
+        return
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, lc)
+    assert excinfo.value.material == {"self_play.storage_policy": (None, STORAGE_POLICY_D12_DROP)}
+    # The field is derived, not configured, so the message says how to go on.
+    assert "recorded before the D12 drop" in str(excinfo.value)
+    fork = str(excinfo.value).split("--fork-from=", 1)[1].split(" instead of", 1)[0]
+    assert shlex.split(fork) == [str(root)]
+    assert resolve_fork(root, lc, now=1_700_000_500.0).run_id != "run-1"  # the way forward
+
+
 def test_resolve_resume_missing_run_dir_raises(tmp_path):
     lc = _launch_config()
     with pytest.raises(FileNotFoundError):
@@ -586,6 +903,30 @@ def test_resolve_fork_never_diffs_and_gets_a_fresh_identity(tmp_path):
     assert resolution.lineage.parent_config_hash == compute_config_hash(lc)
     assert resolution.lineage.parent_run_dir == str(root)
     assert resolution.lineage.imported_weights_version is None
+
+
+def test_document_hash_of_a_stored_config_is_its_launch_time_config_hash(tmp_path):
+    """``write_provenance`` stores ``to_dict()`` verbatim, so the two hashes agree."""
+    root, lc = _write_run(tmp_path)
+    raw, _ = read_stored_config_document(root)
+    assert compute_document_hash(raw) == compute_config_hash(lc)
+    assert compute_document_hash(lc.to_dict()) == compute_config_hash(lc)
+
+
+def test_fork_from_a_v1_parent_records_the_hash_of_the_document_as_stored(tmp_path):
+    """Lineage hashes the parent's file as persisted, never the migrated object."""
+    parent = _v1_run_dir(tmp_path)
+    stored_bytes = (parent / "config.json").read_bytes()
+
+    resolution = resolve_fork(parent, _launch_config(), now=1_700_000_500.0)
+    recorded = resolution.lineage.parent_config_hash
+
+    canonical = json.dumps(json.loads(stored_bytes), sort_keys=True).encode("utf-8")
+    assert recorded == hashlib.sha256(canonical).hexdigest()  # the unchanged parent file
+    assert recorded == V1_LAUNCH_TIME_HASH  # what the launching code computed
+    assert read_run_record(parent).run_id.endswith(f"-{recorded[:12]}")  # the run id's digest
+    assert recorded != compute_config_hash(read_stored_config(parent))  # not the migration
+    assert (parent / "config.json").read_bytes() == stored_bytes
 
 
 def test_resolve_fork_never_writes_the_parent_directory(tmp_path):

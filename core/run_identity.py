@@ -25,6 +25,17 @@ forkable **run**:
   are the run directory's provenance IO (``config.json`` verbatim, plus
   ``run_record.json`` carrying the run id, the milestone's static entry
   condition, and fork lineage).
+* **Two read paths, split on who wrote the file.** A *launch* JSON is
+  user-authored and must be current-shape: :func:`load_launch_config` is strict
+  at :data:`LAUNCH_SCHEMA_VERSION`. A *stored* ``config.json`` was written by
+  whatever version of this module launched the run, so everything persisted is
+  read through :func:`read_stored_config_document` (and
+  :func:`read_stored_config`, which delegates to it): an older document is
+  migrated forward step by step (:data:`_STORED_CONFIG_MIGRATIONS`), each step
+  filling the value the run actually ran with. The file itself is never
+  rewritten, and the document *as stored* is what provenance hashes
+  (:func:`compute_document_hash`) -- the migrated object serves validation and
+  the material diff only.
 * :func:`resolve_resume` recomputes the classified diff against a run's
   stored config and raises :class:`MaterialConfigDiffError` naming every
   offending field on any material difference -- **no override flag exists**.
@@ -43,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -103,6 +115,20 @@ FIELD_CLASSIFICATION: dict[str, str] = {
     "self_play.dirichlet_eps": MATERIAL,
     "self_play.dirichlet_alpha_numerator": MATERIAL,
     "self_play.root_noise": MATERIAL,
+    # Batched selection steers concurrent descents apart with virtual loss, so
+    # the batch size changes which leaves are searched -- hence the visit
+    # counts, the moves played, and the data distribution.
+    "self_play.leaf_batch_size": MATERIAL,
+    # Playout-cap randomization (D6) sets how many simulations each ply is
+    # searched with, so the flag and every schedule scalar change the visit
+    # counts, the moves played, and the data distribution. The scalars are
+    # material even while the flag is off: they are part of the recorded
+    # protocol, and erring material only costs a resume refusal.
+    "self_play.playout_cap_randomization": MATERIAL,
+    "self_play.pcr_mid_sims": MATERIAL,
+    "self_play.pcr_fast_sims": MATERIAL,
+    "self_play.pcr_mid_probability": MATERIAL,
+    "self_play.pcr_full_plies": MATERIAL,
     # --- training (D5/§6.2 pinned scalars) ---
     "training.games": MATERIAL,
     "training.learner_steps": MATERIAL,
@@ -170,14 +196,21 @@ class UnclassifiedFieldError(Exception):
 class MaterialConfigDiffError(ValueError):
     """Raised by :func:`resolve_resume` when the passed config differs materially.
 
+    Args:
+        material: The offending fields, dotted path -> ``(stored, new)``.
+        detail: Optional guidance appended to the message, for a field the
+            launch config cannot change (one :func:`resolve_resume` derives
+            from the run's provenance rather than reads from a config).
+
     Attributes:
         material: The offending fields, dotted path -> ``(stored, new)``.
     """
 
-    def __init__(self, material: Mapping[str, tuple[Any, Any]]) -> None:
+    def __init__(self, material: Mapping[str, tuple[Any, Any]], detail: str | None = None) -> None:
         self.material = dict(material)
         fields = ", ".join(sorted(self.material))
-        super().__init__(f"resume refused: material config field(s) differ: {fields}")
+        message = f"resume refused: material config field(s) differ: {fields}"
+        super().__init__(f"{message}. {detail}" if detail else message)
 
 
 def device_kind(device: str) -> str:
@@ -229,7 +262,14 @@ def _flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
 #: :data:`FIELD_CLASSIFICATION` still lists it as material for documentation
 #: completeness (every field must be classified) even though a genuine
 #: mismatch is caught by the loader first.
-LAUNCH_SCHEMA_VERSION = 1
+#:
+#: History (each bump adds one step to :data:`_STORED_CONFIG_MIGRATIONS`):
+#:
+#: * **1** -- the M3 shape.
+#: * **2** -- adds ``self_play.leaf_batch_size`` (§12 M5).
+#: * **3** -- adds ``self_play.playout_cap_randomization`` and the four
+#:   ``self_play.pcr_*`` schedule scalars (D6, §12 M5).
+LAUNCH_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -387,9 +427,9 @@ class LaunchConfig:
         if missing_launch:
             raise ValueError(f"launch config: missing config keys {missing_launch}")
 
-        run_raw = {k: v for k, v in raw.items() if k.startswith("_") or k not in _LAUNCH_ONLY_KEYS}
-        run_config = RunConfig.from_dict(run_raw)
-
+        # The version is checked before anything else is parsed: a document of
+        # another schema is reported as that, never as whichever key the
+        # schemas happen to differ by.
         where = "launch config"
         schema_version = _int(raw, "schema_version", where)
         if schema_version != LAUNCH_SCHEMA_VERSION:
@@ -397,6 +437,10 @@ class LaunchConfig:
                 f"launch config schema_version mismatch: stored={schema_version!r} "
                 f"live={LAUNCH_SCHEMA_VERSION!r}"
             )
+
+        run_raw = {k: v for k, v in raw.items() if k.startswith("_") or k not in _LAUNCH_ONLY_KEYS}
+        run_config = RunConfig.from_dict(run_raw)
+
         num_actors = _int(raw, "num_actors", where)
         device = _str(raw, "device", where)
         runtime = RuntimeConfig.from_dict(_mapping(raw, "runtime", where))
@@ -432,6 +476,20 @@ def load_launch_config(path: Path | str) -> LaunchConfig:
 # --- config hashing + run id --------------------------------------------------
 
 
+def compute_document_hash(document: Mapping[str, Any]) -> str:
+    """Return the canonical sha256 hex digest of a JSON-shaped config document.
+
+    Args:
+        document: A config as nested plain dicts -- a ``LaunchConfig.to_dict()``
+            payload, or a stored ``config.json`` exactly as parsed from disk.
+
+    Returns:
+        The sha256 hex digest of ``json.dumps(document, sort_keys=True)``.
+    """
+    payload = json.dumps(document, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def compute_config_hash(launch_config: LaunchConfig) -> str:
     """Return a canonical sha256 hex digest of a launch config's full content.
 
@@ -439,11 +497,9 @@ def compute_config_hash(launch_config: LaunchConfig) -> str:
         launch_config: The config to hash.
 
     Returns:
-        The sha256 hex digest of ``json.dumps(launch_config.to_dict(),
-        sort_keys=True)``.
+        :func:`compute_document_hash` of ``launch_config.to_dict()``.
     """
-    payload = json.dumps(launch_config.to_dict(), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return compute_document_hash(launch_config.to_dict())
 
 
 _RUN_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -618,8 +674,12 @@ class Lineage:
 
     Attributes:
         parent_run_id: The parent run's id.
-        parent_config_hash: :func:`compute_config_hash` of the parent's
-            stored config, at fork time.
+        parent_config_hash: :func:`compute_document_hash` of the parent's
+            stored ``config.json`` *as persisted*, at fork time -- for a
+            document :func:`write_provenance` wrote, exactly the
+            :func:`compute_config_hash` its launch computed, whose first 12
+            hex chars end the parent's run id. Never a hash of the object the
+            document migrates to.
         parent_run_dir: The parent's concrete run directory, as a string.
         forked_at: ISO-8601 UTC timestamp of the fork.
         imported_weights_version: The parent model version whose weights were
@@ -656,6 +716,13 @@ class Lineage:
         )
 
 
+#: The self-play storage policy every run record written by this code carries
+#: (:attr:`RunRecord.storage_policy`): under playout-cap randomization a
+#: fast-tier position is played but not stored (D12). A record without it was
+#: written before the drop existed, when a playout-cap run stored every ply.
+STORAGE_POLICY_D12_DROP = "d12_drop_fast_tier"
+
+
 @dataclass(frozen=True)
 class RunRecord:
     """One run's provenance metadata, stored as ``run_record.json``.
@@ -668,12 +735,18 @@ class RunRecord:
             (:data:`ENTRY_CONDITION`).
         lineage: This run's fork lineage, or ``None`` for a run launched
             fresh (not forked).
+        storage_policy: The storage policy the run's actors were written
+            under -- :data:`STORAGE_POLICY_D12_DROP` for every record this
+            code writes, ``None`` for a ``run_record.json`` that predates the
+            field. :func:`resolve_resume` refuses a playout-cap run whose
+            record is not D12 (its shards hold fast-tier positions).
     """
 
     run_id: str
     created_at: str
     entry_condition: Mapping[str, Any]
     lineage: Lineage | None = None
+    storage_policy: str | None = STORAGE_POLICY_D12_DROP
 
     def to_dict(self) -> dict[str, Any]:
         """Return this record as a plain, JSON-serializable dict."""
@@ -682,6 +755,7 @@ class RunRecord:
             "created_at": self.created_at,
             "entry_condition": dict(self.entry_condition),
             "lineage": self.lineage.to_dict() if self.lineage is not None else None,
+            "storage_policy": self.storage_policy,
         }
 
     @classmethod
@@ -700,6 +774,7 @@ class RunRecord:
             created_at=raw["created_at"],
             entry_condition=raw["entry_condition"],
             lineage=Lineage.from_dict(lineage_raw) if lineage_raw is not None else None,
+            storage_policy=raw.get("storage_policy"),
         )
 
 
@@ -733,21 +808,142 @@ def write_provenance(root: Path | str, launch_config: LaunchConfig, record: RunR
     _atomic_write_json(root / RUN_RECORD_FILENAME, record.to_dict())
 
 
-def read_stored_config(root: Path | str) -> LaunchConfig:
-    """Read a run directory's recorded ``config.json``.
+def _migrate_v1_to_v2(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate a schema-v1 stored config to v2: fill ``self_play.leaf_batch_size``.
+
+    Every v1 run searched serially -- the engine had no batched path -- so
+    ``1`` is what the run actually ran with, not a guess.
+
+    Args:
+        document: A v1 document; not mutated.
+
+    Returns:
+        The v2-shaped copy.
+
+    Raises:
+        ValueError: If the document already carries
+            ``self_play.leaf_batch_size`` -- a key the v1 schema never had, so
+            its value cannot be what the run ran with and is not silently
+            replaced.
+    """
+    migrated = dict(document)
+    self_play = migrated.get("self_play")
+    if isinstance(self_play, Mapping):  # anything else is from_dict's error to raise
+        if "leaf_batch_size" in self_play:
+            raise ValueError(
+                "stored config: schema_version 1 document carries self_play.leaf_batch_size, "
+                "a key that schema does not have"
+            )
+        migrated["self_play"] = {**self_play, "leaf_batch_size": 1}
+    migrated["schema_version"] = 2
+    return migrated
+
+
+#: What a schema-v2 document migrates to: playout-cap randomization off, with
+#: the D6 schedule scalars as inert defaults.
+_V3_PCR_OFF_DEFAULTS = {
+    "playout_cap_randomization": False,
+    "pcr_mid_sims": 256,
+    "pcr_fast_sims": 64,
+    "pcr_mid_probability": 0.25,
+    "pcr_full_plies": 2,
+}
+
+
+def _migrate_v2_to_v3(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate a schema-v2 stored config to v3: fill playout-cap randomization off.
+
+    Every v2 run searched each ply at the fixed ``self_play.sims`` -- the
+    self-play loop had no per-move budget draw -- so "off" is what the run
+    actually ran with, and ``sims`` is carried through unchanged. The four
+    schedule scalars are inert while the flag is off.
+
+    Args:
+        document: A v2 document, as stored or as migrated from v1; not mutated.
+
+    Returns:
+        The v3-shaped copy.
+
+    Raises:
+        ValueError: If the document already carries any of the keys this step
+            fills -- keys no schema before 3 had, so their values cannot be
+            what the run ran with and are not silently replaced.
+    """
+    migrated = dict(document)
+    self_play = migrated.get("self_play")
+    if isinstance(self_play, Mapping):  # anything else is from_dict's error to raise
+        present = sorted(set(_V3_PCR_OFF_DEFAULTS) & set(self_play))
+        if present:
+            raise ValueError(
+                f"stored config: a document older than schema 3 carries self_play keys "
+                f"{present}, which no schema before 3 has"
+            )
+        migrated["self_play"] = {**self_play, **_V3_PCR_OFF_DEFAULTS}
+    migrated["schema_version"] = 3
+    return migrated
+
+
+#: One step per superseded schema version: ``version -> (document at that
+#: version -> document at version + 1)``. A later schema bump appends its own
+#: step here and nowhere else; :func:`read_stored_config_document` chains them.
+_STORED_CONFIG_MIGRATIONS = {
+    1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
+}
+
+
+def read_stored_config_document(root: Path | str) -> tuple[Any, LaunchConfig]:
+    """Read a run directory's ``config.json``, migrating an older schema forward.
+
+    The single read path for a *persisted* config (module docstring). The
+    stored file is never rewritten: migration happens on a copy, in memory.
 
     Args:
         root: The concrete run directory.
 
     Returns:
-        The stored, validated :class:`LaunchConfig`.
+        ``(document, launch_config)``: the parsed JSON exactly as stored --
+        what provenance hashes (:func:`compute_document_hash`) -- and the
+        validated, current-shape :class:`LaunchConfig` it migrates to.
 
     Raises:
         FileNotFoundError: If no ``config.json`` exists at ``root`` (not a
             run directory this module created).
+        ValueError: If the document's ``schema_version`` is neither live nor
+            one a migration exists for, or the (migrated) document fails
+            :meth:`LaunchConfig.from_dict`'s own checks.
+        TypeError: On a wrong value type, including a non-object document.
     """
-    path = Path(root) / CONFIG_FILENAME
-    return LaunchConfig.from_dict(json.loads(path.read_text()))
+    document = json.loads((Path(root) / CONFIG_FILENAME).read_text())
+    migrated = document
+    while isinstance(migrated, Mapping):
+        version = migrated.get("schema_version")
+        # ``type is int``: a JSON ``true`` must not look up the v1 step.
+        step = _STORED_CONFIG_MIGRATIONS.get(version) if type(version) is int else None
+        if step is None:
+            break  # live, or unknown -- from_dict accepts the one, names the other
+        migrated = step(migrated)
+    return document, LaunchConfig.from_dict(migrated)
+
+
+def read_stored_config(root: Path | str) -> LaunchConfig:
+    """Read a run directory's recorded ``config.json`` as a current-shape config.
+
+    Args:
+        root: The concrete run directory.
+
+    Returns:
+        The stored, validated :class:`LaunchConfig`, migrated to the live
+        schema if it was written under an older one
+        (:func:`read_stored_config_document`).
+
+    Raises:
+        FileNotFoundError: If no ``config.json`` exists at ``root`` (not a
+            run directory this module created).
+        ValueError: As :func:`read_stored_config_document`.
+        TypeError: As :func:`read_stored_config_document`.
+    """
+    return read_stored_config_document(root)[1]
 
 
 def read_run_record(root: Path | str) -> RunRecord:
@@ -809,16 +1005,40 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
     Raises:
         FileNotFoundError: If ``run_dir`` has no recorded provenance.
         MaterialConfigDiffError: If any material field differs, naming every
-            offending field.
+            offending field -- including ``actor_inference_amp`` for a
+            schema-v1 run resumed on CUDA, and ``self_play.storage_policy``
+            for a playout-cap run recorded before the D12 drop (fork either
+            instead).
         UnclassifiedFieldError: If either config carries an unclassified leaf
             field.
     """
     root = Path(run_dir)
-    stored = read_stored_config(root)
+    document, stored = read_stored_config_document(root)
     record = read_run_record(root)
     diff = diff_launch_configs(stored, new_launch_config)
-    if diff.is_material:
-        raise MaterialConfigDiffError(diff.material)
+    material = dict(diff.material)
+    # Launch schema 1 predates actor-side autocast (``core.amp``): its CUDA
+    # actors ran float32 inference, which a resume here would switch to
+    # float16 under the same run id. Off CUDA the autocast is a no-op.
+    if document["schema_version"] == 1 and device_kind(new_launch_config.device) == "cuda":
+        material["actor_inference_amp"] = (False, True)
+    # A playout-cap run recorded before D12 stored its fast-tier positions;
+    # resuming it here would mix both storage policies in one replay window.
+    # A fixed-tier run stores every ply under either policy.
+    detail = None
+    if (
+        stored.run.self_play.playout_cap_randomization
+        and record.storage_policy != STORAGE_POLICY_D12_DROP
+    ):
+        material["self_play.storage_policy"] = (record.storage_policy, STORAGE_POLICY_D12_DROP)
+        detail = (
+            "self_play.storage_policy is not a config field: this playout-cap run was "
+            "recorded before the D12 drop, so its shards hold fast-tier positions this "
+            "code no longer stores. Continue it as a new run with "
+            f"--fork-from={shlex.quote(str(root))} instead of --resume"
+        )
+    if material:
+        raise MaterialConfigDiffError(material, detail)
     return ResumeResolution(
         run_id=record.run_id,
         run_root=root,
@@ -849,7 +1069,9 @@ def resolve_fork(
 
     Never diffs against the parent (module docstring) -- forks may freely
     change material fields; that is their purpose. The parent run directory
-    is never written to.
+    is never written to. The parent's stored config must still read as a
+    valid config (migrated if it is of an older schema), but the lineage hash
+    is taken over the document as stored.
 
     Args:
         parent_run_dir: The existing run directory to fork from.
@@ -863,9 +1085,11 @@ def resolve_fork(
 
     Raises:
         FileNotFoundError: If ``parent_run_dir`` has no recorded provenance.
+        ValueError: If the parent's stored config cannot be read
+            (:func:`read_stored_config_document`).
     """
     parent_root = Path(parent_run_dir)
-    parent_config = read_stored_config(parent_root)
+    parent_document, _ = read_stored_config_document(parent_root)
     parent_record = read_run_record(parent_root)
     new_run_id = generate_run_id(new_launch_config, now=now)
     return ForkResolution(
@@ -873,7 +1097,7 @@ def resolve_fork(
         run_root=run_root(new_launch_config, new_run_id),
         lineage=Lineage(
             parent_run_id=parent_record.run_id,
-            parent_config_hash=compute_config_hash(parent_config),
+            parent_config_hash=compute_document_hash(parent_document),
             parent_run_dir=str(parent_root),
             forked_at=iso_now(now),
             imported_weights_version=None,

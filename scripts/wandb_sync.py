@@ -203,9 +203,9 @@ from core.observability import (  # noqa: E402
 )
 from core.run_identity import (  # noqa: E402
     LaunchConfig,
-    compute_config_hash,
+    compute_document_hash,
     read_run_record,
-    read_stored_config,
+    read_stored_config_document,
 )
 from games.registry import build_game_factory  # noqa: E402
 
@@ -591,12 +591,16 @@ def _summary_seed(run_dir: Path | str, launch_config: LaunchConfig, run_id: str)
 
     Returns:
         ``run_id``, the config hash, and the adapter's orientation-table hash
-        (``None`` for a game that declares no orientation table).
+        (``None`` for a game that declares no orientation table). The config
+        hash is taken over ``config.json`` *as stored* -- the hash computed at
+        launch, whose first 12 hex chars end ``run_id`` -- never over the
+        object an older-schema document migrates to.
     """
     game = build_game_factory(launch_config.run)()
+    document, _ = read_stored_config_document(run_dir)
     return {
         "run_id": run_id,
-        "config_hash": compute_config_hash(launch_config),
+        "config_hash": compute_document_hash(document),
         "orientation_hash": game.orientation_table_hash,
     }
 
@@ -658,7 +662,10 @@ def _init_wandb_run(
 
     The W&B run id is the run's own ``run_id`` (``core.run_identity``), with
     ``resume="allow"``: syncing the same run dir a second time continues the
-    same W&B run rather than creating a duplicate.
+    same W&B run rather than creating a duplicate. The W&B config is the
+    run's ``config.json`` exactly as stored, not the current-shape object it
+    parses to: it is the record of what was launched, and it stays byte-for-byte
+    the same across re-syncs however the launch schema evolves afterwards.
 
     Args:
         wandb: The imported ``wandb`` module (:func:`_require_wandb`).
@@ -671,7 +678,7 @@ def _init_wandb_run(
         summary fields already set.
     """
     root = Path(run_dir)
-    launch_config = read_stored_config(root)
+    document, launch_config = read_stored_config_document(root)
     record = read_run_record(root)
 
     run = wandb.init(
@@ -679,7 +686,7 @@ def _init_wandb_run(
         project=project,
         entity=entity,
         resume="allow",
-        config=launch_config.to_dict(),
+        config=document,
         tags=_tags(launch_config),
     )
     for key, value in _summary_seed(root, launch_config, record.run_id).items():

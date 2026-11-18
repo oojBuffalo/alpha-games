@@ -1,0 +1,63 @@
+{
+  "device": "cuda",
+  "evaluation": {
+    "agent_form": "rung7_mcts_policy_value",
+    "eval_seed": 97531,
+    "min_score_rate": 0.7,
+    "move_selection": "argmax_n",
+    "n_pairs": 100,
+    "opponent": "rung1_uniform_random",
+    "protocol_fingerprint": "365cb8117cd390ed22b67c2af0a178efd0b42fc851e5354a961a16626271da25",
+    "protocol_version": 2,
+    "root_noise": false,
+    "sims": 128
+  },
+  "game": "blokus_duo",
+  "game_config": "FULL_CONFIG",
+  "loss_predicates": {
+    "head_window_steps": 200,
+    "policy_max_ratio": 0.7,
+    "tail_window_steps": 200,
+    "value_max_ratio": 0.8
+  },
+  "name": "blokus_duo",
+  "num_actors": 4,
+  "run_dir": "runs/blokus_duo",
+  "run_seed": 4096,
+  "runtime": {
+    "ceiling_poll_interval": 1.0,
+    "pacing_poll_interval": 1.0,
+    "refresh_poll_interval": 1.0
+  },
+  "schema_version": 2,
+  "self_play": {
+    "dirichlet_alpha_numerator": 10.8,
+    "dirichlet_eps": 0.25,
+    "k_temp": 8,
+    "leaf_batch_size": 1,
+    "root_noise": true,
+    "sims": 128
+  },
+  "throughput": {
+    "measure_games": 200,
+    "min_projected_games_per_hour": 100.0,
+    "projection_plies_per_game": 35,
+    "projection_sims": 128,
+    "warmup_games": 50
+  },
+  "training": {
+    "aux_loss_weight": 0.25,
+    "batch_size": 256,
+    "checkpoint_count": 30,
+    "checkpoint_selection": "final",
+    "cosine_total_steps": 6000,
+    "games": 6000,
+    "learner_steps": 6000,
+    "learning_rate": 0.02,
+    "publish_interval": 200,
+    "replay_warmup_positions": 1024,
+    "replay_window": 250000,
+    "steps_per_game": 1,
+    "warmup_steps": 600
+  }
+}

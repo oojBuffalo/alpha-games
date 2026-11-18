@@ -9,14 +9,17 @@ and is deliberately kept out of ``core.selfplay`` so the shared loop stays a
 plain function any caller (the micro loop, evaluation, this module) can drive
 without inheriting actor concerns it doesn't have.
 
-**The D6 validate tier is an actor-layer assertion, not a game-loop one.**
-``core.selfplay.play_game`` stays fully parameterizable over ``cfg.sims`` —
-the micro loop runs it at 64, evaluation at whatever ``EvaluationConfig.sims``
-names. :class:`ActorDriver` is the caller that is *pinned* to "fixed 128
-sims, no playout-cap randomization" (§7), so that is exactly where the check
-belongs: :func:`validate_actor_self_play_config` runs once, at construction,
-and raises loudly rather than letting a misconfigured actor silently search
-at the wrong budget for an entire run.
+**The D6 budgets are an actor-layer assertion, not a game-loop one.**
+``core.selfplay.play_game`` stays fully parameterizable over its config —
+the micro loop runs it at a fixed 64, evaluation at whatever
+``EvaluationConfig.sims`` names. :class:`ActorDriver` is the caller that is
+*pinned* to D6 (§7), in exactly two shapes: the validate tier (fixed 128
+sims, playout-cap randomization off) and the playout-cap schedule (plies 0-1
+at 512; later plies 25% at 256, 75% at 64). So that is exactly where the
+check belongs: :func:`validate_actor_self_play_config` runs once, at
+construction, and raises loudly on anything else — a hybrid of the two
+included — rather than letting a misconfigured actor silently search at the
+wrong budget for an entire run.
 
 **Durable identity has exactly one source: the writer's persisted state.**
 ``core.replay_shard.ShardWriter`` already owns a crash-safe
@@ -43,7 +46,9 @@ played at that index.
 strictly before the game it pins is played, and its returned
 ``model_version`` is stamped onto every sample of that game
 (``core.selfplay.play_game``'s new optional parameter) and never changes
-until the next call. ``pacing``, when supplied, is polled the same way,
+until the next call -- within-search leaf batching (``self_play.leaf_batch_size``, §12
+M5) never crosses a game boundary, so a batch is always evaluated by the one
+version its game is pinned to. ``pacing``, when supplied, is polled the same way,
 before ``refresh`` — a "hold" response defers to an injectable ``wait``
 strategy (real backoff in production; instrumented and sleep-free in tests)
 until it clears. Neither hook's cadence depends on this module knowing
@@ -56,14 +61,39 @@ publication) build against.
 supplies them (every test predating this issue) gets byte-identical
 behavior. When both are given, every finished game flushes three ``delta``
 records to ``metrics_writer`` at the game boundary: ``games_completed``
-(always ``1``), ``sims_run`` (``result.plies * self_play.sims`` -- exact and
-cheap, since a validate-tier actor runs no playout-cap randomization, so
-every ply searches exactly ``self_play.sims`` simulations), and
+(always ``1``), ``sims_run`` (``GameResult.sims_run`` -- the exact sum of
+the budgets the game's plies were searched at, which under playout-cap
+randomization is not ``plies * self_play.sims``), and
 ``positions_evaluated`` (drained from ``position_counter``, which the
 caller is responsible for wiring into the actual evaluator via
 ``core.observability.count_positions`` -- this module never constructs an
 evaluator itself). ``positions_evaluated`` is omitted entirely when no
-``position_counter`` was supplied, never written as a fabricated zero.
+``position_counter`` was supplied, never written as a fabricated zero. An
+optional ``batch_counter``, wired into the evaluator the same way, adds the
+inference-batch accounting deltas to the same flush (``inference_batches``
+plus the non-zero size buckets -- ``core.observability``), under the same
+omitted-when-absent rule. A game played under playout-cap randomization also
+flushes its per-tier move counts (``moves_full_512`` / ``moves_mid_256`` /
+``moves_fast_64``, each only when non-zero); a validate-tier game writes none.
+Every game, in either shape, flushes ``positions_played`` and
+``positions_stored``: the positions it searched and played, and the ones it
+published. They differ only under playout-cap randomization, where the fast
+tier's positions are dropped (D12). With them goes
+``consecutive_mover_transitions``, the game's count of plies whose mover
+also made the ply before, counted over the complete played sequence. A
+shard keeps each stored sample's ply and mover, so it still shows a skip
+whose two plies were both stored; a skip next to a dropped ply is recorded
+only by this counter, the one complete count of them.
+
+**The shard is published before the metrics are flushed.** A crash between
+the two leaves a durable game that no counter records, so the counters can
+under-count the shards but never over-count them. A game's series are
+appended as one group in a single synced write
+(:meth:`~core.metrics.EpochMetricsWriter.append_many`), never one synced
+record at a time, so no failure between two of its records can leave the
+group's first records durable without the rest: the played/stored/tier
+identities hold over every game that flushed, and ``positions_stored`` is
+exact for each of them.
 """
 
 from __future__ import annotations
@@ -73,34 +103,54 @@ from collections.abc import Callable
 from pathlib import Path
 
 from core.game import Game
-from core.mcts import Evaluator
+from core.mcts import BatchEvaluator, Evaluator
 from core.metrics import EpochMetricsWriter
 from core.observability import (
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
+    SERIES_MOVES_FAST_64,
+    SERIES_MOVES_FULL_512,
+    SERIES_MOVES_MID_256,
     SERIES_POSITIONS_EVALUATED,
+    SERIES_POSITIONS_PLAYED,
+    SERIES_POSITIONS_STORED,
     SERIES_SIMS_RUN,
+    InferenceBatchCounter,
     PositionCounter,
     delta_record,
 )
 from core.replay_shard import PendingSample, ShardWriter
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
-from core.selfplay import GameResult, Sample, play_game
+from core.selfplay import TIER_FAST, TIER_FULL, TIER_MID, GameResult, Sample, play_game
 
 # D6: validate the loop at a fixed simulation count first (§7); the actor is
 # pinned to it, the shared game loop is not.
 VALIDATE_TIER_SIMS = 128
 
-# The playout-cap-randomization flag D8/M5 will eventually add to
-# SelfPlayConfig, under a name not yet pinned. Read defensively via getattr
-# rather than a direct attribute access, so this check is already correct
-# (the attribute is absent => PCR is absent) and needs no edit as of M5,
-# only the constant below to be renamed to match whatever M5 pins.
-_PCR_ATTR = "playout_cap_randomization"
+# D6: then the playout-cap schedule (§7) -- plies 0-1 always at the full
+# budget; every later ply at the mid budget with this probability, else fast.
+PCR_FULL_SIMS = 512
+PCR_MID_SIMS = 256
+PCR_FAST_SIMS = 64
+PCR_MID_PROBABILITY = 0.25
+PCR_FULL_PLIES = 2
+
+# The delta series each playout-cap tier's plies are counted under. The fixed
+# tier (playout-cap randomization off) has none: ``sims_run / sims`` is its
+# ply count.
+_TIER_SERIES = {
+    TIER_FULL: SERIES_MOVES_FULL_512,
+    TIER_MID: SERIES_MOVES_MID_256,
+    TIER_FAST: SERIES_MOVES_FAST_64,
+}
 
 # One weight refresh: the evaluator to search with (None = the M0 uniform/zero
-# path) and the model version pinned for every sample of the next game.
-RefreshResult = tuple[Evaluator | None, int]
+# path), the model version pinned for every sample of the next game, and --
+# optionally -- the same weights as a batched evaluator, which the driver
+# searches with when ``self_play.leaf_batch_size > 1``. A refresh that has no
+# batched evaluator returns the two-element form.
+RefreshResult = tuple[Evaluator | None, int] | tuple[Evaluator | None, int, BatchEvaluator | None]
 RefreshFn = Callable[[], RefreshResult]
 
 # True = hold production (the learner is behind the replay-ratio floor,
@@ -111,25 +161,43 @@ StopFn = Callable[[], bool]
 
 
 def validate_actor_self_play_config(cfg: SelfPlayConfig) -> None:
-    """Assert ``cfg`` is the D6 validate tier an :class:`ActorDriver` requires.
+    """Assert ``cfg`` is one of the two D6 shapes an :class:`ActorDriver` runs.
+
+    The validate tier is ``sims == 128`` with playout-cap randomization off
+    (the ``pcr_*`` scalars are unused there and not checked). The playout-cap
+    schedule is the flag on with ``sims`` and all four ``pcr_*`` scalars at
+    the D6 pins. Nothing in between is accepted; ``leaf_batch_size`` is free
+    in both.
 
     Args:
         cfg: The self-play scalars an actor is about to be built with.
 
     Raises:
-        ValueError: If ``cfg.sims`` is not exactly :data:`VALIDATE_TIER_SIMS`,
-            or playout-cap randomization is enabled.
+        ValueError: If ``cfg`` is neither shape.
     """
-    if cfg.sims != VALIDATE_TIER_SIMS:
-        raise ValueError(
-            "actor self-play config must run the D6 validate tier: sims must be "
-            f"exactly {VALIDATE_TIER_SIMS}, got {cfg.sims}"
-        )
-    if getattr(cfg, _PCR_ATTR, False):
-        raise ValueError(
-            "actor self-play config must run the D6 validate tier: playout-cap "
-            "randomization must be absent or disabled"
-        )
+    schedule = (
+        cfg.sims,
+        cfg.pcr_mid_sims,
+        cfg.pcr_fast_sims,
+        cfg.pcr_mid_probability,
+        cfg.pcr_full_plies,
+    )
+    d6_schedule = (PCR_FULL_SIMS, PCR_MID_SIMS, PCR_FAST_SIMS, PCR_MID_PROBABILITY, PCR_FULL_PLIES)
+    if cfg.playout_cap_randomization:
+        if schedule == d6_schedule:
+            return
+    elif cfg.sims == VALIDATE_TIER_SIMS:
+        return
+    raise ValueError(
+        "actor self-play config must be one of the two D6 shapes: the validate tier "
+        f"(sims {VALIDATE_TIER_SIMS}, playout-cap randomization off) or the playout-cap "
+        f"schedule (playout-cap randomization on, sims {PCR_FULL_SIMS}, pcr_mid_sims "
+        f"{PCR_MID_SIMS}, pcr_fast_sims {PCR_FAST_SIMS}, pcr_mid_probability "
+        f"{PCR_MID_PROBABILITY}, pcr_full_plies {PCR_FULL_PLIES}); got "
+        f"playout_cap_randomization={cfg.playout_cap_randomization}, sims={cfg.sims}, "
+        f"pcr_mid_sims={cfg.pcr_mid_sims}, pcr_fast_sims={cfg.pcr_fast_sims}, "
+        f"pcr_mid_probability={cfg.pcr_mid_probability}, pcr_full_plies={cfg.pcr_full_plies}"
+    )
 
 
 def _default_wait() -> None:
@@ -173,7 +241,7 @@ def _to_pending_sample(sample: Sample) -> PendingSample:
 
 
 class ActorDriver:
-    """Drives whole self-play games for one actor, publishing every position.
+    """Drives whole self-play games for one actor, publishing every stored position.
 
     Owns the pieces that are specific to being *an actor* rather than to
     playing one game: the D6 config assertion, the durable
@@ -187,7 +255,7 @@ class ActorDriver:
             caller constructs it, exactly as ``core.selfplay.play_game``
             expects.
         self_play: The self-play scalars every game is played with; must be
-            the D6 validate tier (:func:`validate_actor_self_play_config`).
+            one of the two D6 shapes (:func:`validate_actor_self_play_config`).
         run_id: This run's identity (constant across every actor in the run).
         actor_id: This actor's durable identifier within the run — an
             ``int`` because ``core.seeding.GameRNGs.for_actor_game`` requires
@@ -199,7 +267,10 @@ class ActorDriver:
         refresh: Called once per game, strictly before that game is played,
             never while a search is in flight. Returns the evaluator to
             search with and the model version pinned for every sample of the
-            next game.
+            next game, plus optionally a batched evaluator over the same
+            weights (:data:`RefreshResult`). The batched one is used only
+            when ``self_play.leaf_batch_size > 1``: at ``1`` the search is the
+            serial one through the scalar evaluator, exactly as before.
         pacing: Optional. Polled the same way as ``refresh``, before it, on
             every iteration of :meth:`run`'s loop; while it returns ``True``
             the driver calls ``wait`` and polls again rather than starting a
@@ -215,7 +286,10 @@ class ActorDriver:
             stops as soon as either says to.
         metrics_writer: Optional. When given, every finished game flushes
             ``games_completed`` / ``sims_run`` / ``positions_evaluated``
-            deltas to it (module docstring). ``None`` (the default) disables
+            deltas to it, the played and stored position counts, the
+            consecutive-mover transition count, and the per-tier move counts
+            under playout-cap randomization (module docstring). ``None`` (the
+            default) disables
             all metrics flushing — backward compatible with every existing
             caller.
         position_counter: Optional. Drained once per game to populate the
@@ -223,10 +297,14 @@ class ActorDriver:
             ``metrics_writer`` is also given. The caller wires this counter
             into the actual evaluator (``core.observability.count_positions``)
             — this module only drains it.
+        batch_counter: Optional. Drained once per game to populate the
+            inference-batch accounting deltas; only consulted when
+            ``metrics_writer`` is also given, and wired by the caller exactly
+            like ``position_counter``.
 
     Raises:
-        ValueError: If ``self_play`` is not the D6 validate tier, or
-            ``max_games`` is not positive.
+        ValueError: If ``self_play`` is neither D6 shape, or ``max_games``
+            is not positive.
     """
 
     def __init__(
@@ -245,6 +323,7 @@ class ActorDriver:
         should_stop: StopFn | None = None,
         metrics_writer: EpochMetricsWriter | None = None,
         position_counter: PositionCounter | None = None,
+        batch_counter: InferenceBatchCounter | None = None,
     ) -> None:
         validate_actor_self_play_config(self_play)
         if max_games is not None and max_games <= 0:
@@ -262,6 +341,7 @@ class ActorDriver:
         self.should_stop = should_stop
         self.metrics_writer = metrics_writer
         self.position_counter = position_counter
+        self.batch_counter = batch_counter
         self.writer = ShardWriter(Path(out_dir), game, run_id, str(actor_id))
 
     def run(self) -> list[Path]:
@@ -289,8 +369,11 @@ class ActorDriver:
             # iteration for no behavioral gain.
             if self.pacing is not None and self._stop_requested(len(published)):
                 break
-            evaluator, model_version = self.refresh()
-            published.append(self._play_and_publish_one_game(evaluator, model_version))
+            evaluator, model_version, *batched = self.refresh()
+            evaluate_batch = batched[0] if batched and self.self_play.leaf_batch_size > 1 else None
+            published.append(
+                self._play_and_publish_one_game(evaluator, model_version, evaluate_batch)
+            )
         return published
 
     def _stop_requested(self, games_this_call: int) -> bool:
@@ -324,7 +407,12 @@ class ActorDriver:
                 return
             self.wait()
 
-    def _play_and_publish_one_game(self, evaluator: Evaluator | None, model_version: int) -> Path:
+    def _play_and_publish_one_game(
+        self,
+        evaluator: Evaluator | None,
+        model_version: int,
+        evaluate_batch: BatchEvaluator | None = None,
+    ) -> Path:
         """Play one game at the pinned version and publish it as its own shard.
 
         The durable game index is read from the writer's persisted state
@@ -336,6 +424,8 @@ class ActorDriver:
         Args:
             evaluator: This game's leaf evaluator, from ``refresh``.
             model_version: This game's pinned model version, from ``refresh``.
+            evaluate_batch: This game's batched leaf evaluator, or ``None`` to
+                evaluate leaves one at a time through ``evaluator``.
 
         Returns:
             The published shard's path.
@@ -350,6 +440,7 @@ class ActorDriver:
             rngs,
             model_version=model_version,
             game_id=game_id,
+            evaluate_batch=evaluate_batch,
         )
         pending = [_to_pending_sample(sample) for sample in result.samples]
         path = self.writer.write_shard([pending])
@@ -365,12 +456,18 @@ class ActorDriver:
         A no-op unless ``metrics_writer`` was supplied at construction
         (module docstring: optional, off by default). ``games_completed`` is
         always exactly ``1`` -- one flush per finished game. ``sims_run`` is
-        computed directly rather than counted (``result.plies *
-        self.self_play.sims``): an actor is pinned to the D6 validate tier
-        (no playout-cap randomization), so every ply searched exactly
-        ``self.self_play.sims`` simulations, making the product exact.
+        ``result.sims_run``, the exact sum of the budgets the game's plies
+        were searched at. ``positions_played`` and ``positions_stored`` are
+        the game's played and stored position counts, the second exactly the
+        number of samples its shard holds; ``consecutive_mover_transitions``
+        is ``result.consecutive_mover_transitions``, written even when zero.
+        Each playout-cap tier the game played adds its ply count under that
+        tier's series; a validate-tier game played none, so it writes none.
         ``positions_evaluated`` is drained from ``position_counter`` and
         omitted entirely when none was supplied -- never a fabricated zero.
+        The inference-batch deltas are drained from ``batch_counter`` under
+        the same rule. The whole game's records go
+        out in one ``EpochMetricsWriter.append_many`` write.
 
         Args:
             result: The just-finished game.
@@ -378,12 +475,26 @@ class ActorDriver:
         if self.metrics_writer is None:
             return
         now = time.time()
-        self.metrics_writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=now))
-        self.metrics_writer.append(
-            delta_record(SERIES_SIMS_RUN, result.plies * self.self_play.sims, timestamp=now)
-        )
+        values = [
+            (SERIES_GAMES_COMPLETED, 1),
+            (SERIES_SIMS_RUN, result.sims_run),
+            (SERIES_POSITIONS_PLAYED, result.positions_played),
+            (SERIES_POSITIONS_STORED, result.positions_stored),
+            (SERIES_CONSECUTIVE_MOVER_TRANSITIONS, result.consecutive_mover_transitions),
+        ]
+        tier_counts = dict(result.tier_counts)
+        values += [
+            (series, tier_counts[tier])
+            for tier, series in _TIER_SERIES.items()
+            if tier in tier_counts
+        ]
         if self.position_counter is not None:
-            positions = self.position_counter.drain()
-            self.metrics_writer.append(
-                delta_record(SERIES_POSITIONS_EVALUATED, positions, timestamp=now)
-            )
+            values.append((SERIES_POSITIONS_EVALUATED, self.position_counter.drain()))
+        if self.batch_counter is not None:
+            values += self.batch_counter.drain().items()
+        # One write for the whole game, never a durable prefix of it: mean fill,
+        # the bucket histogram and the played/stored/tier identities never see
+        # a game whose flush was cut off part-way.
+        self.metrics_writer.append_many(
+            delta_record(series, value, timestamp=now) for series, value in values
+        )

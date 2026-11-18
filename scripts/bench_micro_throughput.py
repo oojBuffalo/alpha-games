@@ -76,7 +76,7 @@ test battery exercises the arithmetic and the gates, never the spike).
 on/off among the recorded evidence, so both timed paths — the batch-1 forwards
 behind ``r`` (both nets identically, or the ratio is not apples-to-apples) and
 every self-play leaf evaluation — run inside the run's single
-``run_micro.AmpMode`` context, inference-only (``torch.inference_mode`` +
+``core.amp.AmpMode`` context, inference-only (``torch.inference_mode`` +
 autocast, no ``GradScaler``). The reported flag is then read back out of
 :attr:`ForwardRatio.amp` and :attr:`SpikeResult.amp`, both *observed* from
 inside those contexts, and the two must agree — nothing recomputes
@@ -122,12 +122,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# ``run_micro`` (sibling script, on sys.path above): the spike times *the*
-# learner step and *the* AMP policy, not copies of them — any drift between a
-# re-implementation here and the real loop would silently change the measured
-# number, which is the one thing this script exists to get right.
-from run_micro import AmpMode, _learner_step, amp_evaluator, build_game, game_identity  # noqa: E402
+# ``run_micro`` (sibling script, on sys.path above) and ``core.amp``: the spike
+# times *the* learner step and *the* AMP policy, not copies of them — any drift
+# between a re-implementation here and the real loop would silently change the
+# measured number, which is the one thing this script exists to get right.
+from run_micro import _learner_step, build_game, game_identity  # noqa: E402
 
+from core.amp import AmpMode, amp_evaluator  # noqa: E402
 from core.game import Game, State  # noqa: E402
 from core.mcts import Evaluator  # noqa: E402
 from core.network import Network, NetworkConfig, make_network_evaluator  # noqa: E402
@@ -164,7 +165,8 @@ class SpikeResult:
     Attributes:
         games: Games completed in the measurement interval.
         plies: Plies played across those games.
-        sims: Simulations run across those games (``plies * sims_per_move``).
+        sims: Simulations run across those games: the sum of each measured
+            game's ``GameResult.sims_run``.
         net_evals: Leaf network evaluations counted by the wrapping evaluator.
         learner_steps: Learner steps taken inside the interval.
         legal_at_eval: Legal-set sizes seen at evaluated leaves, summed.
@@ -337,7 +339,8 @@ class RunMeta:
             hash — Invariant 4).
         warmup_games: Games discarded before measurement.
         measure_games: Games in the measurement interval.
-        sims: Micro sims/move during the spike.
+        sims: Micro sims/move during the spike (``self_play.sims``; :func:`main`
+            refuses a playout-cap config, so it is the fixed per-move budget).
         date: Run date, ``YYYY-MM-DD``.
     """
 
@@ -479,7 +482,7 @@ def counting_evaluator(evaluator: Evaluator, amp: AmpMode) -> tuple[Evaluator, l
 
     The third counter is the AMP measurement: it asks torch, per evaluation,
     whether autocast is live *at that moment*. For it to see anything, this
-    wrapper must sit **inside** ``run_micro.amp_evaluator``'s context — which
+    wrapper must sit **inside** ``core.amp.amp_evaluator``'s context — which
     is exactly how :func:`run_spike` composes them, and why the report's AMP
     flag describes the forwards that ran rather than the device they ran on.
 
@@ -705,7 +708,7 @@ def run_spike(
         device=str(device),
     )
 
-    plies = net_evals = legal = amp_evals = measured_steps = 0
+    plies = sims = net_evals = legal = amp_evals = measured_steps = 0
     self_play_seconds = train_seconds = 0.0
     started = 0.0
     # The learner-step index is monotonic across warm-up and measurement — it
@@ -716,7 +719,7 @@ def run_spike(
         measuring = index >= warmup_games
         if index == warmup_games:
             # Discard everything the warm-up accumulated, then start the clock.
-            plies = net_evals = legal = amp_evals = measured_steps = 0
+            plies = sims = net_evals = legal = amp_evals = measured_steps = 0
             self_play_seconds = train_seconds = 0.0
             started = time.perf_counter()
 
@@ -754,6 +757,7 @@ def run_spike(
 
         if measuring:
             plies += result.plies
+            sims += result.sims_run
             net_evals += counters[0]
             legal += counters[1]
             amp_evals += counters[2]
@@ -772,7 +776,7 @@ def run_spike(
     return SpikeResult(
         games=measure_games,
         plies=plies,
-        sims=plies * cfg.self_play.sims,
+        sims=sims,
         net_evals=net_evals,
         learner_steps=measured_steps,
         legal_at_eval=legal,
@@ -1276,7 +1280,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Run the spike, project, and emit the report and the mechanical verdict.
 
-    AMP is resolved once (:class:`~run_micro.AmpMode`) and that one value opens
+    AMP is resolved once (:class:`~core.amp.AmpMode`) and that one value opens
     every autocast context; the header's AMP flag comes back out of the two
     measurements via :func:`observed_amp`, never from the device. An official
     run always persists its report (:func:`resolve_out_path`).
@@ -1289,13 +1293,21 @@ def main(argv: list[str] | None = None) -> int:
 
     Raises:
         SystemExit: From :func:`require_official_hardware` when the hardware is
-            not the pinned 4060 Ti 16 GB and the opt-in flag is absent.
+            not the pinned 4060 Ti 16 GB and the opt-in flag is absent; or from
+            this function itself when the config turns playout-cap
+            randomization on (§12 M2.5 pins the spike to a fixed budget,
+            official or not).
         ValueError: From :func:`observed_amp` if the timed forwards and the
             leaf evaluations did not run at the same precision.
     """
     args = parse_args(argv)
     official, device = require_official_hardware(args.allow_unverified_hardware)
     cfg = load_run_config(args.config)
+    if cfg.self_play.playout_cap_randomization:
+        raise SystemExit(
+            "the M2.5 spike is pinned to fixed-budget self-play (§12 M2.5: no PCR); "
+            f"{args.config} turns playout-cap randomization on"
+        )
     warmup_games = (
         args.warmup_games if args.warmup_games is not None else cfg.throughput.warmup_games
     )

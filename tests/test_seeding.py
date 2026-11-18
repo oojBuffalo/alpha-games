@@ -18,6 +18,7 @@ from core.seeding import (
     PURPOSE_DIRICHLET,
     PURPOSE_MOVE_SELECTION,
     PURPOSE_NET_INIT,
+    PURPOSE_PCR_TIER,
     PURPOSE_TIE_BREAK,
     PURPOSE_WINDOW_SAMPLING,
     GameRNGs,
@@ -39,6 +40,7 @@ GOLDEN = {
     (12345, "actor", 3, "game", 0, "move-selection"): 9824953671185842631,
     (12345, "actor", 3, "game", 0, "dirichlet"): 15804084277158994818,
     (12345, "actor", 3, "game", 0, "tie-break"): 687149822308989655,
+    (12345, "actor", 3, "game", 0, "pcr-tier"): 17553845787436354003,
     (12345, "learner", 7, "replay-sampling"): 14003624692365441275,
     (12345, "learner", 7, "augmentation"): 7221077250744959150,
 }
@@ -70,12 +72,15 @@ def test_distinct_labels_give_distinct_seeds():
         (PURPOSE_DIRICHLET,),
         (PURPOSE_MOVE_SELECTION,),
         (PURPOSE_TIE_BREAK,),
+        (PURPOSE_PCR_TIER,),
         (PURPOSE_AUGMENTATION,),
         (PURPOSE_WINDOW_SAMPLING,),
         ("game", 0, PURPOSE_DIRICHLET),
         ("game", 1, PURPOSE_DIRICHLET),
         ("actor", 0, "game", 0, PURPOSE_DIRICHLET),
         ("actor", 1, "game", 0, PURPOSE_DIRICHLET),
+        ("actor", 0, "game", 0, PURPOSE_PCR_TIER),
+        ("actor", 1, "game", 0, PURPOSE_PCR_TIER),
     ]
     seeds = {derive_seed(4242, *lab) for lab in labels}
     assert len(seeds) == len(labels)
@@ -136,8 +141,33 @@ def test_game_bundle_streams_are_distinct():
         rngs.dirichlet.random(),
         rngs.move_selection.random(),
         rngs.tie_break.random(),
+        rngs.pcr_tier.random(),
     }
-    assert len(draws) == 3
+    assert len(draws) == 4
+
+
+def test_the_pcr_tier_stream_is_independent_of_every_other_game_stream():
+    # The D6 tier draw is its own purpose: however many tier draws a game makes, the
+    # Dirichlet, move-selection and tie-break sequences are bit-identical -- and those
+    # three are exactly what they were before the stream existed (their labels, and so
+    # their GOLDEN seeds above, are unchanged).
+    baseline = GameRNGs.for_actor_game(5, actor_id=2, game_index=9)
+    names = ("dirichlet", "move_selection", "tie_break")
+    expected = {name: [getattr(baseline, name).random() for _ in range(5)] for name in names}
+
+    perturbed = GameRNGs.for_actor_game(5, actor_id=2, game_index=9)
+    for _ in range(137):
+        perturbed.pcr_tier.random()
+    for name in names:
+        assert [getattr(perturbed, name).random() for _ in range(5)] == expected[name]
+
+    # ...and the reverse: burning the others leaves the tier sequence untouched.
+    tier_expected = [baseline.pcr_tier.random() for _ in range(5)]
+    burned = GameRNGs.for_actor_game(5, actor_id=2, game_index=9)
+    for name in names:
+        for _ in range(41):
+            getattr(burned, name).random()
+    assert [burned.pcr_tier.random() for _ in range(5)] == tier_expected
 
 
 def test_game_bundle_streams_are_independent():
@@ -210,14 +240,16 @@ def test_canonicalization_never_collides_across_a_part_boundary():
 
 def test_for_actor_game_matches_the_documented_actor_label_family():
     # The exact label family from issue #53: ("actor", actor_id, "game", game_index,
-    # purpose), purpose in {dirichlet, move-selection, tie-break}.
+    # purpose), purpose in {dirichlet, move-selection, tie-break, pcr-tier}.
     rngs = GameRNGs.for_actor_game(12345, actor_id=3, game_index=0)
     dirichlet_golden = GOLDEN[(12345, "actor", 3, "game", 0, "dirichlet")]
     move_golden = GOLDEN[(12345, "actor", 3, "game", 0, "move-selection")]
     tie_break_golden = GOLDEN[(12345, "actor", 3, "game", 0, "tie-break")]
+    pcr_tier_golden = GOLDEN[(12345, "actor", 3, "game", 0, "pcr-tier")]
     assert rngs.dirichlet.random() == random.Random(dirichlet_golden).random()
     assert rngs.move_selection.random() == random.Random(move_golden).random()
     assert rngs.tie_break.random() == random.Random(tie_break_golden).random()
+    assert rngs.pcr_tier.random() == random.Random(pcr_tier_golden).random()
 
 
 def test_for_actor_game_is_sugar_over_for_game_with_the_actor_prefix():
@@ -237,6 +269,7 @@ def test_two_actors_are_decorrelated_for_the_same_game_index():
     assert a.dirichlet.random() != b.dirichlet.random()
     assert a.move_selection.random() != b.move_selection.random()
     assert a.tie_break.random() != b.tie_break.random()
+    assert a.pcr_tier.random() != b.pcr_tier.random()
 
 
 def test_actor_game_index_and_purpose_each_change_the_stream():

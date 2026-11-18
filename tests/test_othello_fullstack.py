@@ -356,6 +356,9 @@ def test_scripted_evaluator_drives_play_game_through_the_pass_regain_trajectory(
     assert pass_sample.mover == OTHELLO.current_player(_TRAJECTORY_STATES[_PASS_PLY])
     assert pass_sample.mover == regain_sample.mover
     assert pass_sample.mover != opponent_sample.mover
+    # ...so an explicit pass keeps the movers alternating: no player ever
+    # moves twice running, unlike an adapter that skips a blocked player.
+    assert result.consecutive_mover_transitions == 0
 
     # z/aux stay mover-relative through the non-monotone consecutive-mover
     # stretch: hand-derived from the decisive terminal outcome, exactly.

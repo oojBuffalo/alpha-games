@@ -17,21 +17,45 @@ count, rather than working around it.
 from __future__ import annotations
 
 import dataclasses
-from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from core import actor as actor_module
+from core.acceptance import _REQUIRED_POSITIVE_SERIES
 from core.actor import (
     VALIDATE_TIER_SIMS,
     ActorDriver,
     validate_actor_self_play_config,
 )
+from core.metrics import EpochMetricsWriter, iter_epoch_records
+from core.observability import (
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
+    SERIES_GAMES_COMPLETED,
+    SERIES_INFERENCE_BATCHES,
+    SERIES_MOVES_FAST_64,
+    SERIES_MOVES_FULL_512,
+    SERIES_MOVES_MID_256,
+    SERIES_POSITIONS_EVALUATED,
+    SERIES_POSITIONS_PLAYED,
+    SERIES_POSITIONS_STORED,
+    SERIES_SIMS_RUN,
+    InferenceBatchCounter,
+    PositionCounter,
+    count_positions,
+    reduce_run,
+)
 from core.replay_shard import read_shard, shard_filename
+from core.run_identity import load_launch_config
 from core.runconfig import load_run_config
+from core.seeding import GameRNGs
+from core.selfplay import play_game
 from games.tictactoe import TicTacToe
+from tests.fixtures.pass_game import PassGame, Scenario
 
 TTT = TicTacToe()
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def self_play_cfg(**overrides):
@@ -61,7 +85,15 @@ def refresh_sequence(versions):
 
 
 def make_driver(
-    tmp_path, *, run_id="run", actor_id=0, run_seed=1, sims=VALIDATE_TIER_SIMS, **kwargs
+    tmp_path,
+    *,
+    run_id="run",
+    actor_id=0,
+    run_seed=1,
+    sims=VALIDATE_TIER_SIMS,
+    leaf_batch_size=1,
+    self_play=None,
+    **kwargs,
 ):
     """Build an :class:`~core.actor.ActorDriver` over TTT with sensible defaults.
 
@@ -72,6 +104,9 @@ def make_driver(
         actor_id: Actor identity within the run.
         run_seed: The run's root seed.
         sims: Self-play sim count (default: the D6 validate tier).
+        leaf_batch_size: Maximum leaves per evaluation (default: serial).
+        self_play: A complete self-play config to use instead of the one
+            built from ``sims`` / ``leaf_batch_size``.
         **kwargs: Forwarded to :class:`~core.actor.ActorDriver` (``refresh``,
             ``pacing``, ``wait``, ``max_games``, ``should_stop``).
 
@@ -81,7 +116,7 @@ def make_driver(
     kwargs.setdefault("refresh", refresh_sequence([1] * 10))
     return ActorDriver(
         game=TTT,
-        self_play=self_play_cfg(sims=sims),
+        self_play=self_play or self_play_cfg(sims=sims, leaf_batch_size=leaf_batch_size),
         run_id=run_id,
         actor_id=actor_id,
         out_dir=tmp_path,
@@ -93,40 +128,83 @@ def make_driver(
 # --- D6 config validation ---------------------------------------------------
 
 
-def test_validate_accepts_exactly_128_sims():
+def d6_cfg(**overrides):
+    """Build the D6 playout-cap-randomization shape an actor accepts.
+
+    Args:
+        **overrides: Fields to replace, e.g. one schedule scalar moved off its
+            pin to build a hybrid.
+
+    Returns:
+        ``sims`` 512 with PCR on over the config's D6 scalar defaults (mid
+        256, fast 64, probability 0.25, always-full boundary 2), then
+        ``overrides`` applied.
+    """
+    return self_play_cfg(**{"sims": 512, "playout_cap_randomization": True, **overrides})
+
+
+def test_validate_accepts_the_validate_tier():
     validate_actor_self_play_config(self_play_cfg(sims=128))
+    # The schedule scalars are inert with the flag off, so they are not checked.
+    validate_actor_self_play_config(self_play_cfg(sims=128, pcr_mid_sims=200, pcr_full_plies=5))
+    # ...which is the shape the checked-in full-game launch config is.
+    shipped = load_launch_config(ROOT / "configs" / "blokus_duo.json").run.self_play
+    assert (shipped.sims, shipped.playout_cap_randomization) == (128, False)
+    validate_actor_self_play_config(shipped)
+
+
+def test_validate_accepts_the_d6_schedule():
+    cfg = d6_cfg()
+    assert (cfg.sims, cfg.pcr_mid_sims, cfg.pcr_fast_sims) == (512, 256, 64)
+    assert (cfg.pcr_mid_probability, cfg.pcr_full_plies) == (0.25, 2)
+    validate_actor_self_play_config(cfg)
+
+
+@pytest.mark.parametrize("leaf_batch_size", [1, 8, 256])
+def test_validate_leaves_the_leaf_batch_size_free_in_both_shapes(leaf_batch_size):
+    validate_actor_self_play_config(self_play_cfg(sims=128, leaf_batch_size=leaf_batch_size))
+    validate_actor_self_play_config(d6_cfg(leaf_batch_size=leaf_batch_size))
 
 
 @pytest.mark.parametrize("bad_sims", [1, 64, 127, 129, 256, 512])
-def test_validate_rejects_any_other_sim_count(bad_sims):
+def test_validate_rejects_any_other_fixed_sim_count(bad_sims):
+    """PCR off, only the validate tier's 128 is an actor shape."""
     with pytest.raises(ValueError, match="128"):
         validate_actor_self_play_config(self_play_cfg(sims=bad_sims))
 
 
-def test_validate_rejects_playout_cap_randomization_when_present_and_true():
-    """Forward-compat: a future SelfPlayConfig.playout_cap_randomization field."""
-    stub = SimpleNamespace(sims=128, playout_cap_randomization=True)
-    with pytest.raises(ValueError, match="playout-cap"):
-        validate_actor_self_play_config(stub)
-
-
-def test_validate_accepts_playout_cap_randomization_when_present_and_false():
-    stub = SimpleNamespace(sims=128, playout_cap_randomization=False)
-    validate_actor_self_play_config(stub)
-
-
-def test_validate_accepts_its_absence_today():
-    """SelfPlayConfig carries no PCR field yet (D8/M5) -- absence must pass."""
-    cfg = self_play_cfg(sims=128)
-    assert not hasattr(cfg, "playout_cap_randomization")
-    validate_actor_self_play_config(cfg)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sims": 513},
+        {"sims": 1024},
+        {"pcr_mid_sims": 255},
+        {"pcr_mid_sims": 128},
+        {"pcr_fast_sims": 65},
+        {"pcr_fast_sims": 32},
+        {"pcr_mid_probability": 0.3},
+        {"pcr_mid_probability": 0.75},
+        {"pcr_full_plies": 0},
+        {"pcr_full_plies": 1},
+        {"pcr_full_plies": 3},
+        # The validate tier's budget with PCR switched on over a smaller schedule.
+        {"sims": 128, "pcr_mid_sims": 64, "pcr_fast_sims": 32},
+    ],
+)
+def test_validate_rejects_a_pcr_schedule_off_the_d6_pins(overrides):
+    """Every one of these is a valid ``SelfPlayConfig``; none is a pinned actor shape."""
+    with pytest.raises(ValueError, match="128.*512"):
+        validate_actor_self_play_config(d6_cfg(**overrides))
 
 
 def test_actor_driver_construction_enforces_the_same_gate(tmp_path):
     with pytest.raises(ValueError, match="128"):
         make_driver(tmp_path, sims=64)
+    with pytest.raises(ValueError, match="512"):
+        make_driver(tmp_path, self_play=d6_cfg(pcr_full_plies=3))
     driver = make_driver(tmp_path, sims=128)
     assert driver.writer.state.next_game_index == 0
+    assert make_driver(tmp_path / "d6", self_play=d6_cfg()).self_play.playout_cap_randomization
 
 
 def test_actor_driver_rejects_a_non_positive_max_games(tmp_path):
@@ -162,7 +240,7 @@ def test_samples_carry_mover_pinned_version_and_durable_game_id(tmp_path):
 
 
 def test_every_ply_is_stored_no_d12_dropping(tmp_path):
-    """M3 stores every position (M5 owns the fast-tier drop policy)."""
+    """The validate tier stores every position: it has no fast tier to drop."""
     driver = make_driver(tmp_path, max_games=4)
     for path in driver.run():
         plies = [r.ply for r in read_shard(path, TTT).records]
@@ -472,3 +550,452 @@ def test_should_stop_call_count_is_unchanged_when_no_pacing_hook_is_installed(tm
     paths = driver.run()
     assert len(paths) == 2
     assert checks["n"] == 3
+
+
+# --- batched leaf inference (§12 M5) -------------------------------------------
+
+
+def _spy_refresh():
+    """A three-element ``refresh`` over uniform stand-in evaluators that log their calls.
+
+    Returns:
+        ``(refresh, scalar_calls, batch_sizes)`` -- the two lists record every
+        scalar call and every batched call's leaf count.
+    """
+    scalar_calls, batch_sizes = [], []
+
+    def scalar(game, state):
+        """Log the leaf; answer value 0 and uniform priors."""
+        scalar_calls.append(state)
+        return 0.0, None
+
+    def batched(game, states):
+        """Log the batch's leaf count; answer value 0 and uniform priors per leaf."""
+        batch_sizes.append(len(states))
+        return [(0.0, None)] * len(states)
+
+    return (lambda: (scalar, 1, batched)), scalar_calls, batch_sizes
+
+
+def test_at_leaf_batch_size_one_the_search_stays_on_the_scalar_evaluator(tmp_path):
+    refresh, scalar_calls, batch_sizes = _spy_refresh()
+    make_driver(tmp_path, refresh=refresh, max_games=1).run()
+    assert scalar_calls and batch_sizes == []
+
+
+def test_above_leaf_batch_size_one_the_search_uses_the_batched_evaluator(tmp_path):
+    """Pinned at 2, the smallest batched size: the switch is ``> 1``, not some larger bound."""
+    refresh, scalar_calls, batch_sizes = _spy_refresh()
+    paths = make_driver(tmp_path, refresh=refresh, max_games=1, leaf_batch_size=2).run()
+    assert len(paths) == 1
+    assert scalar_calls == []
+    assert max(batch_sizes) == 2 and all(1 <= n <= 2 for n in batch_sizes)
+
+
+def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path, monkeypatch):
+    """No batched evaluator on offer: the engine maps the scalar one over each batch."""
+    calls = []
+
+    def scalar(game, state):
+        """Log the leaf; answer value 0 and uniform priors."""
+        calls.append(state)
+        return 0.0, None
+
+    sizes = []
+    real_play_game = actor_module.play_game
+
+    def play_game_spy(game, evaluator, self_play, *args, **kwargs):
+        """Record the leaf batch size the actor hands the game loop, then play."""
+        sizes.append(self_play.leaf_batch_size)
+        return real_play_game(game, evaluator, self_play, *args, **kwargs)
+
+    monkeypatch.setattr(actor_module, "play_game", play_game_spy)
+    driver = make_driver(tmp_path, refresh=lambda: (scalar, 1), max_games=1, leaf_batch_size=4)
+    assert len(driver.run()) == 1
+    assert calls
+    assert sizes == [4]  # the fallback still searches in batches of up to four
+
+
+def test_a_batched_game_is_reproducible_from_its_durable_coordinates(tmp_path):
+    """Same (run_seed, actor_id, game_index) and config => the same shard, batched too."""
+    shards = []
+    for sub in ("a", "b"):
+        refresh, _, _ = _spy_refresh()
+        (path,) = make_driver(tmp_path / sub, refresh=refresh, max_games=1, leaf_batch_size=4).run()
+        shards.append(read_shard(path, TTT).records)
+    assert len(shards[0]) == len(shards[1]) > 0
+    for a, b in zip(shards[0], shards[1], strict=True):
+        assert np.array_equal(np.asarray(a.planes), np.asarray(b.planes))
+        assert (a.sparse_pi, a.z, a.mover, a.ply) == (b.sparse_pi, b.z, b.mover, b.ply)
+
+
+def _counted_spy_refresh(positions, batches):
+    """A spy refresh whose evaluators feed both counters, as ``core.ipc`` wires them.
+
+    Args:
+        positions: The position counter.
+        batches: The inference-batch counter.
+
+    Returns:
+        ``(refresh, batch_sizes)`` -- the leaf count of every batched call.
+    """
+    inner, _, batch_sizes = _spy_refresh()
+    scalar, version, batched = inner()
+
+    def size(game, states):
+        """Count a batched call as its number of leaves."""
+        return len(states)
+
+    for counter in (positions, batches):
+        scalar = count_positions(scalar, counter)
+        batched = count_positions(batched, counter, batch_size=size)
+    return (lambda: (scalar, version, batched)), batch_sizes
+
+
+def _series_values(run_dir, proc="actor-0"):
+    """Every delta record one process wrote, as ``(series, value)`` in append order."""
+    return [(r["series"], r["value"]) for r in iter_epoch_records(run_dir, proc)]
+
+
+@pytest.mark.parametrize("leaf_batch_size", [1, 8])
+def test_every_game_flushes_its_inference_batch_accounting(tmp_path, leaf_batch_size):
+    positions, batches = PositionCounter(), InferenceBatchCounter()
+    refresh, batch_sizes = _counted_spy_refresh(positions, batches)
+    make_driver(
+        tmp_path / "shards",
+        refresh=refresh,
+        max_games=1,
+        leaf_batch_size=leaf_batch_size,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+        position_counter=positions,
+        batch_counter=batches,
+    ).run()
+
+    flushed = dict(_series_values(tmp_path))
+    buckets = {k: v for k, v in flushed.items() if k.startswith("inference_batch_size_")}
+    assert sum(buckets.values()) == flushed[SERIES_INFERENCE_BATCHES] > 0
+    assert all(v > 0 for v in buckets.values())  # only observed buckets are written
+    if leaf_batch_size == 1:
+        # Serial: every evaluation is its own batch of one.
+        assert flushed[SERIES_INFERENCE_BATCHES] == flushed[SERIES_POSITIONS_EVALUATED]
+        assert buckets == {"inference_batch_size_1": flushed[SERIES_INFERENCE_BATCHES]}
+    else:
+        assert flushed[SERIES_INFERENCE_BATCHES] == len(batch_sizes)
+        assert flushed[SERIES_POSITIONS_EVALUATED] == sum(batch_sizes)
+        assert flushed[SERIES_INFERENCE_BATCHES] < flushed[SERIES_POSITIONS_EVALUATED]
+        assert set(buckets) - {"inference_batch_size_1"}  # some batch held several leaves
+    assert batches.drain() == {SERIES_INFERENCE_BATCHES: 0}  # drained at the game boundary
+
+
+def test_each_game_flushes_its_metrics_in_one_write(tmp_path):
+    """An interrupted flush must not leave a game's counters half-written."""
+
+    class GroupRecordingWriter(EpochMetricsWriter):
+        """Writer that records each durable write as one group of series names."""
+
+        def __init__(self, *args, **kwargs):
+            """Open the real epoch file and start an empty write log."""
+            super().__init__(*args, **kwargs)
+            self.groups = []
+
+        def append_many(self, records):
+            """Log the group's series names, then write it for real.
+
+            Args:
+                records: The records ``EpochMetricsWriter.append_many`` takes.
+            """
+            records = list(records)
+            self.groups.append([r["series"] for r in records])
+            super().append_many(records)
+
+    positions, batches = PositionCounter(), InferenceBatchCounter()
+    refresh, _ = _counted_spy_refresh(positions, batches)
+    writer = GroupRecordingWriter(tmp_path, "actor-0")
+    make_driver(
+        tmp_path / "shards",
+        refresh=refresh,
+        max_games=2,
+        leaf_batch_size=8,
+        metrics_writer=writer,
+        position_counter=positions,
+        batch_counter=batches,
+    ).run()
+
+    assert len(writer.groups) == 2  # one durable write per game, nothing else
+    for group in writer.groups:
+        assert {
+            SERIES_GAMES_COMPLETED,
+            SERIES_POSITIONS_EVALUATED,
+            SERIES_INFERENCE_BATCHES,
+        } <= set(group)
+        assert any(series.startswith("inference_batch_size_") for series in group)
+
+
+def test_no_batch_counter_means_no_inference_batch_series(tmp_path):
+    """Omitted, never a fabricated zero -- the position counter's own convention."""
+    make_driver(
+        tmp_path / "shards",
+        max_games=1,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+    assert not any(series.startswith("inference_batch") for series, _ in _series_values(tmp_path))
+
+
+# --- playout-cap randomization: real sims and the per-tier move series --------
+
+TIER_SERIES = {
+    "full": SERIES_MOVES_FULL_512,
+    "mid": SERIES_MOVES_MID_256,
+    "fast": SERIES_MOVES_FAST_64,
+}
+
+
+def test_a_d6_actor_flushes_the_real_sims_and_its_tier_mix(tmp_path):
+    """``sims_run`` is the sum of the drawn budgets, never ``plies * sims``."""
+    games = 6
+    make_driver(
+        tmp_path / "shards",
+        run_seed=11,
+        actor_id=2,
+        self_play=d6_cfg(),
+        max_games=games,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-2"),
+    ).run()
+
+    # The same games, replayed from their durable coordinates.
+    replayed = [
+        play_game(TTT, None, d6_cfg(), GameRNGs.for_actor_game(11, 2, index))
+        for index in range(games)
+    ]
+    assert {name for r in replayed for name, _ in r.tier_counts} == set(TIER_SERIES)
+
+    flushed = _series_values(tmp_path, "actor-2")
+    assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1] * games
+    assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [r.sims_run for r in replayed]
+    assert any(r.sims_run != r.plies * 512 for r in replayed)
+    for tier, series in TIER_SERIES.items():
+        # Written per game, only when that game played the tier.
+        expected = [count for r in replayed for name, count in r.tier_counts if name == tier]
+        assert [v for s, v in flushed if s == series] == expected
+
+    total = lambda series: sum(v for s, v in flushed if s == series)  # noqa: E731
+    assert sum(total(series) for series in TIER_SERIES.values()) == sum(r.plies for r in replayed)
+    assert total(SERIES_SIMS_RUN) == (
+        512 * total(SERIES_MOVES_FULL_512)
+        + 256 * total(SERIES_MOVES_MID_256)
+        + 64 * total(SERIES_MOVES_FAST_64)
+    )
+
+
+def test_a_validate_tier_actor_writes_no_tier_series(tmp_path):
+    """PCR off: ``plies * 128`` sims, no tier mix, every position played is stored."""
+    paths = make_driver(
+        tmp_path / "shards",
+        max_games=2,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+    plies = [len(read_shard(path, TTT).records) for path in paths]
+
+    flushed = _series_values(tmp_path)
+    assert {series for series, _ in flushed} == {
+        SERIES_GAMES_COMPLETED,
+        SERIES_SIMS_RUN,
+        SERIES_POSITIONS_PLAYED,
+        SERIES_POSITIONS_STORED,
+        SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
+    }
+    # ...so the acceptance checklist of such a run must never require them.
+    assert not set(TIER_SERIES.values()) & set(_REQUIRED_POSITIVE_SERIES)
+    assert [v for s, v in flushed if s == SERIES_SIMS_RUN] == [p * 128 for p in plies]
+    assert [v for s, v in flushed if s == SERIES_POSITIONS_PLAYED] == plies
+    assert [v for s, v in flushed if s == SERIES_POSITIONS_STORED] == plies
+    # Tic-Tac-Toe strictly alternates: a zero is written, not left out.
+    assert [v for s, v in flushed if s == SERIES_CONSECUTIVE_MOVER_TRANSITIONS] == [0, 0]
+
+
+# --- the D12 drop: only stored positions are published, and both are counted ---
+
+
+def test_a_d6_actor_publishes_exactly_the_stored_positions_and_counts_them(tmp_path):
+    """The shard holds a game's non-fast plies; the counters say so exactly, per game."""
+    games = 6
+    paths = make_driver(
+        tmp_path / "shards",
+        run_seed=11,
+        actor_id=2,
+        self_play=d6_cfg(),
+        max_games=games,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-2"),
+    ).run()
+    replayed = [
+        play_game(TTT, None, d6_cfg(), GameRNGs.for_actor_game(11, 2, index), model_version=1)
+        for index in range(games)
+    ]
+    shards = [read_shard(path, TTT).records for path in paths]
+
+    # The shard round trip of a game with dropped plies: every stored sample
+    # comes back whole, in ply order, and nothing else does.
+    for records, result in zip(shards, replayed, strict=True):
+        assert [r.ply for r in records][:2] == [0, 1]  # never dropped
+        assert len(records) < result.plies  # ...but something was
+        assert len(records) == len(result.samples)
+        for record, sample in zip(records, result.samples, strict=True):
+            assert np.array_equal(np.asarray(record.planes), np.asarray(sample.planes))
+            assert (record.sparse_pi, record.z, record.aux) == (
+                sample.sparse_pi,
+                sample.z,
+                sample.aux,
+            )
+            assert (record.ply, record.mover, record.model_version) == (
+                sample.ply,
+                sample.mover,
+                sample.model_version,
+            )
+
+    # One exact record per game of each: what was played, and what a reader
+    # of that game's shard will find.
+    flushed = _series_values(tmp_path, "actor-2")
+    played = [v for s, v in flushed if s == SERIES_POSITIONS_PLAYED]
+    stored = [v for s, v in flushed if s == SERIES_POSITIONS_STORED]
+    assert played == [result.plies for result in replayed]
+    assert stored == [len(records) for records in shards]
+
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_POSITIONS_PLAYED] == sum(played)
+    assert totals[SERIES_POSITIONS_STORED] == sum(stored)
+    assert totals[SERIES_POSITIONS_STORED] == (
+        totals[SERIES_MOVES_FULL_512] + totals[SERIES_MOVES_MID_256]
+    )
+    assert totals[SERIES_POSITIONS_PLAYED] == (
+        totals[SERIES_POSITIONS_STORED] + totals[SERIES_MOVES_FAST_64]
+    )
+    # An M3 run carries neither, so its checklist must never require them.
+    assert not {SERIES_POSITIONS_PLAYED, SERIES_POSITIONS_STORED} & set(_REQUIRED_POSITIVE_SERIES)
+
+
+# --- the consecutive-mover transition count survives the drop -----------------
+
+
+def test_a_d6_actor_flushes_the_transitions_its_dropped_plies_would_hide(tmp_path):
+    """The count comes from the played sequence; the shard no longer holds it."""
+    # One legal action per state, so every game is this mover sequence: a
+    # player moves again straight after their own move at plies 3, 7 and 8.
+    movers = (0, 1, 0, 0, 1, 0, 1, 1, 1, 0)
+    chain = PassGame(
+        Scenario(
+            start=0,
+            to_play=dict(enumerate(movers)),
+            edges={state: [(0, state + 1)] for state in range(len(movers))},
+            terminal={len(movers): (1.0, -1.0)},
+        )
+    )
+    games = 4
+    paths = ActorDriver(
+        game=chain,
+        self_play=d6_cfg(),
+        run_id="run",
+        actor_id=0,
+        out_dir=tmp_path / "shards",
+        run_seed=5,
+        refresh=refresh_sequence([1] * games),
+        max_games=games,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+
+    flushed = _series_values(tmp_path)
+    assert [v for s, v in flushed if s == SERIES_CONSECUTIVE_MOVER_TRANSITIONS] == [3] * games
+    assert reduce_run(tmp_path).totals[SERIES_CONSECUTIVE_MOVER_TRANSITIONS] == 3 * games
+    assert SERIES_CONSECUTIVE_MOVER_TRANSITIONS not in _REQUIRED_POSITIVE_SERIES
+
+    # The shards cannot stand in for it: with plies dropped, adjacent stored
+    # samples sharing a mover no longer count consecutive moves.
+    stored_pairs = []
+    for path in paths:
+        stored = [record.mover for record in read_shard(path, chain).records]
+        assert len(stored) < len(movers)
+        stored_pairs.append(sum(a == b for a, b in zip(stored, stored[1:], strict=False)))
+    assert stored_pairs != [3] * games
+
+
+# --- flush order: the shard is published before the game is counted -----------
+
+
+def test_a_game_whose_shard_is_not_published_is_counted_by_no_series(tmp_path):
+    """Shard first, metrics second: the counters never run ahead of the shards."""
+    driver = make_driver(
+        tmp_path / "shards",
+        max_games=2,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    )
+    publish = driver.writer.write_shard
+    calls = []
+
+    def publish_the_first_game_only(games):
+        calls.append(len(games))
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return publish(games)
+
+    driver.writer.write_shard = publish_the_first_game_only
+    with pytest.raises(OSError, match="disk full"):
+        driver.run()
+
+    flushed = _series_values(tmp_path)
+    # One record of each series: the published game's, and nothing of the other's.
+    assert sorted(s for s, _ in flushed) == sorted(
+        [
+            SERIES_GAMES_COMPLETED,
+            SERIES_SIMS_RUN,
+            SERIES_POSITIONS_PLAYED,
+            SERIES_POSITIONS_STORED,
+            SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
+        ]
+    )
+    assert [v for s, v in flushed if s == SERIES_GAMES_COMPLETED] == [1]
+    (shard,) = sorted((tmp_path / "shards").glob("shard-*.npz"))
+    stored = [v for s, v in flushed if s == SERIES_POSITIONS_STORED]
+    assert stored == [len(read_shard(shard, TTT).records)]
+
+
+def test_a_failure_mid_flush_leaves_no_durable_part_of_the_games_series(tmp_path, monkeypatch):
+    """A game's series are durable together: a write that fails part-way keeps none.
+
+    The write stops after the bytes of the group's first records reach the
+    file, then fails. A restarted actor plays on, and the run's
+    played/stored/tier identities still hold over every game that flushed.
+    """
+    import core.metrics
+
+    real_write = core.metrics.os.write
+
+    def write_half_then_fail(fd, data):
+        real_write(fd, bytes(data[: len(data) // 2]))
+        raise OSError("disk full")
+
+    shard_dir = tmp_path / "shards"
+    driver = make_driver(
+        shard_dir,
+        self_play=d6_cfg(),
+        max_games=1,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    )
+    monkeypatch.setattr(core.metrics.os, "write", write_half_then_fail)
+    with pytest.raises(OSError, match="disk full"):
+        driver.run()
+    monkeypatch.undo()
+    assert _series_values(tmp_path) == []  # none of the group, not a prefix of it
+
+    make_driver(
+        shard_dir,
+        self_play=d6_cfg(),
+        max_games=1,
+        metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
+    ).run()
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_GAMES_COMPLETED] == 1
+    assert totals[SERIES_POSITIONS_STORED] == (
+        totals[SERIES_MOVES_FULL_512] + totals[SERIES_MOVES_MID_256]
+    )
+    assert totals[SERIES_POSITIONS_PLAYED] == (
+        totals[SERIES_POSITIONS_STORED] + totals[SERIES_MOVES_FAST_64]
+    )

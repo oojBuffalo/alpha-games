@@ -7,7 +7,7 @@ stays confined to ``core/network.py`` / ``core/losses.py`` / ``core/train.py``
 (the pyproject pin), so the learner half of the loop lives in
 ``scripts/run_micro.py`` and consumes the plain records produced here.
 
-The three pinned decisions this module realizes:
+The pinned decisions this module realizes:
 
 * **D10 move selection.** :func:`select_move` samples ∝ *raw* N (τ = 1, no
   exponentiation) at plies below ``k_temp`` and plays argmax N at and after it,
@@ -18,11 +18,20 @@ The three pinned decisions this module realizes:
 * **D7 root noise.** Wired through ``MCTS(root_noise=...)`` — the hook already in
   ``core/mcts.py`` — from the per-game Dirichlet stream, self-play only, and
   re-drawn by the engine whenever a node becomes root (subtree reuse included).
-* **D12 sample shape.** Every stored sample carries sparse ``(action_id,
-  visit_count)`` pairs (Invariant 3 — never a dense policy vector), plus ``z``
-  and the declared aux targets backfilled at game end. Fast/low-sim positions are
-  dropped entirely at M5; M2.5 searches every ply at one fixed sim count, so
-  every ply is stored.
+* **D12 sample shape and drop.** Every stored sample carries sparse
+  ``(action_id, visit_count)`` pairs (Invariant 3 — never a dense policy
+  vector), plus ``z`` and the declared aux targets backfilled at game end, and
+  its tier's name. A ply searched at the fast tier is played but **dropped
+  entirely**: :func:`play_game` appends a sample only when the ply's
+  :class:`Tier` is a stored one, so no partial or value-only sample ever
+  exists. The fast tier exists only under playout-cap randomization and only
+  at or past the always-full boundary, so with it off every ply is stored and
+  the opening plies can never be dropped.
+* **D6 search budgets.** :func:`draw_tier` picks each ply's simulation budget.
+  With ``SelfPlayConfig.playout_cap_randomization`` off (the default: M2.5's
+  fixed 64, M3's fixed 128) every ply is searched at ``cfg.sims``. With it on,
+  the always-full opening plies are searched at ``cfg.sims`` and every later
+  ply draws the mid or the fast tier from the game's own ``pcr_tier`` stream.
 
 ``z`` and aux are **mover-relative**: each sample is backfilled from
 ``game.training_targets(terminal_state, sample.mover)`` — the declared ABC
@@ -31,7 +40,8 @@ mover-relative own/opponent encoding the network is trained on.
 
 Seeding is per-purpose (``core.seeding``): ``play_game`` takes a
 :class:`~core.seeding.GameRNGs` bundle, so a change in how many Dirichlet draws a
-search makes cannot shift the move-selection sequence.
+search makes cannot shift the move-selection sequence, and neither can the
+tier draws.
 
 M3 (issue #59) extends :class:`Sample`/:func:`play_game` backward-compatibly with
 the two fields the full on-disk sample record (``core.replay_shard.PendingSample``)
@@ -52,11 +62,12 @@ import json
 import random
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 from core.game import Action, Game, PlayerId, State
-from core.mcts import MCTS, Evaluator
+from core.mcts import MCTS, BatchEvaluator, Evaluator
 from core.runconfig import SelfPlayConfig
 from core.seeding import GameRNGs
 
@@ -123,13 +134,66 @@ def _argmax_visits(root_visits: Mapping[Action, int]) -> Action:
     return min(root_visits, key=lambda a: (-root_visits[a], a))
 
 
+# The playout-cap tier names (D6): one fixed budget with playout-cap
+# randomization off; with it on, the always-full opening plies, then the
+# reduced full search or the fast search.
+TIER_FIXED = "fixed"
+TIER_FULL = "full"
+TIER_MID = "mid"
+TIER_FAST = "fast"
+
+
+@dataclass(frozen=True)
+class Tier:
+    """One ply's search budget and whether its position is a stored tier (D6/D12).
+
+    Attributes:
+        sims: Simulations to search the ply with.
+        stored: Whether D12 keeps this tier's positions as training samples.
+            ``False`` only for the fast tier.
+        name: One of :data:`TIER_FIXED`, :data:`TIER_FULL`, :data:`TIER_MID`,
+            :data:`TIER_FAST`.
+    """
+
+    sims: int
+    stored: bool
+    name: str
+
+
+def draw_tier(cfg: SelfPlayConfig, ply: int, rng: random.Random) -> Tier:
+    """Draw the simulation budget for one ply (D6).
+
+    Args:
+        cfg: The self-play scalars; ``playout_cap_randomization`` selects the
+            mode and the ``pcr_*`` fields give the schedule.
+        ply: Zero-based ply index within the game.
+        rng: The tier stream (``GameRNGs.pcr_tier``). Consumed exactly once,
+            and only when the ply is at or past ``cfg.pcr_full_plies`` with
+            playout-cap randomization on.
+
+    Returns:
+        The fixed tier at ``cfg.sims`` with playout-cap randomization off.
+        Otherwise the full tier at ``cfg.sims`` for a ply below
+        ``cfg.pcr_full_plies``, else the mid tier at ``cfg.pcr_mid_sims`` with
+        probability ``cfg.pcr_mid_probability`` and the fast tier at
+        ``cfg.pcr_fast_sims`` with the rest.
+    """
+    if not cfg.playout_cap_randomization:
+        return Tier(cfg.sims, True, TIER_FIXED)
+    if ply < cfg.pcr_full_plies:
+        return Tier(cfg.sims, True, TIER_FULL)
+    if rng.random() < cfg.pcr_mid_probability:
+        return Tier(cfg.pcr_mid_sims, True, TIER_MID)
+    return Tier(cfg.pcr_fast_sims, False, TIER_FAST)
+
+
 def policy_target(root_visits: Mapping[Action, int]) -> list[tuple[Action, int]]:
     """Return the sparse D12 policy target: the root's raw counts, verbatim.
 
     Sparse ``(action_id, visit_count)`` pairs over the root's legal set only
     (Invariant 3), in the root's edge order, with the counts **unmodified** —
     not normalized, not rescaled to the sim budget. Subtree reuse legitimately
-    leaves ΣN above ``cfg.sims`` (the promoted child arrives with its share of
+    leaves ΣN above the ply's budget (the promoted child arrives with its share of
     the previous search's visits), and the extra visits are real search effort:
     the loss normalizes ``π_train(a) = N(a)/ΣN`` at collate time, so any
     rescaling here would only lose information.
@@ -176,6 +240,8 @@ class Sample:
             supply one. Never assigned by this module — only ever a label
             carried through from the caller (``core.actor.ActorDriver``, which
             reads it from ``core.replay_shard.ShardWriter``'s persisted state).
+        tier: The name of the :class:`Tier` the position was searched at, or
+            ``None`` for a sample not produced by :func:`play_game`.
     """
 
     planes: Any
@@ -186,6 +252,7 @@ class Sample:
     aux: tuple[float, ...] | None = None
     model_version: int | None = None
     game_id: tuple[str, str, int] | None = None
+    tier: str | None = None
 
     def training_row(self, num_aux: int) -> tuple[Any, ...]:
         """Return the sample in ``core.train.collate``'s spec-driven row shape.
@@ -220,23 +287,48 @@ class GameResult:
     """One finished self-play game.
 
     Attributes:
-        samples: The backfilled per-ply samples, in play order.
-        moves: The actions played, in order.
+        samples: The backfilled samples of the stored plies, in play order —
+            every ply except those searched at the fast tier (D12).
+        moves: The actions played, in order — every ply, stored or dropped.
         terminal_state: The game's terminal state — kept so a caller can re-derive
             every target through the public ``Game`` surface (the z-consistency
             test does exactly that).
         utilities: Terminal utility per player id, zero-sum in v1.
+        sims_run: Simulations searched over the whole game: the exact sum of
+            every ply's drawn budget.
+        tier_counts: Plies played per tier, as ``(tier name, count)`` pairs
+            sorted by name; only tiers the game actually played appear, and
+            the counts sum to :attr:`plies`.
+        consecutive_mover_transitions: Plies whose mover also made the ply
+            before — a player moving again because the adapter skipped an
+            opponent with no legal action (a blocked skip). Counted over
+            every ply played, so it does not depend on which plies were
+            stored; ``0`` for a strictly alternating game, which includes one
+            whose passes are explicit actions.
     """
 
     samples: tuple[Sample, ...]
     moves: tuple[Action, ...]
     terminal_state: State
     utilities: tuple[float, ...]
+    sims_run: int = 0
+    tier_counts: tuple[tuple[str, int], ...] = ()
+    consecutive_mover_transitions: int = 0
 
     @property
     def plies(self) -> int:
         """Number of actions played from the initial state to terminal."""
         return len(self.moves)
+
+    @property
+    def positions_played(self) -> int:
+        """Positions searched and played: one per ply, stored or dropped."""
+        return len(self.moves)
+
+    @property
+    def positions_stored(self) -> int:
+        """Positions kept as training samples: the played ones minus the D12 drops."""
+        return len(self.samples)
 
 
 def backfill_targets(game: Game, terminal: State, samples: Iterable[Sample]) -> tuple[Sample, ...]:
@@ -277,25 +369,56 @@ def play_game(
     *,
     model_version: int | None = None,
     game_id: tuple[str, str, int] | None = None,
+    evaluate_batch: BatchEvaluator | None = None,
 ) -> GameResult:
     """Play one complete self-play game, returning its stored samples.
 
     One :class:`~core.mcts.MCTS` instance drives the whole game, so the subtree
     under the played move is reused (§6.2) and the D7 hook re-draws root noise on
-    the promoted root. Every ply is searched at the fixed ``cfg.sims`` (M2.5 runs
-    no playout-cap randomization — that is D6/M5), every ply is stored, and the
-    targets are backfilled once the game ends.
+    the promoted root. Each ply is searched at the budget :func:`draw_tier`
+    gives it — the fixed ``cfg.sims`` unless ``cfg.playout_cap_randomization``
+    is on, then the D6 schedule — and the targets are backfilled once the game
+    ends. Root noise, move selection and the stored counts are the same at
+    every tier.
+
+    A ply is stored only when its tier is a stored one (D12): a fast-tier ply
+    is searched, played and advances the reused subtree like any other, but
+    leaves no sample. A stored ply's counts are therefore still the root's raw
+    ``N``, including whatever visits a dropped neighbour's search left in the
+    subtree it inherited. With playout-cap randomization off there is no fast
+    tier and every ply is stored. With it on and ``cfg.pcr_full_plies`` at
+    ``0`` no ply is guaranteed a stored tier, so a game whose every draw is
+    fast returns **no samples at all**; a caller that needs one per game must
+    keep the boundary above zero, as the actor's D6 pin of ``2`` does.
+
+    The mover of every ply is recorded before that filter, so the game's
+    consecutive-mover transition count is taken from the complete played
+    sequence — the stored samples alone cannot give it once plies are dropped.
+
+    Each search collects up to ``cfg.leaf_batch_size`` leaves per evaluation
+    (§6.2 batched parallel selection). ``1`` is the serial search, bit for bit.
+    Above ``1`` the trajectory legitimately differs from the serial one —
+    virtual loss steers a batch's descents apart — but, for fixed deterministic
+    evaluators (the same weights), stays a pure function of the seed and
+    config, and the stored counts are still the root's raw ``N``:
+    virtual loss is fully backed out before a search returns.
 
     Args:
         game: The adapter to play. Game-specific behavior enters *only* here —
             this module never imports ``games/``.
         evaluator: Leaf evaluator for MCTS (``core.network.make_network_evaluator``
-            bridges the batch-1 network in). ``None`` runs the M0 engine: value
-            0.0 and uniform priors, which is what the stdlib-only tests use.
+            bridges the batch-1 network in). ``None`` together with
+            ``evaluate_batch=None`` runs the M0 engine: value 0.0 and uniform
+            priors, which is what the stdlib-only tests use. Unused when
+            ``evaluate_batch`` is supplied.
         cfg: The shared self-play scalars (``core.runconfig.SelfPlayConfig``);
-            ``root_noise`` False disables the D7 hook entirely.
+            ``root_noise`` False disables the D7 hook entirely,
+            ``leaf_batch_size`` bounds the leaves per evaluation, and
+            ``playout_cap_randomization`` with the ``pcr_*`` scalars sets the
+            per-ply budgets.
         rngs: The per-game stream bundle (``GameRNGs.for_game(run_seed, index)``);
-            ``dirichlet`` goes to the D7 hook and ``move_selection`` to D10.
+            ``dirichlet`` goes to the D7 hook, ``move_selection`` to D10 and
+            ``pcr_tier`` to the D6 tier draw.
             ``tie_break`` is deliberately unconsumed here: at M2.5 both the PUCT
             tie-break and the D10 argmax tie-break are deterministic, and the
             stream stays reserved so introducing a randomized tie-break later
@@ -309,33 +432,50 @@ def play_game(
             function never derives or validates the id — it is only ever a
             label the caller already owns (``core.actor.ActorDriver``, from
             ``core.replay_shard.ShardWriter``'s persisted state).
+        evaluate_batch: Optional batched leaf evaluator
+            (``core.network.make_batched_network_evaluator``). When supplied
+            the engine evaluates every leaf batch through it in one call and
+            ``evaluator`` is not used; ``None`` maps ``evaluator`` over each
+            batch's leaves instead.
 
     Returns:
-        The finished :class:`GameResult`, its samples already backfilled.
+        The finished :class:`GameResult`, its stored samples already
+        backfilled and its simulation, per-tier ply and consecutive-mover
+        transition counts filled.
     """
     root_noise = None
     if cfg.root_noise:
         root_noise = (cfg.dirichlet_eps, cfg.dirichlet_alpha_numerator, rngs.dirichlet)
-    search = MCTS(game, evaluate=evaluator, root_noise=root_noise)
+    search = MCTS(game, evaluate=evaluator, evaluate_batch=evaluate_batch, root_noise=root_noise)
     state = game.initial_state()
     search.set_root(state)
 
     samples: list[Sample] = []
     moves: list[Action] = []
+    movers: list[PlayerId] = []
     ply = 0
+    sims_run = 0
+    tier_counts: dict[str, int] = {}
     while not game.is_terminal(state):
-        search.run(cfg.sims)
+        tier = draw_tier(cfg, ply, rngs.pcr_tier)
+        search.run(tier.sims, batch_size=cfg.leaf_batch_size)
+        sims_run += tier.sims
+        tier_counts[tier.name] = tier_counts.get(tier.name, 0) + 1
         visits = search.action_visit_counts()
-        samples.append(
-            Sample(
-                planes=game.encode_state(state),
-                sparse_pi=tuple(policy_target(visits)),
-                ply=ply,
-                mover=game.current_player(state),
-                model_version=model_version,
-                game_id=game_id,
+        mover = game.current_player(state)
+        movers.append(mover)
+        if tier.stored:  # D12: a fast-tier position is dropped entirely
+            samples.append(
+                Sample(
+                    planes=game.encode_state(state),
+                    sparse_pi=tuple(policy_target(visits)),
+                    ply=ply,
+                    mover=mover,
+                    model_version=model_version,
+                    game_id=game_id,
+                    tier=tier.name,
+                )
             )
-        )
         action = select_move(visits, ply, cfg.k_temp, rngs.move_selection)
         search.advance(action)
         state = game.apply(state, action)
@@ -347,6 +487,9 @@ def play_game(
         moves=tuple(moves),
         terminal_state=state,
         utilities=tuple(game.terminal_utility(state, p) for p in range(game.num_players)),
+        sims_run=sims_run,
+        tier_counts=tuple(sorted(tier_counts.items())),
+        consecutive_mover_transitions=sum(a == b for a, b in pairwise(movers)),
     )
 
 

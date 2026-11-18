@@ -20,12 +20,15 @@ Four layers, cheapest first:
 from __future__ import annotations
 
 import dataclasses
+import errno
 import math
+import os
 import time
 from types import SimpleNamespace
 
 import pytest
 
+from core import metrics as metrics_module
 from core.actor import VALIDATE_TIER_SIMS, ActorDriver
 from core.checkpoint import list_published_versions
 from core.ipc import build_actor_pacing, build_actor_refresh
@@ -39,12 +42,17 @@ from core.observability import (
     KIND_SEGMENT_END,
     KIND_SEGMENT_START,
     KIND_TOTAL,
+    SERIES_GAMES_COMPLETED,
+    SERIES_INFERENCE_BATCHES,
+    SERIES_POSITIONS_EVALUATED,
+    InferenceBatchCounter,
     PositionCounter,
     ReducedRun,
     _ordered_records,  # white-box: the pinned tie-break rule
     count_positions,
     delta_record,
     gauge_record,
+    inference_batch_size_series,
     is_real_cuda,
     reduce_run,
     segment_end_record,
@@ -130,6 +138,80 @@ def test_position_counter_rejects_negative_additions():
     counter = PositionCounter()
     with pytest.raises(ValueError, match="position count"):
         counter.add(-1)
+
+
+def test_inference_batch_size_buckets_are_powers_of_two_with_an_open_top():
+    expected = {
+        1: "inference_batch_size_1",
+        2: "inference_batch_size_2_3",
+        3: "inference_batch_size_2_3",
+        4: "inference_batch_size_4_7",
+        7: "inference_batch_size_4_7",
+        8: "inference_batch_size_8_15",
+        15: "inference_batch_size_8_15",
+        16: "inference_batch_size_16_31",
+        31: "inference_batch_size_16_31",
+        32: "inference_batch_size_32_63",
+        63: "inference_batch_size_32_63",
+        64: "inference_batch_size_64_plus",
+        4096: "inference_batch_size_64_plus",
+    }
+    assert {size: inference_batch_size_series(size) for size in expected} == expected
+    with pytest.raises(ValueError, match="batch size"):
+        inference_batch_size_series(0)
+
+
+def test_inference_batch_counter_drains_batches_and_nonzero_buckets_then_resets():
+    counter = InferenceBatchCounter()
+    assert counter.drain() == {SERIES_INFERENCE_BATCHES: 0}  # an honest zero, no buckets
+    for size in (1, 1, 3, 8, 8, 8, 64):
+        counter.add(size)
+    counter.add(0)  # an empty call ran no forward: not a batch
+    assert counter.drain() == {
+        SERIES_INFERENCE_BATCHES: 7,
+        "inference_batch_size_1": 2,
+        "inference_batch_size_2_3": 1,
+        "inference_batch_size_8_15": 3,
+        "inference_batch_size_64_plus": 1,
+    }
+    assert counter.drain() == {SERIES_INFERENCE_BATCHES: 0}
+    with pytest.raises(ValueError, match="batch size"):
+        counter.add(-1)
+
+
+def test_count_positions_feeds_a_batch_counter_one_batch_per_call():
+    """One wrapper, two counters: positions sum the cardinalities, batches count the calls."""
+    positions, batches = PositionCounter(), InferenceBatchCounter()
+
+    def stub_batched_evaluate(game, states):
+        return [(0.0, None)] * len(states)
+
+    def size(game, states):
+        return len(states)
+
+    wrapped = count_positions(stub_batched_evaluate, positions, batch_size=size)
+    wrapped = count_positions(wrapped, batches, batch_size=size)
+    for states in (["a"], ["a", "b", "a"], ["a", "b", "c", "d", "e"]):
+        assert wrapped("g", states) == [(0.0, None)] * len(states)
+    drained = batches.drain()
+    assert positions.total == 9 and drained[SERIES_INFERENCE_BATCHES] == 3
+    # Mean fill is recoverable from the two totals: 9 leaves / 3 batches.
+    assert sum(v for k, v in drained.items() if k != SERIES_INFERENCE_BATCHES) == 3
+
+
+def test_reduce_run_sums_the_inference_batch_series_like_any_delta(tmp_path):
+    for proc, games in (("actor-0", [(5, {1: 2, 4: 3}), (2, {1: 2})]), ("actor-1", [(1, {64: 1})])):
+        writer = EpochMetricsWriter(tmp_path, proc)
+        for batches, sizes in games:
+            writer.append(delta_record(SERIES_INFERENCE_BATCHES, batches))
+            for size, count in sizes.items():
+                writer.append(delta_record(inference_batch_size_series(size), count))
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_INFERENCE_BATCHES] == 8
+    assert totals["inference_batch_size_1"] == 4
+    assert totals["inference_batch_size_4_7"] == 3
+    assert totals["inference_batch_size_64_plus"] == 1
+    assert "inference_batch_size_2_3" not in totals  # never observed => absent, i.e. zero
 
 
 def test_count_positions_batch_one_counts_one_per_call_and_preserves_the_result():
@@ -467,7 +549,14 @@ def test_actor_driver_without_a_position_counter_omits_that_series(tmp_path):
     driver.run()
     records = list(iter_epoch_records(run_dir, "actor-0"))
     series = {r["series"] for r in records}
-    assert series == {"games_completed", "sims_run"}  # never a fabricated positions_evaluated
+    # never a fabricated positions_evaluated
+    assert series == {
+        "games_completed",
+        "sims_run",
+        "positions_played",
+        "positions_stored",
+        "consecutive_mover_transitions",
+    }
 
 
 def test_actor_driver_without_metrics_writer_writes_nothing(tmp_path):
@@ -590,3 +679,67 @@ def test_live_path_smoke_a_real_single_process_run_reduces_to_sane_numbers(tmp_p
         assert learner_step >= 0
         assert positions_evaluated >= 0
         assert gpu_hours >= 0
+
+
+def test_a_failed_group_append_leaves_no_partial_group(tmp_path, monkeypatch):
+    """A short write rolls the file back: no prefix of the group, no torn line."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+    writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
+    before = writer.path.read_bytes()
+    real_write = os.write
+    calls, seen_mid_write = [], []
+
+    def short_then_full(fd, data):
+        """Really write all but the last 10 bytes once, then fail as a full file does.
+
+        Between the two, a concurrent reader snapshots the run.
+        """
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, bytes(data[:-10]))  # ends mid-group
+        seen_mid_write.append(dict(reduce_run(tmp_path).totals))
+        raise OSError(errno.EFBIG, "File too large")
+
+    monkeypatch.setattr(metrics_module.os, "write", short_then_full)
+    group = [
+        delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=2.0),
+        delta_record(SERIES_POSITIONS_EVALUATED, 20, timestamp=2.0),
+        delta_record(SERIES_INFERENCE_BATCHES, 10, timestamp=2.0),
+    ]
+    with pytest.raises(OSError, match="File too large"):
+        writer.append_many(group)
+    monkeypatch.undo()
+
+    assert len(calls) == 2  # the prefix really reached the file before the failure
+    # The partial group was invisible to the concurrent reader.
+    (mid,) = seen_mid_write
+    assert mid[SERIES_GAMES_COMPLETED] == 1 and mid[SERIES_POSITIONS_EVALUATED] == 0
+    assert mid.get(SERIES_INFERENCE_BATCHES, 0) == 0
+    assert writer.path.read_bytes() == before
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1
+
+    # A writer killed after a short write never rolls back: the unterminated
+    # tail stays on disk, and is still not read as records.
+    writer.append_many(group)
+    complete = writer.path.read_bytes()
+    with open(writer.path, "ab") as fh:
+        fh.write(complete[len(before) : -10])
+    totals = reduce_run(tmp_path).totals
+    assert totals[SERIES_GAMES_COMPLETED] == 2  # the complete group, once
+    assert totals[SERIES_INFERENCE_BATCHES] == 10
+
+
+def test_an_fsync_failure_keeps_the_complete_line_readers_may_have_seen(tmp_path, monkeypatch):
+    """Rolling back an already-visible line would let a tail reader overcount."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+
+    def failing_fsync(fd):
+        """Fail as a device I/O error does, after the line is fully written."""
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(metrics_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="Input/output error"):
+        writer.append_many([delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0)])
+    monkeypatch.undo()
+
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1
