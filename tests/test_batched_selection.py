@@ -19,7 +19,9 @@ point:
     asserted — it is false under that rule.
   * Backup is player-aware on every edge, whatever order a batch's leaves land in.
   * ``batch_size = 1`` is the serial search: bit-identical to an independent serial PUCT.
-  * The batched search still plays the solved games optimally (the minimax oracle).
+  * The batched search still plays the tested endgames optimally (the minimax oracle):
+    every reachable Tic-Tac-Toe and 3×3 Connect-3 position with few enough empty cells,
+    and two scripted full-size Connect Four tactics.
 """
 
 from __future__ import annotations
@@ -185,6 +187,9 @@ class _Probe:
         mcts: The engine under test, with this probe as its only evaluator.
         calls: The states handed over, one list per call.
         collided: The ``collided`` flag of every descent, in order.
+        accepted: ``(path, leaf, marked)`` for every accepted descent, in order: the
+            ``(node, edge_index)`` path, the leaf reached, and whether the leaf carried
+            its in-flight mark when the descent returned.
         rejected: The path length of every rejected descent — the number of edges whose
             virtual loss had to be rolled back.
     """
@@ -195,20 +200,41 @@ class _Probe:
         self.mcts = MCTS(game, evaluate_batch=self, **mcts_kwargs)
         self.calls: list[list] = []
         self.collided: list[bool] = []
+        self.accepted: list[tuple[list, object, bool]] = []
         self.rejected: list[int] = []
         self._evaluated: set = set()
         descend = self.mcts._descend
 
         def spy(**kwargs):
+            """Record each descent's outcome, then return it unchanged.
+
+            Args:
+                **kwargs: Forwarded to the engine's ``_descend``.
+
+            Returns:
+                The engine's ``(path, leaf, collided)``.
+            """
             result = descend(**kwargs)
-            self.collided.append(result[2])
-            if result[2]:
-                self.rejected.append(len(result[0]))
+            path, leaf, collided = result
+            self.collided.append(collided)
+            if collided:
+                self.rejected.append(len(path))
+            else:
+                self.accepted.append((list(path), leaf, leaf.in_flight))
             return result
 
         self.mcts._descend = spy
 
     def __call__(self, game, states):
+        """Check the in-flight contract for one collected batch, then evaluate it.
+
+        Args:
+            game: The game searched.
+            states: The batch's leaf states, in collection order.
+
+        Returns:
+            One ``(value, logits)`` per state, from the wrapped single-state evaluator.
+        """
         m = self.mcts
         self.calls.append(list(states))
         leaves = [node for node in _all_nodes(m.root) if node.in_flight]
@@ -263,9 +289,33 @@ def _searches(game_name: str, batch_size: int):
                 m.set_root(_random_position(game, rng, plies))
                 for reuse in (False, False, True):
                     if reuse:
-                        m.advance(rng.choice(m.root.actions))
+                        _advance_keeping_the_subtree(game, m, rng.choice(m.root.actions))
                     done = m.completed_simulations
                     yield probe, probe.run(budget), budget, done, reuse
+
+
+def _advance_keeping_the_subtree(game, m, action) -> None:
+    """Advance ``m`` by ``action`` and check that the promoted root is the right node.
+
+    A materialized child must be promoted as is — the same node, with the edge statistics
+    it had accumulated. An edge that never got a child yields a fresh, unexpanded node
+    for the successor state.
+
+    Args:
+        game: The game searched.
+        m: The engine; its root must be expanded.
+        action: A legal action at the root.
+    """
+    old = m.root
+    kept = old.children[old.actions.index(action)]
+    stats = None if kept is None else (list(kept.N), list(kept.W), list(kept.Q))
+    m.advance(action)
+    if kept is None:
+        assert m.root.state == game.apply(old.state, action)
+        assert not m.root.is_expanded and m.root.N == []
+    else:
+        assert m.root is kept
+        assert (m.root.N, m.root.W, m.root.Q) == stats
 
 
 sweep = pytest.mark.parametrize(
@@ -328,6 +378,12 @@ def _assert_visits_conserved(root, before: dict, budget: int) -> Counter:
 
 @sweep
 def test_visits_are_conserved_per_node_state_against_the_completed_counter(game_name, batch_size):
+    """Every run's visits are conserved node by node, and match ``completed_simulations``.
+
+    Args:
+        game_name: A key of ``GAMES``.
+        batch_size: The batch size of every run.
+    """
     below = Counter()
     for probe, before, budget, done, _reused in _searches(game_name, batch_size):
         m = probe.mcts
@@ -348,9 +404,12 @@ def test_visits_are_conserved_per_node_state_against_the_completed_counter(game_
 
 
 def test_the_sweep_promotes_fresh_expanded_and_terminal_roots():
-    # The root after advance() is whatever the random action led to. Counting only the
-    # runs that follow advance(), over the sweep that is every state a promoted root can
-    # be in — so the reuse equations above are vacuous for none of them.
+    """The root ``advance()`` promotes is, across the sweep, fresh, expanded and terminal.
+
+    The root after ``advance()`` is whatever the random action led to. Counting only the
+    runs that follow it, the sweep covers every state a promoted root can be in, so the
+    reuse equations are vacuous for none of them.
+    """
     promoted = Counter()
     for game_name in GAMES:
         for probe, before, _budget, _done, reused in _searches(game_name, 3):
@@ -363,8 +422,11 @@ def test_the_sweep_promotes_fresh_expanded_and_terminal_roots():
 
 
 def test_the_random_pass_game_is_deep_and_mixes_its_movers():
-    # A seed can draw a tiny tree with one mover; the sweep would then check the
-    # consecutive-mover backup no deeper than the hand-written fixtures do.
+    """The seeded random pass game is deep, mixes its movers and has forced moves.
+
+    A seed can draw a tiny tree with one mover; the sweep would then check the
+    consecutive-mover backup no deeper than the hand-written fixtures do.
+    """
     scenario = GAMES["pass-random"]().s
     depth = {scenario.start: 0}
     for state in sorted(scenario.edges):  # ids grow away from the start state
@@ -388,6 +450,12 @@ def test_the_random_pass_game_is_deep_and_mixes_its_movers():
 
 @sweep
 def test_virtual_loss_is_fully_backed_out_after_every_run(game_name, batch_size):
+    """No virtual loss or in-flight mark survives a run, including after rejected descents.
+
+    Args:
+        game_name: A key of ``GAMES``.
+        batch_size: The batch size of every run.
+    """
     rolled_back = 0
     for probe, *_ in _searches(game_name, batch_size):
         assert _in_flight_under(probe.mcts.root) == 0
@@ -398,6 +466,11 @@ def test_virtual_loss_is_fully_backed_out_after_every_run(game_name, batch_size)
 
 @pytest.mark.parametrize("batch_size", [2, 5])
 def test_back_out_is_exact_at_a_virtual_loss_magnitude_other_than_one(batch_size):
+    """Virtual loss is exact mid-batch and fully backed out at a magnitude of 3.
+
+    Args:
+        batch_size: The batch size of the run.
+    """
     game = Connect4(4, 4, 3)
     probe = _Probe(game, _dyadic, batch_size=batch_size, virtual_loss=3)
 
@@ -410,8 +483,11 @@ def test_back_out_is_exact_at_a_virtual_loss_magnitude_other_than_one(batch_size
 
 
 def test_an_all_terminal_batch_backs_out_and_keeps_counting_the_parent_edge():
-    # Three forced-win moves from the root: once the root is expanded every leaf is
-    # terminal, so no batch reaches the evaluator again and each visit lands on an edge.
+    """Terminal leaves are marked in flight and each edge counts the paths that took it.
+
+    Three forced-win moves from the root: once the root is expanded every leaf is
+    terminal, so no batch reaches the evaluator again and each visit lands on an edge.
+    """
     game = PassGame(
         Scenario(
             start=0,
@@ -427,7 +503,14 @@ def test_an_all_terminal_batch_backs_out_and_keeps_counting_the_parent_edge():
     before = probe.run(10)
 
     assert probe.calls == [[0]]
-    assert sum(m.root.N) == 9 and m.root.W == [float(n) for n in m.root.N]
+    # Every descent after the root's expansion was accepted at a terminal leaf that it
+    # marked in flight, and each edge recorded exactly the descents that took it.
+    accepted = probe.accepted[1:]
+    assert len(accepted) == 9
+    assert all(leaf.is_terminal and marked for _path, leaf, marked in accepted)
+    taken = Counter(path[0][1] for path, _leaf, _marked in accepted)
+    assert m.root.N == [taken[i] for i in range(3)] == [3, 3, 3]
+    assert m.root.W == [3.0, 3.0, 3.0]
     assert all(child.is_terminal and child.N == [] for child in m.root.children)
     assert _in_flight_under(m.root) == 0
     assert _assert_visits_conserved(m.root, before, 10)["terminal"] == 3
@@ -438,6 +521,12 @@ def test_an_all_terminal_batch_backs_out_and_keeps_counting_the_parent_edge():
 
 @sweep
 def test_a_rejected_descent_is_never_a_simulation_and_never_retried(game_name, batch_size):
+    """A collision closes its batch, is not counted as a simulation and is not retried.
+
+    Args:
+        game_name: A key of ``GAMES``.
+        batch_size: The batch size of every run.
+    """
     collisions = 0
     for probe, *_ in _searches(game_name, batch_size):
         m = probe.mcts
@@ -480,6 +569,11 @@ def _star(width: int, stem: int = 0) -> PassGame:
 
 @pytest.mark.parametrize("width", [2, 3, 5, 8])
 def test_virtual_loss_spreads_one_batch_over_every_equal_prior_leaf(width):
+    """One batch takes every equal-prior leaf at the root once, with no collision.
+
+    Args:
+        width: The number of moves at the root.
+    """
     game = _star(width)
     probe = _Probe(game, batch_size=width)
     m = probe.mcts
@@ -496,6 +590,11 @@ def test_virtual_loss_spreads_one_batch_over_every_equal_prior_leaf(width):
 
 @pytest.mark.parametrize("width", [2, 3, 5, 8])
 def test_virtual_loss_diverts_below_the_root_and_at_a_node_with_visits(width):
+    """Virtual loss spreads a batch at an inner node, before and after its edges have visits.
+
+    Args:
+        width: The number of moves at the hub.
+    """
     game = _star(width, stem=1)  # the choice sits behind one forced root move
     probe = _Probe(game, batch_size=width)
     m = probe.mcts
@@ -522,6 +621,11 @@ def test_virtual_loss_diverts_below_the_root_and_at_a_node_with_visits(width):
 
 @pytest.mark.parametrize("width", [2, 5])
 def test_a_batch_wider_than_the_tree_closes_short_at_the_first_collision(width):
+    """A batch wider than the free leaves closes at the first collision; no retry follows.
+
+    Args:
+        width: The number of moves at the root; the batch is three wider.
+    """
     game = _star(width)
     probe = _Probe(game, batch_size=width + 3)
     m = probe.mcts
@@ -541,6 +645,7 @@ def test_a_batch_wider_than_the_tree_closes_short_at_the_first_collision(width):
 
 
 def test_a_collision_deep_in_a_forced_line_rolls_back_its_whole_path():
+    """A collision two edges deep rolls back the virtual loss on every edge of its path."""
     # 0 (P0) --0--> 1 (P0) --0--> 2 (P0) --0--> 3 (P0) --0--> 9  (+1, -1)
     #        \-1--> 4 (P1) --0--> 5 (P0) --0--> 7  (0, 0)
     #                      \-1--> 6 (P0) --0--> 8  (0, 0)
@@ -565,6 +670,15 @@ def test_a_collision_deep_in_a_forced_line_rolls_back_its_whole_path():
     held = {}  # state under evaluation -> virtual loss on the root and on state 1
 
     def evaluate(game, state):
+        """Record the virtual loss held on the line, then call the state won.
+
+        Args:
+            game: The game searched (unused).
+            state: The leaf state.
+
+        Returns:
+            ``(1.0, None)``.
+        """
         root = probe.mcts.root
         line = root.children[0] if root.is_expanded else None
         held[state] = (list(root.vloss), list(line.vloss) if line else None)
@@ -597,15 +711,23 @@ def test_a_collision_deep_in_a_forced_line_rolls_back_its_whole_path():
 
 @pytest.mark.parametrize("batch_size", [2, 8])
 def test_the_single_leaf_evaluator_sees_each_leaf_of_a_batch_once(batch_size):
-    # The probe is a batched evaluator; without one the engine maps `evaluate` over the
-    # batch, and that path must not evaluate a leaf twice either.
+    """Without a batched evaluator, the engine evaluates each expanded node exactly once.
+
+    The probe is a batched evaluator; without one the engine maps ``evaluate`` over the
+    batch, and that path must not evaluate a leaf twice or skip one either.
+
+    Args:
+        batch_size: The batch size of the run.
+    """
     game = Connect4(4, 4, 3)
     seen = []
     m = MCTS(game, evaluate=lambda g, state: seen.append(state) or _dyadic(g, state))
 
     root = m.run(200, root_state=game.initial_state(), batch_size=batch_size)
 
-    assert len(seen) == sum(node.is_expanded for node in _all_nodes(root))
+    # Equal states can sit at distinct nodes (no transposition table), so compare the
+    # multisets: each expanded node's state is evaluated exactly once.
+    assert Counter(seen) == Counter(node.state for node in _all_nodes(root) if node.is_expanded)
 
 
 # --- perspective: player-aware backup on every edge, under any batch order -------------
@@ -639,6 +761,12 @@ def _assert_backed_up_values_are_player_aware(game, root, evaluate) -> None:
 
 @sweep
 def test_backup_is_player_aware_on_every_edge(game_name, batch_size):
+    """Every edge's ``W`` is the player-aware sum of what was backed up through it.
+
+    Args:
+        game_name: A key of ``GAMES``.
+        batch_size: The batch size of every run.
+    """
     same_mover = 0
     for probe, *_ in _searches(game_name, batch_size):
         m = probe.mcts
@@ -785,6 +913,13 @@ def _stats(root) -> list:
 @pytest.mark.parametrize("path", ["default", "batch-size-1", "batched-evaluator"])
 @pytest.mark.parametrize("game_name", sorted(GAMES))
 def test_batch_size_one_is_bit_identical_to_an_independent_serial_search(game_name, path):
+    """``batch_size = 1`` matches an independent serial PUCT bit for bit, across subtree reuse.
+
+    Args:
+        game_name: A key of ``GAMES``.
+        path: How the engine is configured — the default run, an explicit
+            ``batch_size=1``, or a batched evaluator.
+    """
     game = GAMES[game_name]()
     run_kwargs = {} if path == "default" else {"batch_size": 1}
     for evaluate, options, serial_evaluate in SERIAL_CASES:
@@ -858,6 +993,12 @@ def _assert_plays_optimally_on_endgames(game, plies: int, sims_for, batch_size: 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("solved", sorted(SOLVED))
 def test_batched_mcts_plays_optimally_on_solved_endgames(solved, batch_size):
+    """Batched and serial MCTS keep the optimal value at every endgame with at most 3 empty cells.
+
+    Args:
+        solved: A key of ``SOLVED``.
+        batch_size: The batch size of every search.
+    """
     make_game, at_least = SOLVED[solved]
     tested = _assert_plays_optimally_on_endgames(
         make_game(), 3, lambda size: min(2000, max(240, 30 * size)), batch_size
@@ -868,6 +1009,11 @@ def test_batched_mcts_plays_optimally_on_solved_endgames(solved, batch_size):
 @pytest.mark.slow
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_batched_mcts_plays_optimally_on_ttt_deep(batch_size):
+    """Batched and serial MCTS play Tic-Tac-Toe optimally with at most 5 empty cells.
+
+    Args:
+        batch_size: The batch size of every search.
+    """
     _assert_plays_optimally_on_endgames(
         TicTacToe(), 5, lambda size: min(3000, max(300, 16 * size)), batch_size
     )
@@ -880,6 +1026,14 @@ def test_batched_mcts_plays_optimally_on_ttt_deep(batch_size):
     ids=["takes-the-win", "blocks-the-loss"],
 )
 def test_batched_mcts_finds_the_connect4_tactic(moves, sims, best, batch_size):
+    """Batched and serial MCTS find a scripted win or block on the full-size Connect Four board.
+
+    Args:
+        moves: The columns played to reach the position.
+        sims: The simulation budget.
+        best: The only correct column.
+        batch_size: The batch size of the search.
+    """
     game = Connect4()
     m = MCTS(game)
     m.run(sims, root_state=game.from_moves(moves), batch_size=batch_size)
