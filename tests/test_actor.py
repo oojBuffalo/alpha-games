@@ -29,6 +29,7 @@ from core.actor import (
 )
 from core.metrics import EpochMetricsWriter, iter_epoch_records
 from core.observability import (
+    SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_POSITIONS_EVALUATED,
     InferenceBatchCounter,
@@ -503,10 +504,12 @@ def _spy_refresh():
     scalar_calls, batch_sizes = [], []
 
     def scalar(game, state):
+        """Log the leaf; answer value 0 and uniform priors."""
         scalar_calls.append(state)
         return 0.0, None
 
     def batched(game, states):
+        """Log the batch's leaf count; answer value 0 and uniform priors per leaf."""
         batch_sizes.append(len(states))
         return [(0.0, None)] * len(states)
 
@@ -533,6 +536,7 @@ def test_a_two_element_refresh_still_drives_a_batched_search(tmp_path):
     calls = []
 
     def scalar(game, state):
+        """Log the leaf; answer value 0 and uniform priors."""
         calls.append(state)
         return 0.0, None
 
@@ -568,6 +572,7 @@ def _counted_spy_refresh(positions, batches):
     scalar, version, batched = inner()
 
     def size(game, states):
+        """Count a batched call as its number of leaves."""
         return len(states)
 
     for counter in (positions, batches):
@@ -609,6 +614,50 @@ def test_every_game_flushes_its_inference_batch_accounting(tmp_path, leaf_batch_
         assert flushed[SERIES_INFERENCE_BATCHES] < flushed[SERIES_POSITIONS_EVALUATED]
         assert set(buckets) - {"inference_batch_size_1"}  # some batch held several leaves
     assert batches.drain() == {SERIES_INFERENCE_BATCHES: 0}  # drained at the game boundary
+
+
+def test_each_game_flushes_its_metrics_in_one_write(tmp_path):
+    """An interrupted flush must not leave a game's counters half-written."""
+
+    class GroupRecordingWriter(EpochMetricsWriter):
+        """Writer that records each durable write as one group of series names."""
+
+        def __init__(self, *args, **kwargs):
+            """Open the real epoch file and start an empty write log."""
+            super().__init__(*args, **kwargs)
+            self.groups = []
+
+        def append_many(self, records):
+            """Log the group's series names, then write it for real.
+
+            Args:
+                records: The records ``EpochMetricsWriter.append_many`` takes.
+            """
+            records = list(records)
+            self.groups.append([r["series"] for r in records])
+            super().append_many(records)
+
+    positions, batches = PositionCounter(), InferenceBatchCounter()
+    refresh, _ = _counted_spy_refresh(positions, batches)
+    writer = GroupRecordingWriter(tmp_path, "actor-0")
+    make_driver(
+        tmp_path / "shards",
+        refresh=refresh,
+        max_games=2,
+        leaf_batch_size=8,
+        metrics_writer=writer,
+        position_counter=positions,
+        batch_counter=batches,
+    ).run()
+
+    assert len(writer.groups) == 2  # one durable write per game, nothing else
+    for group in writer.groups:
+        assert {
+            SERIES_GAMES_COMPLETED,
+            SERIES_POSITIONS_EVALUATED,
+            SERIES_INFERENCE_BATCHES,
+        } <= set(group)
+        assert any(series.startswith("inference_batch_size_") for series in group)
 
 
 def test_no_batch_counter_means_no_inference_batch_series(tmp_path):

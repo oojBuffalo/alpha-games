@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -216,8 +216,21 @@ class EpochMetricsWriter:
         Args:
             record: A flat, JSON-serializable mapping. Copied, not mutated.
         """
-        line = json.dumps(dict(record), sort_keys=True)
+        self.append_many([record])
+
+    def append_many(self, records: Iterable[Mapping[str, Any]]) -> None:
+        """Append several records in one write, durable before returning.
+
+        One ``write`` and one ``fsync`` for the whole group, so a process
+        killed mid-flush never leaves only some of a group's records behind
+        (records that are only meaningful together, such as one game's
+        counters).
+
+        Args:
+            records: Flat, JSON-serializable mappings. Copied, not mutated.
+        """
+        text = "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records)
         with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
