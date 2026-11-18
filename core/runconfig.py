@@ -440,8 +440,9 @@ class SelfPlayConfig:
                 int), or ``pcr_mid_probability`` is not a float.
         """
         # Direct construction bypasses the JSON reader's type checks. They run
-        # first, so a wrong type is a TypeError whatever its value; a float or
-        # bool budget would otherwise pass the range checks and the actor gate.
+        # first, so a wrong type is a TypeError whatever its value; an integral
+        # float budget (512.0) would otherwise pass the range checks and the
+        # actor gate, then fail inside the search.
         if type(self.playout_cap_randomization) is not bool:
             raise TypeError(
                 "self_play.playout_cap_randomization: expected a bool, "
