@@ -38,7 +38,10 @@ terminal leaves take ``terminal_utility`` inside the loop without reaching the e
     at least one simulation.
   * ``completed_simulations`` counts backed-up simulations, as distinct from descents
     attempted; the budget is spent against it, exactly.
-  * ``batch_size = 1`` is the serial search, bit for bit. Batching changes selection only
+  * ``batch_size = 1`` is the serial search, bit for bit, for an evaluator returning
+    Python floats (every leaf value is now backed up as a Python ``float``, so one
+    returning a NumPy ``float32`` accumulates in double precision where the serial engine
+    accumulated in ``float32``). Batching changes selection only
     through the in-flight virtual-loss term: PUCT (D11), root noise (D7) and subtree
     reuse are as in the serial engine.
 """
@@ -116,8 +119,9 @@ class MCTS:
         evaluate: Optional leaf evaluator ``(game, state) -> (value, priors)`` used at
             non-terminal leaves. ``None`` (M0) means value ``0.0`` and uniform priors.
             The network plugs in here at M2 — the same seam, no new abstraction. The
-            value must be a finite real scalar (a ``numbers.Real``: a Python number or a
-            NumPy scalar; it is backed up as a Python ``float``). Arrays and tensors are
+            value must be a real scalar in ``[-1, 1]`` (a ``numbers.Real``: a Python number
+            or a NumPy scalar; it is backed up as a Python ``float``) — the v1 range of
+            the ``tanh`` value head and of ``terminal_utility``. Arrays and tensors are
             rejected, 0-d and one-element ones included, so an evaluator hands over
             ``.item()``; this holds for ``evaluate_batch`` too.
         evaluate_batch: Optional batched leaf evaluator ``(game, states) -> results``,
@@ -207,7 +211,8 @@ class MCTS:
         descent's virtual loss is rolled back in full and it spends none of the budget;
         there is no retry. A batch's first descent cannot collide, so every batch
         completes at least one simulation. With ``batch_size = 1`` this is the serial
-        search, bit for bit.
+        search, bit for bit, for an evaluator returning Python floats (see the module
+        docstring for NumPy scalars).
 
         A batch that fails is abandoned whole. If the evaluator or ``terminal_utility``
         raises, or returns anything the engine cannot use (see Raises), every descent of
@@ -219,6 +224,10 @@ class MCTS:
         An exception raised inside a descent (by the adapter's ``apply`` /
         ``legal_moves`` / ``is_terminal`` / ``current_player``) abandons the batch the
         same way: the failing descent removes its own virtual loss before propagating.
+        The one thing that can interrupt the fill-and-backup phase is an asynchronous
+        exception such as ``KeyboardInterrupt``; it may land half-way through a backup,
+        so the tree is discarded (the root is unset) before it propagates, and the next
+        call must pass ``root_state``.
 
         Args:
             num_simulations: Number of simulations (backed-up leaf visits) to perform.
@@ -234,7 +243,8 @@ class MCTS:
             ValueError: If ``batch_size < 1``, if no root is set, if ``evaluate_batch``
                 returns a different number of results than it was given states, if a
                 result is an iterable of the wrong length for a ``(value, priors)`` pair,
-                or if a leaf value or a normalized prior is not finite (NaN or infinite).
+                or if a leaf value lies outside ``[-1, 1]`` (NaN included) or a normalized
+                prior is not finite.
             TypeError: If ``num_simulations`` or ``batch_size`` is not an integer, if a
                 leaf value — evaluated, or from ``terminal_utility`` — is not a real
                 number, or if a result is not iterable at all. Malformed priors raise
@@ -284,12 +294,20 @@ class MCTS:
                     leaf.actions = []  # undo the deferral: a fresh node again
                 raise
             # Every value is in hand and checked: the rest only assigns and adds floats.
-            for (path, leaf), resolved in zip(batch, terminal, strict=True):
-                if resolved is None:
-                    resolved = self._leaf_value(leaf, path, self._fill_expand(leaf, *next(results)))
-                self._backup(path, *resolved)
-                leaf.in_flight = False
-                self.completed_simulations += 1
+            try:
+                for (path, leaf), resolved in zip(batch, terminal, strict=True):
+                    if resolved is None:
+                        value = self._fill_expand(leaf, *next(results))
+                        resolved = self._leaf_value(leaf, path, value)
+                    self._backup(path, *resolved)
+                    leaf.in_flight = False
+                    self.completed_simulations += 1
+            except BaseException:
+                # Only an asynchronous interruption (a signal) can land here, possibly
+                # half-way through one path's backup: the tree can no longer be trusted,
+                # so it is dropped rather than left holding stale marks.
+                self.root = None
+                raise
             remaining -= len(batch)
         return self.root
 
@@ -410,7 +428,8 @@ class MCTS:
         Raises:
             ValueError: If ``evaluate_batch`` returns the wrong number of results, if a
                 result is an iterable of the wrong length for a ``(value, priors)`` pair,
-                or if a value is NaN or infinite or the logits give non-finite priors.
+                or if a value lies outside ``[-1, 1]`` (NaN included) or the logits give
+                non-finite priors.
             TypeError: If a value is not a real number, or a result is not iterable.
             OverflowError: If a value is a real number too large for a float.
         """
@@ -435,7 +454,7 @@ class MCTS:
 
     @staticmethod
     def _checked(value: float) -> float:
-        """Return a leaf value as a finite Python float, ready to back up.
+        """Return a leaf value as a Python float in ``[-1, 1]``, ready to back up.
 
         Backup negates the value and adds it to a float; this is where a value that
         cannot do that is rejected, while no statistic has been touched yet. Converting
@@ -452,13 +471,14 @@ class MCTS:
             TypeError: If ``value`` is not a ``numbers.Real`` (an array or a tensor is
                 not, even a 0-d one).
             OverflowError: If ``value`` is too large for a float.
-            ValueError: If ``value`` is NaN or infinite.
+            ValueError: If ``value`` lies outside the v1 range ``[-1, 1]`` (NaN and the
+                infinities included), which also keeps every accumulated ``W`` finite.
         """
         if not isinstance(value, numbers.Real):
             raise TypeError(f"a leaf value must be a real number; got {value!r}")
         value = float(value)  # a huge int or Fraction overflows here
-        if not math.isfinite(value):
-            raise ValueError(f"a leaf value must be finite; got {value!r}")
+        if not -1.0 <= value <= 1.0:  # False for NaN as well
+            raise ValueError(f"a leaf value must be a finite number in [-1, 1]; got {value!r}")
         return value
 
     def _defer_expand(self, node: _Node) -> None:

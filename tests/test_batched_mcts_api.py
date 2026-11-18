@@ -366,18 +366,37 @@ def test_equal_state_leaves_of_one_batch_each_receive_their_own_result():
         return results
 
     m = MCTS(game, evaluate_batch=positional)
-    fill = m._fill_expand
+    fill, descend, noise_check = m._fill_expand, m._descend, m._maybe_noise_root
+    pending, sent_to = [], []  # the batch's accepted non-terminal leaves; all sent leaves
 
-    def spy(node, value, priors):
+    def spy_fill(node, value, priors):
         filled.append((node, value, priors))
         return fill(node, value, priors)
 
-    m._fill_expand = spy
-    m.run(300, root_state=game.initial_state(), batch_size=8)
+    def spy_descend(**kwargs):
+        path, leaf, collided = descend(**kwargs)
+        if not collided and not leaf.is_terminal:
+            pending.append(leaf)
+        return path, leaf, collided
 
-    assert len(filled) == len(returned)
-    for (node, value, priors), (state, sent_value, logits) in zip(filled, returned, strict=True):
-        assert node.state == state and value == sent_value
+    def spy_noise_check():
+        # Each batch starts here: the previous batch's leaves were sent (or, in an
+        # all-terminal batch, there were none to send).
+        sent_to.extend(pending)
+        pending.clear()
+        noise_check()
+
+    m._fill_expand, m._descend, m._maybe_noise_root = spy_fill, spy_descend, spy_noise_check
+    m.run(300, root_state=game.initial_state(), batch_size=8)
+    sent_to.extend(pending)
+
+    assert len(filled) == len(returned) == len(sent_to)
+    for (node, value, priors), (state, sent_value, logits), leaf in zip(
+        filled, returned, sent_to, strict=True
+    ):
+        # The node the i-th result was installed on is, by identity, the leaf whose
+        # state was i-th in the call: equal states cannot trade results or paths.
+        assert node is leaf and leaf.state == state and value == sent_value
         assert priors == m._priors(node.actions, logits)
     # The check above has teeth only if some batch really carried two equal states.
     assert any(len(set(call)) < len(call) for call in calls)
@@ -451,6 +470,32 @@ def test_a_descent_that_raises_removes_its_own_virtual_loss():
     m.run(40, batch_size=4)  # the retry leaves nothing behind either
     assert m.completed_simulations == 41
     _assert_no_residue(m.root)
+
+
+def test_an_interrupted_commit_discards_the_tree():
+    game = Connect4(4, 4, 3)
+    m = MCTS(game)
+    start = game.initial_state()
+    m.run(1, root_state=start)  # expand the root, so the next batch holds four paths
+    backup, backups = m._backup, []
+
+    def interrupted(*args):
+        backups.append(1)
+        if len(backups) == 2:  # an interruption half-way through committing the batch
+            raise KeyboardInterrupt
+        return backup(*args)
+
+    m._backup = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        m.run(4, batch_size=4)
+
+    # A half-committed tree is never offered for reuse: it is gone, not left with marks.
+    assert m.root is None
+    with pytest.raises(ValueError, match="no root set"):
+        m.run(4, batch_size=4)
+    m._backup = backup
+    root = m.run(20, root_state=start, batch_size=4)
+    _assert_no_residue(root)
 
 
 def test_numpy_unsigned_values_back_up_with_the_opponent_sign():
@@ -603,6 +648,7 @@ EVALUATION_FAILURES = {
     "priors-not-logits": (lambda good: [*good[:-1], (0.0, {0: "high"})], TypeError, None),
     "value-nan": (lambda good: [*good[:-1], (float("nan"), None)], ValueError, "finite"),
     "value-inf": (lambda good: [*good[:-1], (float("-inf"), None)], ValueError, "finite"),
+    "value-out-of-range": (lambda good: [*good[:-1], (1.5, None)], ValueError, r"\[-1, 1\]"),
     "priors-nan": (lambda good: [*good[:-1], (0.0, {0: float("nan")})], ValueError, "finite"),
     "priors-inf": (lambda good: [*good[:-1], (0.0, {1: float("inf")})], ValueError, "finite"),
     "result-not-a-pair": (lambda good: [*good[:-1], (0.0,)], ValueError, "unpack"),
@@ -660,15 +706,20 @@ class _FlakyUtilityConnect4(Connect4):
         return super().terminal_utility(state, player_id)
 
 
-@pytest.mark.parametrize("batch_size", [1, 7])
+@pytest.mark.parametrize(("batch_size", "win"), [(1, 0), (7, 0), (7, 6)])
 @pytest.mark.parametrize("bad", ["raises", "not-a-number"])
-def test_a_failed_terminal_utility_abandons_the_batch_and_leaves_the_tree_clean(bad, batch_size):
+def test_a_failed_terminal_utility_abandons_the_batch_and_leaves_the_tree_clean(
+    bad, batch_size, win
+):
     game = _FlakyUtilityConnect4(bad)
-    state = game.from_moves([0, 1, 0, 1, 0, 1])  # column 0 wins at once: a terminal child
+    other = 1 if win == 0 else 5
+    state = game.from_moves([win, other] * 3)  # column `win` wins at once: a terminal child
+
     m = MCTS(game)
 
     # The batch after the root's holds that terminal leaf — alone at batch_size 1, with
-    # six evaluated non-terminal leaves at batch_size 7.
+    # six evaluated non-terminal leaves at batch_size 7: descended after them all when it
+    # is column 6, so the failure comes behind six leaves that are ready to back up.
     with pytest.raises(RuntimeError if bad == "raises" else TypeError):
         m.run(60, root_state=state, batch_size=batch_size)
 
@@ -679,7 +730,7 @@ def test_a_failed_terminal_utility_abandons_the_batch_and_leaves_the_tree_clean(
     m.run(60, batch_size=batch_size)  # the tree is still searchable
     assert m.completed_simulations == 61
     _assert_no_residue(m.root)
-    assert m.best_action() == 0
+    assert m.best_action() == win
 
 
 def test_a_stale_in_flight_mark_fails_loudly_instead_of_spinning():
