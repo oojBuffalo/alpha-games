@@ -734,6 +734,9 @@ def test_python_construction_defaults_to_pcr_off():
         ("pcr_full_plies", 2.0),
         ("playout_cap_randomization", 1),
         ("sims", 512.0),
+        ("sims", False),
+        ("sims", -1.0),
+        ("sims", "512"),
         ("pcr_mid_probability", Fraction(1, 4)),
     ],
 )

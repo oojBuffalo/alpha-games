@@ -439,13 +439,9 @@ class SelfPlayConfig:
                 ``pcr_full_plies`` is not an int (a bool is not accepted as an
                 int), or ``pcr_mid_probability`` is not a float.
         """
-        _positive(self.leaf_batch_size, "self_play.leaf_batch_size")
-        _positive(self.sims, "self_play.sims")
-        _non_negative(self.k_temp, "self_play.k_temp")
-        _unit_interval(self.dirichlet_eps, "self_play.dirichlet_eps")
-        _positive(self.dirichlet_alpha_numerator, "self_play.dirichlet_alpha_numerator")
-        # Direct construction bypasses the JSON reader's type checks; a float
-        # or bool tier budget would pass the range checks and the actor gate.
+        # Direct construction bypasses the JSON reader's type checks. They run
+        # first, so a wrong type is a TypeError whatever its value; a float or
+        # bool budget would otherwise pass the range checks and the actor gate.
         if type(self.playout_cap_randomization) is not bool:
             raise TypeError(
                 "self_play.playout_cap_randomization: expected a bool, "
@@ -460,6 +456,11 @@ class SelfPlayConfig:
                 "self_play.pcr_mid_probability: expected a float, "
                 f"got {type(self.pcr_mid_probability).__name__}"
             )
+        _positive(self.leaf_batch_size, "self_play.leaf_batch_size")
+        _positive(self.sims, "self_play.sims")
+        _non_negative(self.k_temp, "self_play.k_temp")
+        _unit_interval(self.dirichlet_eps, "self_play.dirichlet_eps")
+        _positive(self.dirichlet_alpha_numerator, "self_play.dirichlet_alpha_numerator")
         _positive(self.pcr_mid_sims, "self_play.pcr_mid_sims")
         _positive(self.pcr_fast_sims, "self_play.pcr_fast_sims")
         if not 0.0 < self.pcr_mid_probability < 1.0:
