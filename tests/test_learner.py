@@ -286,6 +286,49 @@ def test_two_writers_never_share_a_file(tmp_path):
     assert list(iter_epoch_records(tmp_path, "actor-0")) == []
 
 
+def test_a_record_group_reads_back_whole_or_not_at_all_wherever_a_crash_cuts_it(tmp_path):
+    """Every cut of a group's line, at a record boundary or inside one, reads as none of it."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+    writer.append({"kind": "first", "value": 0})
+    before = writer.path.read_bytes()
+    group = [{"kind": "delta", "series": s, "value": i} for i, s in enumerate("abc")]
+    writer.append_many(group)
+    full = writer.path.read_bytes()
+    assert list(iter_epoch_records(tmp_path, "actor-0")) == [{"kind": "first", "value": 0}, *group]
+
+    for cut in range(len(before), len(full)):
+        writer.path.write_bytes(full[:cut])
+        assert list(iter_epoch_records(tmp_path, "actor-0")) == [{"kind": "first", "value": 0}]
+
+    # A restart after the cut opens a new epoch; the torn tail stays unread.
+    writer.path.write_bytes(full[:-1])
+    EpochMetricsWriter(tmp_path, "actor-0").append_many(group)
+    assert list(iter_epoch_records(tmp_path, "actor-0")) == [{"kind": "first", "value": 0}, *group]
+
+
+def test_a_failed_append_is_cut_back_so_the_writer_can_carry_on(tmp_path, monkeypatch):
+    """A write that fails part-way leaves the file as it was before the call."""
+    import core.metrics
+
+    writer = EpochMetricsWriter(tmp_path, "learner")
+    writer.append({"kind": "first"})
+    before = writer.path.read_bytes()
+    real_write = core.metrics.os.write
+
+    def write_half_then_fail(fd, data):
+        real_write(fd, bytes(data[: len(data) // 2]))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(core.metrics.os, "write", write_half_then_fail)
+    with pytest.raises(OSError, match="disk full"):
+        writer.append_many([{"kind": "a"}, {"kind": "b"}])
+    monkeypatch.undo()
+    assert writer.path.read_bytes() == before
+
+    writer.append({"kind": "second"})
+    assert list(iter_epoch_records(tmp_path, "learner")) == [{"kind": "first"}, {"kind": "second"}]
+
+
 def test_iter_epoch_records_on_an_untouched_directory_is_empty(tmp_path):
     assert list(iter_epoch_records(tmp_path, "learner")) == []
     assert next_epoch(tmp_path, "learner") == 0

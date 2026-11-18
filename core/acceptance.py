@@ -130,9 +130,11 @@ def _consecutive_mover_game(by_game: dict[GameId, list[SampleRecord]]) -> GameId
     playout-cap randomization off (the M3 fixed-128-sims tier): there, two
     adjacent *stored* records sharing a mover is exactly a consecutive-mover
     (blocked-skip) sequence in the real game. A run with it on drops its
-    fast-search positions (D12), so two stored records also share a mover
-    whenever an odd number of plies was dropped between them, with no skip
-    played -- :func:`verify_acceptance` does not call this for such a run.
+    fast-search positions (D12), so two adjacent stored records can share a
+    mover with no skip between them -- in strictly alternating play, whenever
+    an odd number of plies was dropped between them. (The game contract does
+    not assume alternation, so a gap says nothing either way about a skip.)
+    :func:`verify_acceptance` does not call this for such a run.
 
     Args:
         by_game: Every observed game's ply-sorted records
@@ -192,8 +194,9 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
     )
 
     if run_config.self_play.playout_cap_randomization:
-        # Fail closed: on this run the stored-sample test would name a game
-        # as evidence whenever a dropped ply sat between two stored ones.
+        # Fail closed: on this run the stored-sample test can name a game as
+        # evidence with no skip played -- in strictly alternating play,
+        # whenever an odd number of plies was dropped between two stored ones.
         checks.append(
             CheckResult(
                 "at least one consecutive-mover (blocked-skip) sequence",

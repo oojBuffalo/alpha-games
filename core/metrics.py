@@ -41,7 +41,12 @@ Every documented record carries a ``kind`` field naming what it is (e.g.
 latest-value observation), or ``total`` (a coordinator-owned exact
 cumulative) per the design-doc taxonomy -- issue #62 defines and enforces
 that taxonomy for its own series; this module does not interpret record
-contents at all, only their durable storage and retrieval.
+contents, only their durable storage and retrieval -- with one exception of
+its own: a group of records that must be read together is appended as one
+``record_group`` line (:meth:`EpochMetricsWriter.append_many`), which
+:func:`iter_epoch_records` expands back into its records. A line counts only
+once its terminating newline is on disk, so a write cut short by a crash is
+never read, and a group is read whole or not at all.
 """
 
 from __future__ import annotations
@@ -55,6 +60,9 @@ from typing import Any
 
 _METRICS_DIRNAME = "metrics"
 _EPOCH_PATTERN = re.compile(r"^(?P<proc>.+)-(?P<epoch>\d+)\.jsonl$")
+
+#: ``kind`` of the one line :meth:`EpochMetricsWriter.append_many` writes per group.
+RECORD_GROUP_KIND = "record_group"
 
 
 def metrics_dir(run_dir: Path | str) -> Path:
@@ -165,6 +173,10 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         run_dir: The run's root directory.
         proc: The process name.
 
+    A group appended by :meth:`EpochMetricsWriter.append_many` is yielded
+    as its records, in order, and only whole: an unterminated final line is
+    skipped, so a crash mid-append never exposes part of a group.
+
     Yields:
         Each record, parsed from JSON, oldest first.
     """
@@ -179,9 +191,19 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         if m is not None and m.group("proc") == proc:
             epoch_files.append((int(m.group("epoch")), p))
     for _, path in sorted(epoch_files):
-        for line in path.read_text().splitlines():
-            if line.strip():
-                yield json.loads(line)
+        # A line counts only once its newline is on disk: the text after the
+        # last newline is a write still in flight or one a crash cut short,
+        # and is never yielded (a record group is all one line, so this also
+        # never yields part of a group).
+        *lines, _tail = path.read_text(encoding="utf-8").split("\n")
+        for line in lines:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("kind") == RECORD_GROUP_KIND:
+                yield from record["records"]
+            else:
+                yield record
 
 
 class EpochMetricsWriter:
@@ -216,20 +238,42 @@ class EpochMetricsWriter:
         Args:
             record: A flat, JSON-serializable mapping. Copied, not mutated.
         """
-        self.append_many([record])
+        self._write_line(json.dumps(dict(record), sort_keys=True))
 
     def append_many(self, records: Iterable[Mapping[str, Any]]) -> None:
-        """Append records as JSON lines in one write, all durable before returning.
+        """Append records as one group, durable whole or not at all.
 
-        One ``write`` and one ``fsync`` for the whole group, so a group that
-        must be read together (one game's accounting -- :mod:`core.actor`)
-        is never left half-appended by a failure between two of its records.
+        The group is written as a single ``record_group`` line that
+        :func:`iter_epoch_records` expands back into its records. A reader
+        counts a line only once its newline is on disk, so a crash mid-write
+        exposes none of the group, not a prefix of it -- the guarantee one
+        game's accounting needs (:mod:`core.actor`).
 
         Args:
             records: Flat, JSON-serializable mappings. Copied, not mutated.
         """
-        text = "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records)
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
+        group = {"kind": RECORD_GROUP_KIND, "records": [dict(record) for record in records]}
+        self._write_line(json.dumps(group, sort_keys=True))
+
+    def _write_line(self, line: str) -> None:
+        """Append ``line`` and a newline, fsynced; on failure, cut the file back.
+
+        A failed write is truncated away before the error propagates, so a
+        writer that carries on never appends after a partial line.
+
+        Args:
+            line: One JSON document with no newline in it.
+        """
+        data = memoryview((line + "\n").encode("utf-8"))
+        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
+        try:
+            start = os.fstat(fd).st_size
+            try:
+                while data:
+                    data = data[os.write(fd, data) :]
+                os.fsync(fd)
+            except BaseException:
+                os.ftruncate(fd, start)
+                raise
+        finally:
+            os.close(fd)

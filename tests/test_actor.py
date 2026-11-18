@@ -899,20 +899,19 @@ def test_a_game_whose_shard_is_not_published_is_counted_by_no_series(tmp_path):
 
 
 def test_a_failure_mid_flush_leaves_no_durable_part_of_the_games_series(tmp_path, monkeypatch):
-    """A game's series are durable together: a failure inside the group keeps none.
+    """A game's series are durable together: a write that fails part-way keeps none.
 
-    The failure is injected at the ``positions_stored`` record, after the
-    group's first records. A restarted actor then plays on, and the run's
+    The write stops after the bytes of the group's first records reach the
+    file, then fails. A restarted actor plays on, and the run's
     played/stored/tier identities still hold over every game that flushed.
     """
     import core.metrics
 
-    real_dumps = core.metrics.json.dumps
+    real_write = core.metrics.os.write
 
-    def fail_at_positions_stored(obj, **kwargs):
-        if obj.get("series") == SERIES_POSITIONS_STORED:
-            raise OSError("disk full")
-        return real_dumps(obj, **kwargs)
+    def write_half_then_fail(fd, data):
+        real_write(fd, bytes(data[: len(data) // 2]))
+        raise OSError("disk full")
 
     shard_dir = tmp_path / "shards"
     driver = make_driver(
@@ -921,11 +920,11 @@ def test_a_failure_mid_flush_leaves_no_durable_part_of_the_games_series(tmp_path
         max_games=1,
         metrics_writer=EpochMetricsWriter(tmp_path, "actor-0"),
     )
-    monkeypatch.setattr(core.metrics.json, "dumps", fail_at_positions_stored)
+    monkeypatch.setattr(core.metrics.os, "write", write_half_then_fail)
     with pytest.raises(OSError, match="disk full"):
         driver.run()
     monkeypatch.undo()
-    assert _series_values(tmp_path) == []  # not even the records before the failure
+    assert _series_values(tmp_path) == []  # none of the group, not a prefix of it
 
     make_driver(
         shard_dir,
