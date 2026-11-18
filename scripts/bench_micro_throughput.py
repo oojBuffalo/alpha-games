@@ -1293,9 +1293,10 @@ def main(argv: list[str] | None = None) -> int:
 
     Raises:
         SystemExit: From :func:`require_official_hardware` when the hardware is
-            not the pinned 4060 Ti 16 GB and the opt-in flag is absent, or when
-            the config turns playout-cap randomization on (§12 M2.5 pins the
-            spike to a fixed budget, official or not).
+            not the pinned 4060 Ti 16 GB and the opt-in flag is absent; or from
+            this function itself when the config turns playout-cap
+            randomization on (§12 M2.5 pins the spike to a fixed budget,
+            official or not).
         ValueError: From :func:`observed_amp` if the timed forwards and the
             leaf evaluations did not run at the same precision.
     """

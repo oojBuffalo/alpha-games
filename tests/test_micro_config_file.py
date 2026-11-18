@@ -32,6 +32,7 @@ import inspect
 import json
 import textwrap
 from collections.abc import Iterator
+from fractions import Fraction
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -732,6 +733,8 @@ def test_python_construction_defaults_to_pcr_off():
         ("pcr_fast_sims", True),
         ("pcr_full_plies", 2.0),
         ("playout_cap_randomization", 1),
+        ("sims", 512.0),
+        ("pcr_mid_probability", Fraction(1, 4)),
     ],
 )
 def test_python_construction_type_checks_the_pcr_fields(field, bad):
@@ -745,5 +748,5 @@ def test_python_construction_type_checks_the_pcr_fields(field, bad):
         playout_cap_randomization=True,
     )
     fields[field] = bad
-    with pytest.raises(TypeError, match=rf"self_play\.{field}: expected an? (int|bool)"):
+    with pytest.raises(TypeError, match=rf"self_play\.{field}: expected an? (int|bool|float)"):
         SelfPlayConfig(**fields)

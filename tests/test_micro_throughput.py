@@ -677,6 +677,14 @@ def test_main_refuses_a_playout_cap_config(monkeypatch, tmp_path, official):
     real_load = BENCH.load_run_config
 
     def load_pcr(path):
+        """Load ``path`` through the real parser and switch it to the D6 budget.
+
+        Args:
+            path: The config path ``main`` passes.
+
+        Returns:
+            The parsed config with playout-cap randomization on and ``sims`` 512.
+        """
         cfg = real_load(path)
         return dataclasses.replace(
             cfg,
