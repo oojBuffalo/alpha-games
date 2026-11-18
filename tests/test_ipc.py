@@ -1371,13 +1371,91 @@ class _ExitsBeforeTheKill(_HeldProcess):
 
 
 def test_a_child_that_exits_cleanly_before_the_kill_is_not_recorded_as_forced(tmp_path):
+    clean, killed = _ExitsBeforeTheKill(), _HeldProcess()
+    clean.name, clean.pid = "actor-0", 1001
+    killed.name, killed.pid = "actor-1", 1002
     launched = ipc.LaunchedRun(
         ctx=None,
         learner=_ExitedProcess(),
-        actors={0: _ExitsBeforeTheKill(), 1: _HeldProcess()},
+        actors={0: clean, 1: killed},
         metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
     )
     launched.shutdown(0.0)
     records = list(iter_epoch_records(tmp_path, "orchestrator"))
     assert [rec["kind"] for rec in records] == [KIND_SHUTDOWN_FORCED, KIND_SEGMENT_END]
-    assert len([rec for rec in records if rec["kind"] == KIND_SHUTDOWN_FORCED]) == 1
+    assert (records[0]["process"], records[0]["pid"]) == ("actor-1", 1002)
+
+
+class _FailsOnceAt(EpochMetricsWriter):
+    """A real-format writer whose first append of one record kind fails.
+
+    Args:
+        run_dir: The run directory.
+        proc: The process name.
+        kind: The record kind whose first append fails.
+        how: ``"short_write"`` -- part of the line reaches the file, then
+            ENOSPC; ``"fsync"`` -- the whole line reaches the file, then the
+            fsync fails.
+    """
+
+    def __init__(self, run_dir, proc, kind, how):
+        super().__init__(run_dir, proc)
+        self.kind, self.how, self.failed = kind, how, False
+
+    def append(self, record):
+        if record["kind"] != self.kind or self.failed:
+            return super().append(record)
+        self.failed = True
+        if self.how == "fsync":
+            super().append(record)
+            raise OSError(5, "Input/output error")
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write('{"kind": "shutdown_fo')
+        raise OSError(28, "No space left on device")
+
+
+@pytest.mark.parametrize("how", ["short_write", "fsync"])
+def test_a_retried_shutdown_writes_each_record_exactly_once_in_a_readable_file(tmp_path, how):
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _HeldProcess()},
+        metrics_writer=_FailsOnceAt(tmp_path, "orchestrator", KIND_SHUTDOWN_FORCED, how),
+    )
+    with pytest.raises(OSError):
+        launched.shutdown(0.0)
+    launched.shutdown(0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SHUTDOWN_FORCED, KIND_SEGMENT_END]
+    assert launched.metrics_writer.path.read_text().endswith("\n")
+
+
+class _FinishesAGameWhenSignaled(_HeldProcess):
+    """An actor that completes its in-flight game, then exits, once signaled."""
+
+    def __init__(self, run_dir):
+        super().__init__()
+        self.run_dir = run_dir
+
+    def terminate(self):
+        self.calls.append("terminate")
+        _write_completed_games(self.run_dir, [0, 1])  # a second writer: one more game
+        self.alive = False
+        self.exitcode = 0
+
+
+def test_a_wait_retried_after_shutdown_began_does_not_judge_the_target_again(tmp_path, monkeypatch):
+    """The learner's exit ended the run; a game landing during shutdown does not change that."""
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [1])
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _FinishesAGameWhenSignaled(tmp_path)},
+        metrics_writer=_FailsOnceAt(tmp_path, "orchestrator", KIND_SEGMENT_END, "short_write"),
+        spike_games=2,
+    )
+    with pytest.raises(OSError):
+        launched.wait(poll_interval=0.0, shutdown_grace=0.0)
+    assert launched.games_completed() == 2  # the target is met now, but did not stop the run
+    launched.wait(poll_interval=0.0, shutdown_grace=0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]

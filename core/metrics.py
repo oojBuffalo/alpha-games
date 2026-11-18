@@ -219,11 +219,48 @@ class EpochMetricsWriter:
     def append(self, record: Mapping[str, Any]) -> None:
         """Append one record as a JSON line, durable before returning.
 
+        A failed earlier append can leave an unterminated line at the end of
+        the file; it is cut back to the last complete record first, so this
+        record starts on its own line.
+
         Args:
             record: A flat, JSON-serializable mapping. Copied, not mutated.
         """
         line = json.dumps(dict(record), sort_keys=True)
+        self._drop_torn_tail()
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
             os.fsync(fh.fileno())
+
+    def _drop_torn_tail(self) -> None:
+        """Truncate an unterminated last line (a failed append's partial write)."""
+        with open(self.path, "rb+") as fh:
+            end = fh.seek(0, os.SEEK_END)
+            if end == 0:
+                return
+            fh.seek(end - 1)
+            if fh.read(1) == b"\n":
+                return
+            fh.seek(0)
+            fh.truncate(fh.read().rfind(b"\n") + 1)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def contains(self, record: Mapping[str, Any]) -> bool:
+        """Return whether this epoch's file already holds ``record`` as a complete line.
+
+        For a caller retrying an append that raised: the record may have
+        been written in full before the error (say, a failed ``fsync``).
+
+        Args:
+            record: The record that was being appended.
+
+        Returns:
+            Whether an equal record is in this instance's epoch file.
+        """
+        target = dict(record)
+        for line in self.path.read_text().split("\n")[:-1]:
+            if line.strip() and json.loads(line) == target:
+                return True
+        return False

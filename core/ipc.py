@@ -647,8 +647,8 @@ class LaunchedRun:
     metrics_writer: EpochMetricsWriter
     spike_games: int | None = None
     _ended: bool = field(default=False, init=False, repr=False)
-    _spike_stop_written: bool = field(default=False, init=False, repr=False)
-    _pending_forced: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+    _spike_stop: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _final_records: list[dict[str, Any]] | None = field(default=None, init=False, repr=False)
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
@@ -709,8 +709,11 @@ class LaunchedRun:
         says only that something else ended the run.
 
         Once the run has shut down, a further call returns at once and
-        writes nothing, and a call retried after a failed shutdown write
-        does not append ``spike_stop`` again: one launch has at most one.
+        writes nothing. Once :meth:`shutdown` has begun, a call retried
+        after a failed write does not judge the target again: it writes the
+        ``spike_stop`` already decided, if any, and finishes the shutdown.
+        Each record is built once and skipped on a retry if the failed
+        attempt wrote it in full, so one launch has at most one.
 
         With :attr:`spike_games` unset this reads no metrics and writes no
         record of its own.
@@ -727,6 +730,13 @@ class LaunchedRun:
         _check_grace_period(shutdown_grace)
         if self._ended:
             return
+        if self._final_records is not None:
+            # A retry after a failed finalization write: the run is already
+            # stopped, so the target is not judged again.
+            if self._spike_stop is not None:
+                self._append_once(self._spike_stop)
+            self.shutdown(shutdown_grace)
+            return
         try:
             while True:
                 actors_alive = any(actor.is_alive() for actor in self.actors.values())
@@ -734,13 +744,11 @@ class LaunchedRun:
                 if self.spike_games is not None:
                     completed = self.games_completed()
                     if completed >= self.spike_games:
-                        if not self._spike_stop_written:
-                            self.metrics_writer.append(
-                                spike_stop_record(
-                                    target=self.spike_games, games_completed=completed
-                                )
+                        if self._spike_stop is None:
+                            self._spike_stop = spike_stop_record(
+                                target=self.spike_games, games_completed=completed
                             )
-                            self._spike_stop_written = True
+                        self._append_once(self._spike_stop)
                         break
                     if not (actors_alive and learner_alive):
                         break
@@ -791,8 +799,9 @@ class LaunchedRun:
         complete, it is gone, and it is not an escalation.
 
         A call after a completed shutdown returns at once and writes nothing.
-        A call retried after a record write failed writes the
-        ``shutdown_forced`` records still pending, then ``segment_end``.
+        The records are fixed when the children are gone; a call retried
+        after a write failed signals nothing and writes those records not
+        yet in the epoch file, so each lands exactly once.
 
         Args:
             timeout: The grace period, in seconds, shared by every process:
@@ -807,6 +816,31 @@ class LaunchedRun:
         _check_grace_period(timeout)
         if self._ended:
             return
+        if self._final_records is None:
+            self._final_records = self._stop_children(timeout)
+        for record in self._final_records:
+            self._append_once(record)
+        self._ended = True
+
+    def _append_once(self, record: dict[str, Any]) -> None:
+        """Append ``record`` unless an earlier, failed attempt already wrote it in full.
+
+        Args:
+            record: One finalization record, built once and reused by retries.
+        """
+        if not self.metrics_writer.contains(record):
+            self.metrics_writer.append(record)
+
+    def _stop_children(self, timeout: float) -> list[dict[str, Any]]:
+        """Signal, join and, past the grace period, kill and reap every child.
+
+        Args:
+            timeout: The shared grace period.
+
+        Returns:
+            The records to write, in order: one ``shutdown_forced`` per
+            child that exited from ``SIGKILL``, then ``segment_end``.
+        """
         processes = self.all_processes()
         for process in processes:
             if process.is_alive():
@@ -823,18 +857,12 @@ class LaunchedRun:
             process.join()
         # A survivor that exited on its own between the snapshot and the
         # signal ran its clean path; only a SIGKILL exit is an escalation.
-        # Pending records outlive a failed append, so a retried shutdown
-        # (its children already reaped) still writes them.
-        self._pending_forced.extend(
+        forced = [
             shutdown_forced_record(process=process.name, pid=process.pid)
             for process in survivors
             if process.exitcode == -signal.SIGKILL
-        )
-        while self._pending_forced:
-            self.metrics_writer.append(self._pending_forced[0])
-            self._pending_forced.pop(0)
-        self.metrics_writer.append(segment_end_record())
-        self._ended = True
+        ]
+        return [*forced, segment_end_record()]
 
 
 def launch_run(
