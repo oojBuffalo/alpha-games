@@ -434,7 +434,29 @@ class SelfPlayConfig:
                 outside ``(0, 1)``, ``pcr_full_plies`` is negative, or
                 playout-cap randomization is on without
                 ``sims > pcr_mid_sims > pcr_fast_sims``.
+            TypeError: If ``playout_cap_randomization`` is not a bool,
+                ``sims``, ``pcr_mid_sims``, ``pcr_fast_sims`` or
+                ``pcr_full_plies`` is not an int (a bool is not accepted as an
+                int), or ``pcr_mid_probability`` is not a float.
         """
+        # Direct construction bypasses the JSON reader's type checks. They run
+        # first, so a wrong type is a TypeError whatever its value; an integral
+        # float budget (512.0) would otherwise pass the range checks and the
+        # actor gate, then fail inside the search.
+        if type(self.playout_cap_randomization) is not bool:
+            raise TypeError(
+                "self_play.playout_cap_randomization: expected a bool, "
+                f"got {type(self.playout_cap_randomization).__name__}"
+            )
+        for name in ("sims", "pcr_mid_sims", "pcr_fast_sims", "pcr_full_plies"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"self_play.{name}: expected an int, got {type(value).__name__}")
+        if type(self.pcr_mid_probability) is not float:
+            raise TypeError(
+                "self_play.pcr_mid_probability: expected a float, "
+                f"got {type(self.pcr_mid_probability).__name__}"
+            )
         _positive(self.leaf_batch_size, "self_play.leaf_batch_size")
         _positive(self.sims, "self_play.sims")
         _non_negative(self.k_temp, "self_play.k_temp")

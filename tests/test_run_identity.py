@@ -297,8 +297,14 @@ def _bump(value):
 
 
 def _override_pcr_on(raw: dict) -> None:
-    # The flag alone is not schema-valid on the micro base: PCR on needs
-    # ``sims`` above the mid tier, so the always-full budget moves with it.
+    """Turn playout-cap randomization on in place, keeping the config valid.
+
+    The flag alone is not schema-valid on the micro base: PCR on needs
+    ``sims`` above the mid tier, so the always-full budget moves with it.
+
+    Args:
+        raw: A launch-config dict, mutated in place.
+    """
     raw["self_play"]["playout_cap_randomization"] = True
     raw["self_play"]["sims"] = 512
 
@@ -665,6 +671,22 @@ def test_an_older_document_migrates_to_pcr_off_with_sims_carried_through(tmp_pat
     assert migrated.sims == raw["self_play"]["sims"] == 128
     assert migrated.leaf_batch_size == 1
     assert (root / "config.json").read_bytes() == fixture.read_bytes()
+
+
+def test_a_batched_v2_run_keeps_its_leaf_batch_size_through_migration(tmp_path):
+    """The v2 -> v3 step must not reset ``leaf_batch_size`` to the v1 default."""
+    root = _v1_run_dir(tmp_path, fixture=V2_CONFIG_FIXTURE)
+    doc = json.loads(V2_CONFIG_FIXTURE.read_text())
+    doc["self_play"]["leaf_batch_size"] = 8
+    (root / "config.json").write_text(json.dumps(doc))
+
+    _, lc = read_stored_config_document(root)
+    assert lc.run.self_play.leaf_batch_size == 8
+
+    live_raw = load_launch_config(ROOT / "configs" / "blokus_duo.json").to_dict()
+    live_raw["self_play"]["leaf_batch_size"] = 8
+    live = LaunchConfig.from_dict(live_raw)
+    assert resolve_resume(root, live).effective_config == live
 
 
 def test_strict_launch_loader_rejects_the_v2_document():

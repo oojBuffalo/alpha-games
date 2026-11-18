@@ -32,6 +32,7 @@ import inspect
 import json
 import textwrap
 from collections.abc import Iterator
+from fractions import Fraction
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -722,3 +723,33 @@ def test_python_construction_defaults_to_pcr_off():
     assert default.playout_cap_randomization is False
     assert (default.pcr_mid_sims, default.pcr_fast_sims) == (256, 64)
     assert (default.pcr_mid_probability, default.pcr_full_plies) == (0.25, 2)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("pcr_mid_sims", 256.0),
+        ("pcr_fast_sims", 64.0),
+        ("pcr_fast_sims", True),
+        ("pcr_full_plies", 2.0),
+        ("playout_cap_randomization", 1),
+        ("sims", 512.0),
+        ("sims", False),
+        ("sims", -1.0),
+        ("sims", "512"),
+        ("pcr_mid_probability", Fraction(1, 4)),
+    ],
+)
+def test_python_construction_type_checks_the_pcr_fields(field, bad):
+    """Direct construction must not let a float budget past the actor's pin check."""
+    fields = dict(
+        sims=512,
+        k_temp=4,
+        dirichlet_eps=0.25,
+        dirichlet_alpha_numerator=10.8,
+        root_noise=True,
+        playout_cap_randomization=True,
+    )
+    fields[field] = bad
+    with pytest.raises(TypeError, match=rf"self_play\.{field}: expected an? (int|bool|float)"):
+        SelfPlayConfig(**fields)

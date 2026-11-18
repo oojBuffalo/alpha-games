@@ -377,7 +377,7 @@ def test_verify_acceptance_cli_reads_a_schema_v1_run_dir_end_to_end(tmp_path, ca
     assert rs.main(["--verify-acceptance", str(root)]) == 0
 
     out = capsys.readouterr().out
-    assert out.count("[PASS]") == 9
+    assert out.count("[PASS]") == 10
     assert "[FAIL]" not in out
     assert "verdict: PASS" in out
     assert (root / "config.json").read_bytes() == V1_CONFIG_FIXTURE.read_bytes()
