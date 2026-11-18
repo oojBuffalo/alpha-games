@@ -342,6 +342,9 @@ def _assert_visits_conserved(root, before: dict, budget: int) -> Counter:
     Below the root the same offset holds in absolute terms, since a node's parent edge
     carries every visit it ever had: an expanded child's edge total is its parent-edge
     ``N`` minus one, and a child is materialized exactly when that ``N`` is positive.
+    That last equivalence assumes no run on this engine was abandoned: a failed
+    evaluation backs out its batch but keeps the children it allocated, on edges that
+    stay at zero visits. Every caller here searches without failures.
 
     Args:
         root: The root after the run.
