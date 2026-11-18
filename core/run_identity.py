@@ -982,16 +982,23 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
     Raises:
         FileNotFoundError: If ``run_dir`` has no recorded provenance.
         MaterialConfigDiffError: If any material field differs, naming every
-            offending field.
+            offending field -- including ``actor_inference_amp`` for a
+            schema-v1 run resumed on CUDA (fork it instead).
         UnclassifiedFieldError: If either config carries an unclassified leaf
             field.
     """
     root = Path(run_dir)
-    stored = read_stored_config(root)
+    document, stored = read_stored_config_document(root)
     record = read_run_record(root)
     diff = diff_launch_configs(stored, new_launch_config)
-    if diff.is_material:
-        raise MaterialConfigDiffError(diff.material)
+    material = dict(diff.material)
+    # Launch schema 1 predates actor-side autocast (``core.amp``): its CUDA
+    # actors ran float32 inference, which a resume here would switch to
+    # float16 under the same run id. Off CUDA the autocast is a no-op.
+    if document["schema_version"] == 1 and device_kind(new_launch_config.device) == "cuda":
+        material["actor_inference_amp"] = (False, True)
+    if material:
+        raise MaterialConfigDiffError(material)
     return ResumeResolution(
         run_id=record.run_id,
         run_root=root,

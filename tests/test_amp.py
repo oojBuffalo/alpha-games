@@ -82,7 +82,11 @@ def test_observe_reports_the_live_state_once_from_inside_the_context():
 
     def fake(game, state):
         """A stand-in evaluator recording whether autocast was live for its 'forward'."""
-        inside.append(torch.is_autocast_enabled("cpu"))
+        # Queried independently of AmpMode.observed, with the same torch 2.3 fallback.
+        try:
+            inside.append(torch.is_autocast_enabled("cpu"))
+        except TypeError:  # torch < 2.4: no device-type argument
+            inside.append(torch.is_autocast_cpu_enabled())
         return 0.5, {1: 0.25}
 
     forced = AmpMode(device_type="cpu", enabled=True)

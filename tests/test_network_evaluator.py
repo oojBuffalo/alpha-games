@@ -326,15 +326,25 @@ def test_batched_bridge_drives_batched_mcts():
     batched = make_batched_network_evaluator(OTHELLO_NET, OTHELLO)
 
     def spy(game, states):
+        """Log the batch's leaf count, then evaluate it for real."""
         calls.append(len(states))
         return batched(game, states)
 
     def scalar_must_not_run(game, state):
+        """Fail the test: with ``evaluate_batch`` supplied this is never called."""
         raise AssertionError("evaluate_batch supplied: the scalar evaluator is not used")
 
-    m = MCTS(OTHELLO, evaluate=scalar_must_not_run, evaluate_batch=spy)
-    root = m.run(64, root_state=OTHELLO.initial_state(), batch_size=8)
+    # The net's own forward batch sizes, not the wrapper's: a bridge that ran
+    # one forward per leaf would still be called once per leaf batch.
+    forwards = []
+    hook = OTHELLO_NET.register_forward_hook(lambda _m, args, _o: forwards.append(len(args[0])))
+    try:
+        m = MCTS(OTHELLO, evaluate=scalar_must_not_run, evaluate_batch=spy)
+        root = m.run(64, root_state=OTHELLO.initial_state(), batch_size=8)
+    finally:
+        hook.remove()
 
+    assert forwards == calls  # exactly one network forward per leaf batch
     assert sum(root.N) == 63  # the first simulation expands the root
     assert max(calls) > 1  # several leaves really shared one forward
     assert sum(calls) <= 64 and all(1 <= n <= 8 for n in calls)

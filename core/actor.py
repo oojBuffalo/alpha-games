@@ -438,7 +438,8 @@ class ActorDriver:
         it writes none. ``positions_evaluated`` is drained from
         ``position_counter`` and omitted entirely when none was supplied --
         never a fabricated zero. The inference-batch deltas are drained from
-        ``batch_counter`` under the same rule.
+        ``batch_counter`` under the same rule. The whole game's records go
+        out in one ``EpochMetricsWriter.append_many`` write.
 
         Args:
             result: The just-finished game.
@@ -446,17 +447,22 @@ class ActorDriver:
         if self.metrics_writer is None:
             return
         now = time.time()
-        self.metrics_writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=now))
-        self.metrics_writer.append(delta_record(SERIES_SIMS_RUN, result.sims_run, timestamp=now))
+        deltas: list[tuple[str, float]] = [
+            (SERIES_GAMES_COMPLETED, 1),
+            (SERIES_SIMS_RUN, result.sims_run),
+        ]
         tier_counts = dict(result.tier_counts)
-        for tier, series in _TIER_SERIES.items():
-            if tier in tier_counts:
-                self.metrics_writer.append(delta_record(series, tier_counts[tier], timestamp=now))
+        deltas.extend(
+            (series, tier_counts[tier])
+            for tier, series in _TIER_SERIES.items()
+            if tier in tier_counts
+        )
         if self.position_counter is not None:
-            positions = self.position_counter.drain()
-            self.metrics_writer.append(
-                delta_record(SERIES_POSITIONS_EVALUATED, positions, timestamp=now)
-            )
+            deltas.append((SERIES_POSITIONS_EVALUATED, self.position_counter.drain()))
         if self.batch_counter is not None:
-            for series, value in self.batch_counter.drain().items():
-                self.metrics_writer.append(delta_record(series, value, timestamp=now))
+            deltas.extend(self.batch_counter.drain().items())
+        # One write for the whole game, so mean fill and the bucket histogram
+        # never see a game whose flush was cut off part-way.
+        self.metrics_writer.append_many(
+            delta_record(series, value, timestamp=now) for series, value in deltas
+        )

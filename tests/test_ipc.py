@@ -376,22 +376,26 @@ def _spy_on_batched_factory(monkeypatch):
         monkeypatch: The pytest fixture.
 
     Returns:
-        The list the leaf counts are appended to, one entry per forward pass.
+        ``(sizes, forwards)``: the leaf count of every batched call, and the
+        batch size of every forward the built networks actually ran.
     """
-    sizes = []
+    sizes, forwards = [], []
     real = ipc.make_batched_network_evaluator
 
     def factory(net, game, device="cpu"):
+        """Build the real batched evaluator, logging its calls and the net's forwards."""
+        net.register_forward_hook(lambda _m, args, _o: forwards.append(len(args[0])))
         inner = real(net, game, device=device)
 
         def spy(game_, states):
+            """Log the batch's leaf count, then evaluate it for real."""
             sizes.append(len(states))
             return inner(game_, states)
 
         return spy
 
     monkeypatch.setattr(ipc, "make_batched_network_evaluator", factory)
-    return sizes
+    return sizes, forwards
 
 
 def _run_counted_actor(tmp_path, monkeypatch, *, leaf_batch_size):
@@ -403,12 +407,13 @@ def _run_counted_actor(tmp_path, monkeypatch, *, leaf_batch_size):
         leaf_batch_size: The actor's ``self_play.leaf_batch_size``.
 
     Returns:
-        ``(totals, sizes)``: the reduced run's totals and the leaf count of
-        every batched forward pass.
+        ``(totals, sizes, forwards)``: the reduced run's totals, the leaf
+        count of every batched call, and the batch size of every network
+        forward actually run.
     """
     shard_dir, ckpt_dir, run_dir = tmp_path / "shards", tmp_path / "ckpt", tmp_path / "run"
     _make_learner(shard_dir, ckpt_dir, run_dir)  # publishes v0
-    sizes = _spy_on_batched_factory(monkeypatch)
+    sizes, forwards = _spy_on_batched_factory(monkeypatch)
     counter = PositionCounter()
     batch_counter = InferenceBatchCounter()
     writer = EpochMetricsWriter(run_dir, "actor-0")
@@ -433,12 +438,13 @@ def _run_counted_actor(tmp_path, monkeypatch, *, leaf_batch_size):
         batch_counter=batch_counter,
     )
     assert len(actor.run()) == 2
-    return reduce_run(run_dir).totals, sizes
+    return reduce_run(run_dir).totals, sizes, forwards
 
 
 def test_a_batched_actor_counts_leaves_evaluated_not_forward_passes(tmp_path, monkeypatch):
-    totals, sizes = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=8)
+    totals, sizes, forwards = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=8)
 
+    assert forwards == sizes  # one real network forward per leaf batch
     assert totals[SERIES_POSITIONS_EVALUATED] == sum(sizes)  # the x-axis counts leaves
     assert sum(sizes) > len(sizes)  # ...which is more than the forward passes run
     assert max(sizes) > 1 and all(1 <= n <= 8 for n in sizes)
@@ -455,8 +461,9 @@ def test_a_batched_actor_counts_leaves_evaluated_not_forward_passes(tmp_path, mo
 
 
 def test_a_serial_actor_never_touches_the_batched_evaluator(tmp_path, monkeypatch):
-    totals, sizes = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=1)
+    totals, sizes, forwards = _run_counted_actor(tmp_path, monkeypatch, leaf_batch_size=1)
     assert sizes == []
+    assert forwards and set(forwards) == {1}  # every scalar forward holds one leaf
     assert 0 < totals[SERIES_POSITIONS_EVALUATED] <= totals[SERIES_SIMS_RUN]
     # Serial inference is accounted too: every evaluation is a batch of one.
     assert totals[SERIES_INFERENCE_BATCHES] == totals[SERIES_POSITIONS_EVALUATED]
