@@ -165,6 +165,11 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         run_dir: The run's root directory.
         proc: The process name.
 
+    A file's last line without its newline is skipped: it is a record still
+    being written, or one a crash interrupted (:meth:`EpochMetricsWriter.append`
+    writes the newline last), so it was never durably appended. Any other
+    line that is not valid JSON still raises.
+
     Yields:
         Each record, parsed from JSON, oldest first.
     """
@@ -179,7 +184,8 @@ def iter_epoch_records(run_dir: Path | str, proc: str) -> Iterator[dict[str, Any
         if m is not None and m.group("proc") == proc:
             epoch_files.append((int(m.group("epoch")), p))
     for _, path in sorted(epoch_files):
-        for line in path.read_text().splitlines():
+        # The piece after the last newline is empty, or an unterminated record.
+        for line in path.read_text().split("\n")[:-1]:
             if line.strip():
                 yield json.loads(line)
 

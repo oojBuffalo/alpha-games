@@ -105,7 +105,7 @@ import multiprocessing
 import signal
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
@@ -646,6 +646,7 @@ class LaunchedRun:
     actors: dict[int, multiprocessing.process.BaseProcess]
     metrics_writer: EpochMetricsWriter
     spike_games: int | None = None
+    _ended: bool = field(default=False, init=False, repr=False)
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
@@ -690,7 +691,7 @@ class LaunchedRun:
         seen gone is final: at or above the target the stop is recorded, even
         if the last game landed as its actor exited. Below the target, two
         states end the run with **no** ``spike_stop`` -- the record's absence
-        is the durable sign the target was not reached:
+        is the durable sign the target did not trigger the shutdown:
 
         - every actor is gone (each at its own cap, or dead): no game can
           complete;
@@ -700,7 +701,13 @@ class LaunchedRun:
 
         Nothing else is detected: a run whose processes are all alive but
         completing no games is polled until interrupted. :meth:`shutdown`
-        always runs.
+        always runs. Actors still playing when it starts finish their
+        in-flight games, so a run stopped below the target can still end
+        with a durable total at or above it; the absence of ``spike_stop``
+        says only that something else ended the run.
+
+        Once the run has shut down, a further call returns at once and
+        writes nothing: one launch has at most one ``spike_stop``.
 
         With :attr:`spike_games` unset this reads no metrics and writes no
         record of its own.
@@ -715,6 +722,8 @@ class LaunchedRun:
                 Raised before the first poll.
         """
         _check_grace_period(shutdown_grace)
+        if self._ended:
+            return
         try:
             while True:
                 actors_alive = any(actor.is_alive() for actor in self.actors.values())
@@ -748,9 +757,10 @@ class LaunchedRun:
         Postconditions, in order:
 
         1. **A child that outlives the grace period is killed, and that is
-           recorded.** It gets ``SIGKILL`` and is joined without a timeout,
-           and one ``shutdown_forced`` record
-           (``core.observability.shutdown_forced_record``) names it. A killed
+           recorded.** Every such child gets ``SIGKILL`` and is joined
+           without a timeout before any record is written; then one
+           ``shutdown_forced`` record
+           (``core.observability.shutdown_forced_record``) names each. A killed
            child ran no clean path, so the record is how the run directory
            says its evidence may be incomplete.
         2. **``segment_end`` is never written while any child is alive.** It
@@ -772,6 +782,8 @@ class LaunchedRun:
         restores the default handler early in its teardown. Its work was
         complete, it is gone, and it is not an escalation.
 
+        A call after a completed shutdown returns at once and writes nothing.
+
         Args:
             timeout: The grace period, in seconds, shared by every process:
                 how long after the signal a child may still be finishing
@@ -783,6 +795,8 @@ class LaunchedRun:
                 before any process is signaled.
         """
         _check_grace_period(timeout)
+        if self._ended:
+            return
         processes = self.all_processes()
         for process in processes:
             if process.is_alive():
@@ -790,14 +804,19 @@ class LaunchedRun:
         deadline = time.monotonic() + timeout
         for process in processes:
             process.join(max(0.0, deadline - time.monotonic()))
-        for process in processes:
-            if process.is_alive():
-                process.kill()
-                process.join()
-                self.metrics_writer.append(
-                    shutdown_forced_record(process=process.name, pid=process.pid)
-                )
+        # Every survivor is killed and reaped before any record is written, so
+        # a failing append (a full disk) cannot leave a later child alive.
+        survivors = [process for process in processes if process.is_alive()]
+        for process in survivors:
+            process.kill()
+        for process in survivors:
+            process.join()
+        for process in survivors:
+            self.metrics_writer.append(
+                shutdown_forced_record(process=process.name, pid=process.pid)
+            )
         self.metrics_writer.append(segment_end_record())
+        self._ended = True
 
 
 def launch_run(

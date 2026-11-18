@@ -953,7 +953,7 @@ def test_wait_ends_a_run_whose_actors_have_all_exited_below_the_target(tmp_path,
 
     assert learner.calls[0] == "terminate"  # the run was shut down
     kinds = _orchestrator_kinds(tmp_path)
-    assert KIND_SPIKE_STOP not in kinds  # its absence is the sign the target was not reached
+    assert KIND_SPIKE_STOP not in kinds  # its absence: the target did not trigger the shutdown
     assert kinds[-1] == KIND_SEGMENT_END
 
 
@@ -1266,3 +1266,61 @@ def test_wait_gives_shutdown_its_grace_period_as_one_deadline(tmp_path, monkeypa
         KIND_SHUTDOWN_FORCED,
         KIND_SEGMENT_END,
     ]
+
+
+class _FailingWriter(EpochMetricsWriter):
+    """An orchestrator writer whose appends fail, as on a full disk."""
+
+    def append(self, record):
+        raise OSError(28, "No space left on device")
+
+
+def test_shutdown_kills_every_survivor_before_a_record_write_can_fail(tmp_path):
+    actors = [_HeldProcess(), _HeldProcess()]
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors=dict(enumerate(actors)),
+        metrics_writer=_FailingWriter(tmp_path, "orchestrator"),
+    )
+    with pytest.raises(OSError, match="No space"):
+        launched.shutdown(0.0)
+    assert [actor.is_alive() for actor in actors] == [False, False]
+    assert all(actor.calls[-1] == ("join", None) for actor in actors)  # each reaped
+
+
+def test_a_second_wait_on_a_finished_spike_run_writes_nothing(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [3])
+    launched = _exited_run(tmp_path, spike_games=3)
+    launched.wait(poll_interval=0.0)
+    launched.wait(poll_interval=0.0)
+    launched.shutdown(0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SPIKE_STOP, KIND_SEGMENT_END]
+
+
+def test_a_torn_record_ending_an_earlier_epoch_does_not_abort_a_resumed_spike_run(
+    tmp_path, monkeypatch
+):
+    """A crash mid-append leaves an unterminated last line; the resumed run reads past it."""
+    _bound_polls(monkeypatch)
+    old = EpochMetricsWriter(tmp_path, "actor-0")
+    old.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
+    with open(old.path, "a", encoding="utf-8") as fh:
+        fh.write('{"kind": "delta", "series": "games_')  # the crash cut this record short
+    EpochMetricsWriter(tmp_path, "actor-0").append(
+        delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=2.0)
+    )
+    launched = _exited_run(tmp_path, spike_games=2)
+    assert launched.games_completed() == 2
+    launched.wait(poll_interval=0.0)
+    assert _orchestrator_kinds(tmp_path) == [KIND_SPIKE_STOP, KIND_SEGMENT_END]
+
+
+def test_a_malformed_complete_metrics_line_still_raises(tmp_path):
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+    with open(writer.path, "a", encoding="utf-8") as fh:
+        fh.write("not json\n")
+    writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
+    with pytest.raises(ValueError):
+        list(iter_epoch_records(tmp_path, "actor-0"))
