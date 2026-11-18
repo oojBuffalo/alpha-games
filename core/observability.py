@@ -859,8 +859,9 @@ class WindowedRun:
             its steps), :data:`WINDOW_ZERO_DENOMINATOR` (a ratio whose
             series are present but whose denominator summed to zero) and
             :data:`WINDOW_INCOMPLETE_FLUSH` (a game flush in the window lacks
-            or under-records a series the field is built from -- a flush read
-            mid-write or cut short by a crash; ``_incomplete_series``).
+            or under-records a series the field is built from -- possible in
+            logs written before a game's records became one ``record_group``
+            line; ``_incomplete_series``).
         window_start: Timestamp of the start flush (:func:`reduce_window`).
         window_end: Timestamp of the end flush.
         start_game_ordinal: Run-wide cumulative ``games_completed`` through
@@ -1004,10 +1005,13 @@ def _game_flushes(
 def _incomplete_series(window: list[dict[str, Any]]) -> set[str]:
     """Return the series a window's game flushes do not wholly record.
 
-    An actor writes a game's records as one group, ``games_completed``
-    first (``core.actor``). A crash inside that write can still persist its
-    first lines and not the rest; such a flush counts its game but lacks
-    later series, or a sum the earlier lines promise. Such a flush is detected
+    An actor now writes a game's records as one ``record_group`` line
+    (``core.metrics.EpochMetricsWriter.append_many``), which a reader sees
+    whole or not at all. An older log wrote them as separate lines,
+    ``games_completed`` first, so a crash between two lines could keep a
+    flush that counts its game but lacks later series, or a sum the
+    earlier lines promise. The checks stay for such logs; a log written
+    in the group format gives them nothing to flag. Such a flush is detected
     from what complete flushes must hold: each of ``_ALWAYS_FLUSHED_SERIES``,
     ``positions_evaluated``, ``inference_batches`` and the tier series is in
     every flush of the window or in none (a series in none has no record,
@@ -1239,7 +1243,8 @@ def reduce_window(
     formed returns a named :attr:`WindowedRun.reason` and no number; a field
     whose own series cannot support it is ``None`` with its reason in
     :attr:`WindowedRun.unavailable`; that includes a field fed by a game
-    flush that is only partly written (:data:`WINDOW_INCOMPLETE_FLUSH`).
+    flush that is only partly written, which only an older, line-per-record
+    log can hold (:data:`WINDOW_INCOMPLETE_FLUSH`).
 
     Args:
         run_dir: The run's root directory (``core.metrics.metrics_dir``).
