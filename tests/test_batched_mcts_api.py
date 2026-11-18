@@ -490,11 +490,66 @@ def test_an_interrupted_commit_discards_the_tree():
         m.run(4, batch_size=4)
 
     # A half-committed tree is never offered for reuse: it is gone, not left with marks.
+    # The backup that did complete before the interruption stays counted.
     assert m.root is None
+    assert m.completed_simulations == 2
     with pytest.raises(ValueError, match="no root set"):
         m.run(4, batch_size=4)
     m._backup = backup
+    m.set_root(start)  # either root entry point restarts the search
+    root = m.run(20, batch_size=4)
+    assert m.completed_simulations == 22
+    _assert_no_residue(root)
+
+
+class _InterruptingList(list):
+    """A list whose ``n``-th item assignment completes and then raises ``KeyboardInterrupt``.
+
+    Args:
+        items: The initial items.
+        n: Which assignment (1-based) is interrupted, just after it takes effect.
+    """
+
+    def __init__(self, items, n: int):
+        super().__init__(items)
+        self.n = n
+
+    def __setitem__(self, index, value):
+        super().__setitem__(index, value)
+        self.n -= 1
+        if self.n == 0:
+            raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("where", ["after-descent", "after-vloss"])
+def test_an_interruption_during_collection_discards_the_tree(where):
+    game = Connect4(4, 4, 3)
+    m = MCTS(game)
+    start = game.initial_state()
+    m.run(1, root_state=start)  # expand the root, so the next batch holds four paths
+    descend, descents = m._descend, []
+
+    def after_descent(**kwargs):
+        result = descend(**kwargs)
+        descents.append(1)
+        if len(descents) == 2:  # a reservation made but not yet recorded in the batch
+            raise KeyboardInterrupt
+        return result
+
+    if where == "after-descent":
+        m._descend = after_descent
+    else:
+        # The second descent's root-edge virtual loss lands, then the interruption
+        # arrives before the descent records that edge in its path.
+        m.root.vloss = _InterruptingList(m.root.vloss, 2)
+    with pytest.raises(KeyboardInterrupt):
+        m.run(4, batch_size=4)
+
+    assert m.root is None
+    assert m.completed_simulations == 1
+    m._descend = descend
     root = m.run(20, root_state=start, batch_size=4)
+    assert m.completed_simulations == 21
     _assert_no_residue(root)
 
 
