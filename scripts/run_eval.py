@@ -35,6 +35,13 @@ Usage::
     # number, measured rather than asserted. Writes nothing to the eval store.
     python3 scripts/run_eval.py configs/m4_eval.json --bench
 
+    # Launch and --bench both take the harness execution (design doc §9
+    # "Harness execution"): --workers spawned pair workers, each at
+    # --torch-threads intra-op threads. Neither is material -- a relaunch may
+    # change them -- and both are recorded on the bench result and the
+    # launch's eval/execution.json.
+    python3 scripts/run_eval.py configs/m4_eval.json --bench --workers 4 --torch-threads 3
+
 ``core/`` never imports ``games.*`` (design doc §Repo layout); this script is the
 one call site that resolves ``EvalConfig.run_dir``'s stored game name
 (``core.run_identity.read_stored_config``) to a live ``Game`` instance
@@ -59,7 +66,9 @@ from core.eval_protocol import PLATEAU_CONFIRMATION_COUNT  # noqa: E402
 from core.eval_run import (  # noqa: E402
     BenchResult,
     EvalConfig,
+    EvalExecution,
     WatchLoopResult,
+    WorkerSetup,
     bench_candidate,
     build_liveness_report,
     eval_lag,
@@ -73,7 +82,11 @@ from core.eval_run import (  # noqa: E402
 from core.eval_stats import PlateauResult, build_verdict, detect_plateau  # noqa: E402
 from core.game import Game  # noqa: E402
 from core.run_identity import read_stored_config  # noqa: E402
-from games.registry import build_eval_profile, build_game_factory  # noqa: E402
+from games.registry import (  # noqa: E402
+    build_eval_profile,
+    build_eval_worker_setup,
+    build_game_factory,
+)
 
 #: Production watch-loop poll cadence -- generous, since a completed member's
 #: worth of games (24 pairs x up to 5 opponents x 3 forms, at S = 512 sims for
@@ -86,7 +99,7 @@ DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_BENCH_PAIRS = 1
 
 
-def _resolve_watched_game(run_dir: Path | str) -> tuple[Game, EvalProfile]:
+def _resolve_watched_game(run_dir: Path | str) -> tuple[Game, EvalProfile, WorkerSetup]:
     """Resolve the watched run's live game adapter and declared eval profile.
 
     Args:
@@ -94,10 +107,11 @@ def _resolve_watched_game(run_dir: Path | str) -> tuple[Game, EvalProfile]:
             ``core.run_identity``'s recorded ``config.json``).
 
     Returns:
-        ``(game, profile)`` -- exactly the pair ``core.eval_run.run_watch_loop``
-        and ``core.eval_run.bench_candidate`` need. This function, and the
-        module-level imports above, are the only place this script reaches
-        into ``games.*``.
+        ``(game, profile, worker_setup)`` -- exactly what
+        ``core.eval_run.run_watch_loop`` and ``core.eval_run.bench_candidate``
+        need, ``worker_setup`` being the picklable rebuild their spawned pair
+        workers run. This function, and the module-level imports above, are
+        the only place this script reaches into ``games.*``.
 
     Raises:
         FileNotFoundError: If ``run_dir`` has no recorded ``config.json`` yet.
@@ -107,7 +121,7 @@ def _resolve_watched_game(run_dir: Path | str) -> tuple[Game, EvalProfile]:
     stored = read_stored_config(run_dir)
     game = build_game_factory(stored.run)()
     profile = build_eval_profile(stored.run.game)
-    return game, profile
+    return game, profile, build_eval_worker_setup(stored.run)
 
 
 def _build_report(config: EvalConfig) -> dict:
@@ -184,20 +198,35 @@ def cmd_liveness(config_path: Path | str, throughput_windows: Path | str | None 
     )
 
 
-def cmd_bench(config_path: Path | str, *, n_pairs: int = DEFAULT_BENCH_PAIRS) -> BenchResult:
+def cmd_bench(
+    config_path: Path | str,
+    *,
+    n_pairs: int = DEFAULT_BENCH_PAIRS,
+    execution: EvalExecution | None = None,
+) -> BenchResult:
     """``--bench``: measure real throughput against the newest published member.
 
     Args:
         config_path: Path to an :class:`~core.eval_run.EvalConfig` JSON file.
         n_pairs: Mirrored pairs sampled per required cell (small; see
             ``core.eval_run.bench_candidate``).
+        execution: Workers and intra-op threads to measure under (``None``:
+            one in-process worker at torch's default threads).
 
     Returns:
         The measured :class:`~core.eval_run.BenchResult`.
     """
     config = load_eval_config(config_path)
-    game, profile = _resolve_watched_game(config.run_dir)
-    return bench_candidate(config.run_dir, config, profile, game, n_pairs=n_pairs)
+    game, profile, worker_setup = _resolve_watched_game(config.run_dir)
+    return bench_candidate(
+        config.run_dir,
+        config,
+        profile,
+        game,
+        n_pairs=n_pairs,
+        execution=execution,
+        worker_setup=worker_setup,
+    )
 
 
 def cmd_launch(
@@ -206,6 +235,7 @@ def cmd_launch(
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     max_idle_polls: int | None = None,
     single_pass: bool = False,
+    execution: EvalExecution | None = None,
 ) -> WatchLoopResult:
     """Default mode: launch (or resume) the concurrent watch/report loop.
 
@@ -224,12 +254,14 @@ def cmd_launch(
             runs until every member ``1..K`` is complete.
         single_pass: Test-facing: run exactly one poll cycle and return,
             regardless of completeness.
+        execution: Workers and intra-op threads to play under (``None``: one
+            in-process worker at torch's default threads).
 
     Returns:
         The loop's summary (``core.eval_run.WatchLoopResult``).
     """
     config = load_eval_config(config_path)
-    game, profile = _resolve_watched_game(config.run_dir)
+    game, profile, worker_setup = _resolve_watched_game(config.run_dir)
 
     def _on_member_complete(member_version: int) -> None:
         with report_lock(config.run_dir):
@@ -260,6 +292,8 @@ def cmd_launch(
         max_idle_polls=max_idle_polls,
         single_pass=single_pass,
         on_member_complete=_on_member_complete,
+        execution=execution,
+        worker_setup=worker_setup,
     )
 
 
@@ -317,6 +351,7 @@ def _render_bench(result: BenchResult) -> str:
         [
             f"candidate_version: {result.candidate_version}",
             f"device: {result.device}  eval_sims: {result.eval_sims}",
+            f"workers: {result.workers}  torch_threads: {result.torch_threads}",
             f"cells_benched: {result.cells_benched}  "
             f"games_played: {result.games_played} "
             f"({result.bench_pairs_per_cell} pair(s)/cell sampled)",
@@ -402,6 +437,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=1,
+        help="pair worker processes for launch/--bench (default: 1, in-process)",
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=_positive_int,
+        default=None,
+        help="torch intra-op threads per playing process for launch/--bench (default: torch's)",
+    )
+    parser.add_argument(
         "--poll-interval",
         type=_nonnegative_float,
         default=DEFAULT_POLL_INTERVAL,
@@ -444,6 +491,13 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"watch flags do not apply to this mode: {', '.join(sorted(invalid))}")
     if not args.bench and "--bench-pairs" in flags:
         parser.error("--bench-pairs requires --bench")
+    if args.report or args.plateau or args.liveness:
+        invalid = flags & {"--workers", "--torch-threads"}
+        if invalid:
+            parser.error(
+                f"execution flags apply to launch/--bench only: {', '.join(sorted(invalid))}"
+            )
+    execution = EvalExecution(workers=args.workers, torch_threads=args.torch_threads)
 
     if args.throughput_windows and not args.liveness:
         parser.error("--throughput-windows requires --liveness")
@@ -456,13 +510,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.plateau:
             print(_render_plateau(cmd_plateau(args.config)))
         elif args.bench:
-            print(_render_bench(cmd_bench(args.config, n_pairs=args.bench_pairs)))
+            print(
+                _render_bench(cmd_bench(args.config, n_pairs=args.bench_pairs, execution=execution))
+            )
         else:
             result = cmd_launch(
                 args.config,
                 poll_interval=args.poll_interval,
                 max_idle_polls=args.max_idle_polls,
                 single_pass=args.single_pass,
+                execution=execution,
             )
             print(
                 f"[run_eval] stopped: {result.stopped_reason} (polls={result.polls}, "
