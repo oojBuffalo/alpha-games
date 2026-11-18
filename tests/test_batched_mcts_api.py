@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import random
 
+import numpy as np
 import pytest
 
 from core import MCTS
@@ -164,6 +165,12 @@ def test_run_counts_completed_simulations_and_leaves_nothing_in_flight(make_game
     assert m.completed_simulations == 150
     assert not any(node.in_flight for node in _all_nodes(m.root))
 
+    # A fresh root discards the tree, not the count.
+    m.set_root(game.initial_state())
+    assert m.completed_simulations == 150
+    m.run(10)
+    assert m.completed_simulations == 160
+
 
 # --- expansion split: defer (reserve the leaf) then fill (install the evaluation) ------
 
@@ -269,6 +276,19 @@ def test_batched_run_spends_the_budget_exactly_and_leaves_no_residue(make_game, 
     _assert_no_residue(root)
 
 
+@pytest.mark.parametrize("kwargs", [{"num_simulations": 5.5}, {"batch_size": 2.5}])
+def test_non_integer_counts_are_rejected_before_anything_is_searched(kwargs):
+    game = Connect4(4, 4, 3)
+    m = MCTS(game)
+    m.set_root(game.initial_state())
+    args = {"num_simulations": 5, "batch_size": 4, **kwargs}
+
+    with pytest.raises(TypeError):
+        m.run(args["num_simulations"], batch_size=args["batch_size"])
+    assert m.completed_simulations == 0
+    assert not m.root.is_expanded and not m.root.in_flight
+
+
 @pytest.mark.parametrize("batch_size", [0, -1])
 def test_batch_size_below_one_is_rejected(batch_size):
     game = TicTacToe()
@@ -328,6 +348,120 @@ def test_each_result_of_a_batch_is_installed_on_its_own_leaf():
         value, logits = evaluate(game, game.apply(start, root.actions[i]))
         assert root.W[i] == -value  # the child's own value, from its mover's perspective
         assert child.P == m._priors(child.actions, logits)  # and its own priors
+
+
+def test_equal_state_leaves_of_one_batch_each_receive_their_own_result():
+    game = TicTacToe()
+    returned, filled, calls = [], [], []
+
+    def positional(game, states):
+        # Every result is distinct, so a lookup keyed by state would misroute one.
+        calls.append(list(states))
+        results = []
+        for state in states:
+            k = len(returned)
+            logits = {a: (k * 7 + a) % 5 for a in game.legal_moves(state)}
+            results.append((k / 1000.0, logits))
+            returned.append((state, k / 1000.0, logits))
+        return results
+
+    m = MCTS(game, evaluate_batch=positional)
+    fill = m._fill_expand
+
+    def spy(node, value, priors):
+        filled.append((node, value, priors))
+        return fill(node, value, priors)
+
+    m._fill_expand = spy
+    m.run(300, root_state=game.initial_state(), batch_size=8)
+
+    assert len(filled) == len(returned)
+    for (node, value, priors), (state, sent_value, logits) in zip(filled, returned, strict=True):
+        assert node.state == state and value == sent_value
+        assert priors == m._priors(node.actions, logits)
+    # The check above has teeth only if some batch really carried two equal states.
+    assert any(len(set(call)) < len(call) for call in calls)
+
+
+def test_in_flight_virtual_loss_counts_every_accepted_path_through_each_edge():
+    game = Connect4(4, 4, 3)
+    accepted, snapshots = [], []
+    m = MCTS(game, evaluate_batch=lambda game, states: snapshot(states))
+
+    def snapshot(states):
+        expected = {}
+        for path in accepted:
+            for node, i in path:
+                expected[(id(node), i)] = expected.get((id(node), i), 0) + 1
+        seen = {
+            (id(node), i): v for node in _all_nodes(m.root) for i, v in enumerate(node.vloss) if v
+        }
+        snapshots.append((expected, seen, max((len(p) for p in accepted), default=0)))
+        return [(0.0, None)] * len(states)
+
+    # Each batch starts with the root-noise check: forget the previous batch's paths
+    # there, since an all-terminal batch never reaches the evaluator.
+    noise_check = m._maybe_noise_root
+    m._maybe_noise_root = lambda: accepted.clear() or noise_check()
+    descend = m._descend
+
+    def spy(**kwargs):
+        path, leaf, collided = descend(**kwargs)
+        if not collided:
+            accepted.append(list(path))
+        return path, leaf, collided
+
+    m._descend = spy
+    m.run(60, root_state=game.initial_state(), batch_size=8)
+
+    for expected, seen, _ in snapshots:
+        assert seen == expected
+    assert any(depth >= 2 for _, _, depth in snapshots)  # edges below the root were held
+    _assert_no_residue(m.root)
+
+
+class _FlakyApplyConnect4(Connect4):
+    """4x4 Connect 3 whose ``apply`` raises once, the first time column 1 is played."""
+
+    def __init__(self):
+        super().__init__(4, 4, 3)
+        self.armed = False
+
+    def apply(self, state, action):
+        if self.armed and action == 1:
+            self.armed = False
+            raise RuntimeError("adapter hiccup")
+        return super().apply(state, action)
+
+
+def test_a_descent_that_raises_removes_its_own_virtual_loss():
+    game = _FlakyApplyConnect4()
+    m = MCTS(game)
+    m.run(1, root_state=game.initial_state())  # expand the root
+    game.armed = True
+
+    # Column 0's descent joins the batch first; column 1's raises inside apply.
+    with pytest.raises(RuntimeError, match="adapter hiccup"):
+        m.run(4, batch_size=4)
+
+    assert m.completed_simulations == 1
+    assert m.root.vloss == [0, 0, 0, 0] and m.root.N == [0, 0, 0, 0]
+    _assert_no_residue(m.root)
+
+    m.run(40, batch_size=4)  # the retry leaves nothing behind either
+    assert m.completed_simulations == 41
+    _assert_no_residue(m.root)
+
+
+def test_numpy_unsigned_values_back_up_with_the_opponent_sign():
+    game = Connect4(4, 4, 3)
+    m = MCTS(game, evaluate_batch=lambda game, states: [(np.uint64(1), None)] * len(states))
+
+    root = m.run(5, root_state=game.initial_state(), batch_size=4)
+
+    assert root.W == [-1.0] * 4
+    assert all(type(w) is float for w in root.W)
+    _assert_no_residue(root)
 
 
 def test_a_duplicate_at_an_in_flight_terminal_leaf_closes_the_batch():
@@ -456,7 +590,8 @@ def test_batched_evaluator_takes_precedence_over_the_single_leaf_one():
 
 
 # What the third evaluate_batch call does, and the error (type, message) run() must
-# surface. The last five spoil only the *final* result, behind a well-formed prefix.
+# surface. All but the first three spoil only the *final* result, behind a well-formed
+# prefix.
 COUNT = r"evaluate_batch returned \d+ results for \d+ states"
 EVALUATION_FAILURES = {
     "raises": (None, RuntimeError, "evaluator down"),
@@ -466,6 +601,10 @@ EVALUATION_FAILURES = {
     "value-not-a-number": (lambda good: [*good[:-1], ("0.5", None)], TypeError, "real number"),
     "value-overflows": (lambda good: [*good[:-1], (10**400, None)], OverflowError, None),
     "priors-not-logits": (lambda good: [*good[:-1], (0.0, {0: "high"})], TypeError, None),
+    "value-nan": (lambda good: [*good[:-1], (float("nan"), None)], ValueError, "finite"),
+    "value-inf": (lambda good: [*good[:-1], (float("-inf"), None)], ValueError, "finite"),
+    "priors-nan": (lambda good: [*good[:-1], (0.0, {0: float("nan")})], ValueError, "finite"),
+    "priors-inf": (lambda good: [*good[:-1], (0.0, {1: float("inf")})], ValueError, "finite"),
     "result-not-a-pair": (lambda good: [*good[:-1], (0.0,)], ValueError, "unpack"),
 }
 
