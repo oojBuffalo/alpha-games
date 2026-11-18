@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -1033,8 +1034,8 @@ def resolve_resume(run_dir: Path | str, new_launch_config: LaunchConfig) -> Resu
         detail = (
             "self_play.storage_policy is not a config field: this playout-cap run was "
             "recorded before the D12 drop, so its shards hold fast-tier positions this "
-            "code no longer stores. Continue it as a new run with --fork-from "
-            f"{root} instead of --resume"
+            "code no longer stores. Continue it as a new run with "
+            f"--fork-from {shlex.quote(str(root))} instead of --resume"
         )
     if material:
         raise MaterialConfigDiffError(material, detail)
