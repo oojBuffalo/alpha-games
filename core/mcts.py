@@ -214,20 +214,25 @@ class MCTS:
         search, bit for bit, for an evaluator returning Python floats (see the module
         docstring for NumPy scalars).
 
-        A batch that fails is abandoned whole. If the evaluator or ``terminal_utility``
-        raises, or returns anything the engine cannot use (see Raises), every descent of
-        that batch is rolled back before the error propagates: no virtual loss or
-        in-flight mark is left, no leaf of the batch is expanded, and none of it is
-        counted. Every evaluation result and every terminal utility is obtained and
-        checked before the first leaf is filled, so one failure discards the batch's
-        well-formed results too, and filling and backing up then only assign and add.
-        An exception raised inside a descent (by the adapter's ``apply`` /
-        ``legal_moves`` / ``is_terminal`` / ``current_player``) abandons the batch the
-        same way: the failing descent removes its own virtual loss before propagating.
-        The one thing that can interrupt the fill-and-backup phase is an asynchronous
-        exception such as ``KeyboardInterrupt``; it may land half-way through a backup,
-        so the tree is discarded (the root is unset) before it propagates, and the next
-        call must pass ``root_state``.
+        A batch that fails (an ``Exception``) is abandoned whole. If the evaluator or
+        ``terminal_utility`` raises, or returns anything the engine cannot use (see
+        Raises), every descent of that batch is rolled back before the error propagates:
+        no virtual loss or in-flight mark is left, no leaf of the batch is expanded, and
+        none of it is counted. Every evaluation result and every terminal utility is
+        obtained and checked before the first leaf is filled, so one failure discards the
+        batch's well-formed results too, and filling and backing up then only assign and
+        add, which cannot fail. An exception raised inside a descent (by the adapter's
+        ``apply`` / ``legal_moves`` / ``is_terminal`` / ``current_player``) abandons the
+        batch the same way: the failing descent removes its own virtual loss first. The
+        tree stays searchable after any of these.
+
+        An interruption is different. A ``BaseException`` that is not an ``Exception``
+        (``KeyboardInterrupt``, ``SystemExit``) can arrive between any two steps — after a
+        reservation is made but before it is recorded, or half-way through a backup — so
+        wherever it lands in the search loop the tree is discarded (the root is unset)
+        before it propagates. Simulations already backed up, including earlier ones of
+        the interrupted batch, stay in ``completed_simulations``. Restart with
+        ``root_state`` or :meth:`set_root`.
 
         Args:
             num_simulations: Number of simulations (backed-up leaf visits) to perform.
@@ -263,6 +268,28 @@ class MCTS:
             self.set_root(root_state)
         if self.root is None:
             raise ValueError("no root set; pass root_state or call set_root first")
+        try:
+            return self._run_batches(remaining, batch_size)
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                # An interruption may have landed between a reservation and its
+                # bookkeeping, or half-way through a backup: the tree can no longer be
+                # trusted, so it is dropped rather than left holding stale marks.
+                self.root = None
+            raise
+
+    def _run_batches(self, remaining: int, batch_size: int) -> _Node:
+        """Run batches from the current root until ``remaining`` simulations are spent.
+
+        The search loop of :meth:`run`, which validates the arguments and sets the root.
+
+        Args:
+            remaining: Simulations still to back up.
+            batch_size: Maximum number of leaves per evaluation (``>= 1``).
+
+        Returns:
+            The root ``_Node``.
+        """
         while remaining > 0:
             # Leaves are filled only once the batch has closed, so root priors cannot
             # appear mid-batch: one noise check per batch is one check per descent.
@@ -285,7 +312,7 @@ class MCTS:
                     self._leaf_value(leaf, path, None) if leaf.is_terminal else None
                     for path, leaf in batch
                 ]
-            except BaseException:
+            except Exception:
                 # Nothing is filled yet, so abandoning the batch is exact: no virtual
                 # loss, no in-flight mark, no simulation counted.
                 for path, leaf in batch:
@@ -294,20 +321,13 @@ class MCTS:
                     leaf.actions = []  # undo the deferral: a fresh node again
                 raise
             # Every value is in hand and checked: the rest only assigns and adds floats.
-            try:
-                for (path, leaf), resolved in zip(batch, terminal, strict=True):
-                    if resolved is None:
-                        value = self._fill_expand(leaf, *next(results))
-                        resolved = self._leaf_value(leaf, path, value)
-                    self._backup(path, *resolved)
-                    leaf.in_flight = False
-                    self.completed_simulations += 1
-            except BaseException:
-                # Only an asynchronous interruption (a signal) can land here, possibly
-                # half-way through one path's backup: the tree can no longer be trusted,
-                # so it is dropped rather than left holding stale marks.
-                self.root = None
-                raise
+            for (path, leaf), resolved in zip(batch, terminal, strict=True):
+                if resolved is None:
+                    value = self._fill_expand(leaf, *next(results))
+                    resolved = self._leaf_value(leaf, path, value)
+                self._backup(path, *resolved)
+                leaf.in_flight = False
+                self.completed_simulations += 1
             remaining -= len(batch)
         return self.root
 
