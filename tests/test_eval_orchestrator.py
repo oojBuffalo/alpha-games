@@ -2143,9 +2143,19 @@ def test_liveness_report_stamps_observation_rule_and_interval_series(tmp_path):
             "timestamp": 100.0,
         }
     )
+    # The production actor's per-game flush: one grouped line per game (the
+    # learner's markers stay single-record lines).
     for timestamp in (150.0, 200.0, 250.0):
-        actor.append(
-            {"kind": "delta", "series": "games_completed", "value": 2, "timestamp": timestamp}
+        actor.append_many(
+            [
+                {"kind": "delta", "series": "games_completed", "value": 2, "timestamp": timestamp},
+                {
+                    "kind": "delta",
+                    "series": "inference_batches",
+                    "value": 7,
+                    "timestamp": timestamp,
+                },
+            ]
         )
     learner.append(
         {

@@ -720,3 +720,19 @@ def test_a_failed_group_append_leaves_no_partial_group(tmp_path, monkeypatch):
     totals = reduce_run(tmp_path).totals
     assert totals[SERIES_GAMES_COMPLETED] == 2  # the complete group, once
     assert totals[SERIES_INFERENCE_BATCHES] == 10
+
+
+def test_an_fsync_failure_keeps_the_complete_line_readers_may_have_seen(tmp_path, monkeypatch):
+    """Rolling back an already-visible line would let a tail reader overcount."""
+    writer = EpochMetricsWriter(tmp_path, "actor-0")
+
+    def failing_fsync(fd):
+        """Fail as a device I/O error does, after the line is fully written."""
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(metrics_module.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="Input/output error"):
+        writer.append_many([delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0)])
+    monkeypatch.undo()
+
+    assert reduce_run(tmp_path).totals[SERIES_GAMES_COMPLETED] == 1

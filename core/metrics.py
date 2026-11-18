@@ -20,9 +20,13 @@ construction: :class:`EpochMetricsWriter` picks the next unused epoch for
 instance (a process restart, by definition) always opens a brand-new file
 rather than reopening a stale one.
 
-**Records are flat JSON, one per line, durable before the call returns.**
-:meth:`EpochMetricsWriter.append` opens the file in append mode, writes one
-``json.dumps`` line, and ``flush``\\ es + ``fsync``\\ s before returning --
+**Records are flat JSON, newline-terminated lines, durable before the call
+returns.** A line is either one record (:meth:`EpochMetricsWriter.append`) or
+a JSON array of records written together as one group
+(:meth:`EpochMetricsWriter.append_many`; :func:`parse_metrics_line` expands
+either form). A line is readable only once its newline is on disk: a final
+line without one is a write still in progress or cut short, and every reader
+skips it. Each call writes its line and ``fsync``\\ s before returning --
 not the temp-name-then-``os.replace`` whole-file pattern
 ``core.replay_shard``/``core.checkpoint`` use for *replaceable* artifacts,
 because an append-only log is never replaced, only grown; the durability
@@ -257,7 +261,8 @@ class EpochMetricsWriter:
             records: Flat, JSON-serializable mappings. Copied, not mutated.
 
         Raises:
-            OSError: If the write or ``fsync`` fails; the file is unchanged.
+            OSError: If the write fails (the file is unchanged) or the
+                ``fsync`` fails (the complete line stays, unsynced).
         """
         self._write_line(json.dumps([dict(record) for record in records], sort_keys=True))
 
@@ -266,13 +271,16 @@ class EpochMetricsWriter:
 
         If the write fails part-way (a short write on a full disk or a
         file-size limit), the file is truncated back to its size before the
-        call and the error re-raised, so no torn line is left behind.
+        call and the error re-raised, so no torn line is left behind. Once the
+        complete line is written it is visible to readers and is kept: an
+        ``fsync`` failure is re-raised without removing it.
 
         Args:
             line: The line, without its newline.
 
         Raises:
-            OSError: If the write or ``fsync`` fails; the file is unchanged.
+            OSError: If the write fails (the file is unchanged) or the
+                ``fsync`` fails (the complete line stays, unsynced).
         """
         view = memoryview((line + "\n").encode("utf-8"))
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
@@ -281,9 +289,11 @@ class EpochMetricsWriter:
             try:
                 while view:
                     view = view[os.write(fd, view) :]
-                os.fsync(fd)
             except BaseException:
                 os.ftruncate(fd, start)
                 raise
+            # Not rolled back on failure: the complete line may already have
+            # been read by an incremental reader (core.eval_run's metrics tail).
+            os.fsync(fd)
         finally:
             os.close(fd)
