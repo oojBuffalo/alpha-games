@@ -215,13 +215,16 @@ class MCTS:
         docstring for NumPy scalars).
 
         A failed evaluation abandons its batch whole and keeps the tree. If the
-        evaluator or ``terminal_utility`` raises, or returns anything the engine cannot
-        use (see Raises), every descent of that batch is rolled back before the error
-        propagates: no virtual loss or in-flight mark is left, no leaf of the batch is
-        expanded, and none of it is counted. Every evaluation result and every terminal
-        utility is obtained and checked before the first leaf is filled, so one failure
-        discards the batch's well-formed results too. This rollback is exact because it
-        runs only once every descent of the batch has been recorded.
+        evaluator or ``terminal_utility`` raises an ``Exception``, or returns anything the
+        engine cannot use (see Raises), every descent of that batch is rolled back before
+        the error propagates: no virtual loss or in-flight mark is left, no leaf of the
+        batch is expanded, and none of it is counted. The tree survives only if that
+        rollback completes; an evaluator that raises a ``BaseException`` that is not an
+        ``Exception`` (``KeyboardInterrupt``) gets no rollback and discards it. Every
+        evaluation result and every terminal utility is obtained and checked before the
+        first leaf is filled, so one failure discards the batch's well-formed results
+        too. This rollback is exact because it runs only once every descent of the batch
+        has been recorded.
 
         Anything else that escapes the search loop discards the tree (the root is
         unset) before it propagates: an exception raised by the adapter during a descent
@@ -520,7 +523,9 @@ class MCTS:
         """Install an evaluation on a deferred leaf (the fill half of expansion).
 
         Completes the sparse ``{N, W, Q, P}`` expansion over the legal actions stored by
-        :meth:`_defer_expand`. It only assigns, so it cannot fail part-way.
+        :meth:`_defer_expand`. It only allocates and assigns, raising nothing of its own;
+        an asynchronous exception or ``MemoryError`` can still leave the node partly
+        filled, and :meth:`run` then discards the tree.
 
         Args:
             node: A node previously passed to :meth:`_defer_expand`.
