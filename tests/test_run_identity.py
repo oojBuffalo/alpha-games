@@ -27,12 +27,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 
 from core.run_identity import (
     LAUNCH_SCHEMA_VERSION,
+    STORAGE_POLICY_D12_DROP,
     LaunchConfig,
     Lineage,
     MaterialConfigDiffError,
@@ -833,6 +835,53 @@ def test_resolve_resume_has_no_override_flag_anywhere_in_its_signature():
     params = inspect.signature(resolve_resume).parameters
     assert "override" not in params
     assert "force" not in params
+
+
+def _drop_storage_policy(root: Path) -> None:
+    """Rewrite ``run_record.json`` as a record written before the D12 drop existed.
+
+    Args:
+        root: The run directory.
+    """
+    path = root / "run_record.json"
+    raw = json.loads(path.read_text())
+    del raw["storage_policy"]
+    path.write_text(json.dumps(raw))
+
+
+@pytest.mark.parametrize("pcr", [False, True], ids=["fixed-tier", "playout-cap"])
+def test_a_run_recorded_before_the_d12_drop_resumes_only_at_a_fixed_tier(tmp_path, pcr):
+    """A pre-D12 playout-cap run stored its fast plies, so it must be forked, not resumed.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        pcr: Whether the stored run has playout-cap randomization on.
+    """
+    raw = _launch_raw()
+    if pcr:
+        _override_pcr_on(raw)
+    raw["run_dir"] = str(tmp_path / "old PCR runs")  # a path the shell must quote
+    lc = LaunchConfig.from_dict(raw)
+    root = run_root(lc, "run-1")
+    write_provenance(
+        root, lc, RunRecord(run_id="run-1", created_at="2026-01-01T00:00:00Z", entry_condition={})
+    )
+    assert read_run_record(root).storage_policy == STORAGE_POLICY_D12_DROP
+    assert resolve_resume(root, lc).run_id == "run-1"  # a D12 record resumes either way
+
+    _drop_storage_policy(root)
+    assert read_run_record(root).storage_policy is None
+    if not pcr:
+        assert resolve_resume(root, lc).run_id == "run-1"  # every ply stored either way
+        return
+    with pytest.raises(MaterialConfigDiffError) as excinfo:
+        resolve_resume(root, lc)
+    assert excinfo.value.material == {"self_play.storage_policy": (None, STORAGE_POLICY_D12_DROP)}
+    # The field is derived, not configured, so the message says how to go on.
+    assert "recorded before the D12 drop" in str(excinfo.value)
+    fork = str(excinfo.value).split("--fork-from=", 1)[1].split(" instead of", 1)[0]
+    assert shlex.split(fork) == [str(root)]
+    assert resolve_fork(root, lc, now=1_700_000_500.0).run_id != "run-1"  # the way forward
 
 
 def test_resolve_resume_missing_run_dir_raises(tmp_path):

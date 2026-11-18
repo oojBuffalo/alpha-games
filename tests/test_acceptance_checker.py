@@ -20,6 +20,7 @@ from core.metrics import EpochMetricsWriter
 from core.observability import (
     CHECKPOINT_PUBLISHED_KIND,
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_INFERENCE_BATCHES,
     SERIES_LEARNER_STEP,
@@ -34,7 +35,7 @@ from games.tictactoe import TicTacToe
 TTT = TicTacToe()
 
 
-def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT):
+def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT, plies=None):
     """Build one synthetic game's records, with a caller-chosen mover sequence.
 
     Args:
@@ -45,6 +46,9 @@ def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT)
             direct control over consecutive-mover (blocked-skip) sequences.
         model_version: Stamped on every record in this game.
         game: The adapter whose encoding the records carry.
+        plies: The ply index stamped on each record, one per mover; ``None``
+            (the default) numbers them ``0, 1, 2, ...`` -- a run that stored
+            every ply.
 
     Returns:
         A tuple of ``len(movers)`` ``SampleRecord``s.
@@ -63,13 +67,15 @@ def _game_records(run_id, actor_id, game_index, movers, model_version, game=TTT)
             ply=ply,
             game_id=(run_id, actor_id, game_index),
         )
-        for ply, mover in enumerate(movers)
+        for ply, mover in zip(range(len(movers)) if plies is None else plies, movers, strict=True)
     )
 
 
-def _write_game_shard(shard_dir, run_id, actor_id, seq, movers, model_version, game=TTT):
-    """Publish one synthetic single-game shard."""
-    records = _game_records(run_id, actor_id, seq, movers, model_version, game)
+def _write_game_shard(
+    shard_dir, run_id, actor_id, seq, movers, model_version, game=TTT, plies=None
+):
+    """Publish one synthetic single-game shard (``plies``: :func:`_game_records`)."""
+    records = _game_records(run_id, actor_id, seq, movers, model_version, game, plies)
     shard_id = shard_filename(run_id, actor_id, seq)
     write_shard(shard_dir / shard_id, game, records, run_id=run_id, actor_id=actor_id, seq=seq)
 
@@ -248,6 +254,56 @@ def test_fails_when_no_game_has_a_consecutive_mover_sequence(tmp_path):
     assert not report.passed
 
 
+def test_the_blocked_skip_check_is_not_evaluable_on_a_playout_cap_run(tmp_path):
+    """Dropped plies put same-mover samples side by side with no skip played.
+
+    A strictly alternating game that stored plies 0, 1 and 3 reads as movers
+    0, 1, 1: the stored-sample test would name it as a blocked skip. On a run
+    whose config has playout-cap randomization on, the check fails closed.
+    """
+    name = "at least one consecutive-mover (blocked-skip) sequence"
+    root = tmp_path / "run"
+    shard_dir = root / "shards"
+    shard_dir.mkdir(parents=True)
+    for i in range(_NUM_GAMES):
+        # Plies 0, 1 and 3 of a strictly alternating game: ply 2 was dropped.
+        model_version = 0 if i < _NUM_GAMES // 2 else 1
+        _write_game_shard(shard_dir, "run", "0", i, [0, 1, 1], model_version, plies=[0, 1, 3])
+    _write_actor_metrics(root, num_games=_NUM_GAMES)
+    _write_learner_metrics(root, learner_step=_LEARNER_STEP, published_versions=(0, 1))
+    _write_checkpoints(root / "checkpoints", (0, 1))
+
+    # Read as an all-stored run, the stored-sample test takes the gap for a
+    # blocked skip and passes: the misreading the check must not make.
+    stored_all = verify_acceptance(root, TTT, _run_config())
+    assert stored_all.passed
+
+    # Not evaluable means not evaluable: the run's own transition counter
+    # being positive does not turn the check into a pass.
+    EpochMetricsWriter(root, "actor-1").append(
+        delta_record(SERIES_CONSECUTIVE_MOVER_TRANSITIONS, 3)
+    )
+    schedule_on = _run_config_stub(
+        batch_size=_BATCH_SIZE, publish_interval=_PUBLISH_INTERVAL, sims=512, pcr=True
+    )
+    report = verify_acceptance(root, TTT, schedule_on)
+    check = _check(report, name)
+    assert not check.passed
+    assert not report.passed
+    # The detail names the durable evidence and claims no reader for it.
+    assert check.detail.endswith(
+        f"the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} series, which this checklist does not read"
+    )
+    assert "[FAIL] " + name in report.render()
+    # The run also fails M3's fixed-budget gate; every other check reads exactly as it did.
+    tier = "self-play at the fixed-128-sim validate tier (D6)"
+    assert not _check(report, tier).passed
+    others = [(c.name, c.passed, c.detail) for c in report.checks if c.name not in (name, tier)]
+    assert others == [
+        (c.name, c.passed, c.detail) for c in stored_all.checks if c.name not in (name, tier)
+    ]
+
+
 def test_fails_when_no_reload_observed(tmp_path):
     root = tmp_path / "run"
     shard_dir = root / "shards"
@@ -339,6 +395,7 @@ def test_fails_when_the_run_was_not_at_the_fixed_128_validate_tier(tmp_path, sim
     report = verify_acceptance(root, TTT, cfg)
     assert not report.passed
     assert not _check(report, "self-play at the fixed-128-sim validate tier (D6)").passed
+    # A playout-cap run also fails the blocked-skip check as not evaluable.
     assert [c.name for c in report.checks if not c.passed] == [
         "self-play at the fixed-128-sim validate tier (D6)"
-    ]
+    ] + (["at least one consecutive-mover (blocked-skip) sequence"] if pcr else [])

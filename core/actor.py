@@ -75,6 +75,25 @@ plus the non-zero size buckets -- ``core.observability``), under the same
 omitted-when-absent rule. A game played under playout-cap randomization also
 flushes its per-tier move counts (``moves_full_512`` / ``moves_mid_256`` /
 ``moves_fast_64``, each only when non-zero); a validate-tier game writes none.
+Every game, in either shape, flushes ``positions_played`` and
+``positions_stored``: the positions it searched and played, and the ones it
+published. They differ only under playout-cap randomization, where the fast
+tier's positions are dropped (D12). With them goes
+``consecutive_mover_transitions``, the game's count of plies whose mover
+also made the ply before, counted over the complete played sequence. A
+shard keeps each stored sample's ply and mover, so it still shows a skip
+whose two plies were both stored; a skip next to a dropped ply is recorded
+only by this counter, the one complete count of them.
+
+**The shard is published before the metrics are flushed.** A crash between
+the two leaves a durable game that no counter records, so the counters can
+under-count the shards but never over-count them. A game's series are
+appended as one group in a single synced write
+(:meth:`~core.metrics.EpochMetricsWriter.append_many`), never one synced
+record at a time, so no failure between two of its records can leave the
+group's first records durable without the rest: the played/stored/tier
+identities hold over every game that flushed, and ``positions_stored`` is
+exact for each of them.
 """
 
 from __future__ import annotations
@@ -87,11 +106,14 @@ from core.game import Game
 from core.mcts import BatchEvaluator, Evaluator
 from core.metrics import EpochMetricsWriter
 from core.observability import (
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_MOVES_FAST_64,
     SERIES_MOVES_FULL_512,
     SERIES_MOVES_MID_256,
     SERIES_POSITIONS_EVALUATED,
+    SERIES_POSITIONS_PLAYED,
+    SERIES_POSITIONS_STORED,
     SERIES_SIMS_RUN,
     InferenceBatchCounter,
     PositionCounter,
@@ -219,7 +241,7 @@ def _to_pending_sample(sample: Sample) -> PendingSample:
 
 
 class ActorDriver:
-    """Drives whole self-play games for one actor, publishing every position.
+    """Drives whole self-play games for one actor, publishing every stored position.
 
     Owns the pieces that are specific to being *an actor* rather than to
     playing one game: the D6 config assertion, the durable
@@ -264,8 +286,10 @@ class ActorDriver:
             stops as soon as either says to.
         metrics_writer: Optional. When given, every finished game flushes
             ``games_completed`` / ``sims_run`` / ``positions_evaluated``
-            deltas to it, plus the per-tier move counts under playout-cap
-            randomization (module docstring). ``None`` (the default) disables
+            deltas to it, the played and stored position counts, the
+            consecutive-mover transition count, and the per-tier move counts
+            under playout-cap randomization (module docstring). ``None`` (the
+            default) disables
             all metrics flushing — backward compatible with every existing
             caller.
         position_counter: Optional. Drained once per game to populate the
@@ -433,12 +457,16 @@ class ActorDriver:
         (module docstring: optional, off by default). ``games_completed`` is
         always exactly ``1`` -- one flush per finished game. ``sims_run`` is
         ``result.sims_run``, the exact sum of the budgets the game's plies
-        were searched at. Each playout-cap tier the game played adds its ply
-        count under that tier's series; a validate-tier game played none, so
-        it writes none. ``positions_evaluated`` is drained from
-        ``position_counter`` and omitted entirely when none was supplied --
-        never a fabricated zero. The inference-batch deltas are drained from
-        ``batch_counter`` under the same rule. The whole game's records go
+        were searched at. ``positions_played`` and ``positions_stored`` are
+        the game's played and stored position counts, the second exactly the
+        number of samples its shard holds; ``consecutive_mover_transitions``
+        is ``result.consecutive_mover_transitions``, written even when zero.
+        Each playout-cap tier the game played adds its ply count under that
+        tier's series; a validate-tier game played none, so it writes none.
+        ``positions_evaluated`` is drained from ``position_counter`` and
+        omitted entirely when none was supplied -- never a fabricated zero.
+        The inference-batch deltas are drained from ``batch_counter`` under
+        the same rule. The whole game's records go
         out in one ``EpochMetricsWriter.append_many`` write.
 
         Args:
@@ -447,22 +475,26 @@ class ActorDriver:
         if self.metrics_writer is None:
             return
         now = time.time()
-        deltas: list[tuple[str, float]] = [
+        values = [
             (SERIES_GAMES_COMPLETED, 1),
             (SERIES_SIMS_RUN, result.sims_run),
+            (SERIES_POSITIONS_PLAYED, result.positions_played),
+            (SERIES_POSITIONS_STORED, result.positions_stored),
+            (SERIES_CONSECUTIVE_MOVER_TRANSITIONS, result.consecutive_mover_transitions),
         ]
         tier_counts = dict(result.tier_counts)
-        deltas.extend(
+        values += [
             (series, tier_counts[tier])
             for tier, series in _TIER_SERIES.items()
             if tier in tier_counts
-        )
+        ]
         if self.position_counter is not None:
-            deltas.append((SERIES_POSITIONS_EVALUATED, self.position_counter.drain()))
+            values.append((SERIES_POSITIONS_EVALUATED, self.position_counter.drain()))
         if self.batch_counter is not None:
-            deltas.extend(self.batch_counter.drain().items())
-        # One write for the whole game, so mean fill and the bucket histogram
-        # never see a game whose flush was cut off part-way.
+            values += self.batch_counter.drain().items()
+        # One write for the whole game, never a durable prefix of it: mean fill,
+        # the bucket histogram and the played/stored/tier identities never see
+        # a game whose flush was cut off part-way.
         self.metrics_writer.append_many(
-            delta_record(series, value, timestamp=now) for series, value in deltas
+            delta_record(series, value, timestamp=now) for series, value in values
         )

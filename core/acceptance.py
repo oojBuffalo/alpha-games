@@ -27,6 +27,7 @@ from core.actor import VALIDATE_TIER_SIMS
 from core.checkpoint import list_published_versions
 from core.game import Game
 from core.observability import (
+    SERIES_CONSECUTIVE_MOVER_TRANSITIONS,
     SERIES_GAMES_COMPLETED,
     SERIES_LEARNER_STEP,
     SERIES_POSITIONS_EVALUATED,
@@ -126,10 +127,15 @@ def _scan_shards(shard_dir: Path, game: Game) -> dict[GameId, list[SampleRecord]
 def _consecutive_mover_game(by_game: dict[GameId, list[SampleRecord]]) -> GameId | None:
     """Return a game id whose stored samples include two consecutive same-mover plies.
 
-    At M3's fixed-128-sims tier every ply is stored (D12's drop policy is not
-    exercisable here -- design doc §12 M3), so two adjacent *stored* records
-    sharing a mover is exactly a consecutive-mover (blocked-skip) sequence in
-    the real game, not an artifact of dropped fast-search positions.
+    Valid only for a run that stored every ply, which is every run with
+    playout-cap randomization off (the M3 fixed-128-sims tier): there, two
+    adjacent *stored* records sharing a mover is exactly a consecutive-mover
+    (blocked-skip) sequence in the real game. A run with it on drops its
+    fast-search positions (D12), so two adjacent stored records can share a
+    mover with no skip between them -- in strictly alternating play, whenever
+    an odd number of plies was dropped between them. (The game contract does
+    not assume alternation, so a gap says nothing either way about a skip.)
+    :func:`verify_acceptance` does not call this for such a run.
 
     Args:
         by_game: Every observed game's ply-sorted records
@@ -155,7 +161,12 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
         run_config: The run's protocol (``core.run_identity.read_stored_config
             (run_dir).run``), for ``training.batch_size``/``publish_interval``
             and the self-play budget, which M3 pins at the fixed-128 validate
-            tier (D6) with playout-cap randomization off.
+            tier (D6) with playout-cap randomization off. With that flag on,
+            the consecutive-mover check is also reported failed as not
+            evaluable: its stored-sample test is invalid once fast-search
+            positions are dropped (:func:`_consecutive_mover_game`), and this
+            checklist does not read the ``consecutive_mover_transitions``
+            series that replaces it.
 
     Returns:
         The full checklist. Never raises for a failing run -- a check that
@@ -194,16 +205,33 @@ def verify_acceptance(run_dir: Path | str, game: Game, run_config: RunConfig) ->
         )
     )
 
-    consecutive_game = _consecutive_mover_game(by_game)
-    checks.append(
-        CheckResult(
-            "at least one consecutive-mover (blocked-skip) sequence",
-            consecutive_game is not None,
-            f"game {consecutive_game}"
-            if consecutive_game is not None
-            else "no game had two consecutive stored samples sharing a mover",
+    if run_config.self_play.playout_cap_randomization:
+        # Fail closed: on this run the stored-sample test can name a game as
+        # evidence with no skip played -- in strictly alternating play,
+        # whenever an odd number of plies was dropped between two stored ones.
+        checks.append(
+            CheckResult(
+                "at least one consecutive-mover (blocked-skip) sequence",
+                False,
+                "not evaluable: this run has playout-cap randomization on, so its "
+                "fast-search positions were dropped and two adjacent stored samples "
+                "sharing a mover no longer show a player moving twice running; such "
+                "a run is outside this M3 check's scope, and the complete count is "
+                f"the {SERIES_CONSECUTIVE_MOVER_TRANSITIONS} "
+                "series, which this checklist does not read",
+            )
         )
-    )
+    else:
+        consecutive_game = _consecutive_mover_game(by_game)
+        checks.append(
+            CheckResult(
+                "at least one consecutive-mover (blocked-skip) sequence",
+                consecutive_game is not None,
+                f"game {consecutive_game}"
+                if consecutive_game is not None
+                else "no game had two consecutive stored samples sharing a mover",
+            )
+        )
 
     versions_played = {r.model_version for records in by_game.values() for r in records}
     checks.append(
