@@ -262,6 +262,16 @@ class EpochMetricsWriter:
             fh.flush()
             os.fsync(fh.fileno())
 
+    def sync(self) -> None:
+        """Flush this epoch's file to stable storage (``fsync``).
+
+        For a caller that found a record a failed append had written in
+        full: the line is readable, but the failed ``fsync`` left it
+        unconfirmed.
+        """
+        with open(self.path, "rb") as fh:
+            os.fsync(fh.fileno())
+
     def last_record(self) -> dict[str, Any] | None:
         """Return the last complete record in this epoch's file, or ``None``.
 

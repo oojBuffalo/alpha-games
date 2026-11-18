@@ -23,6 +23,7 @@ Three layers, cheapest first:
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import signal
 import time
@@ -1478,3 +1479,57 @@ def test_two_identical_forced_records_are_both_written(tmp_path, monkeypatch):
         KIND_SHUTDOWN_FORCED,
         KIND_SEGMENT_END,
     ]
+
+
+def test_a_spike_stop_whose_write_failed_is_written_before_the_segment_closes(
+    tmp_path, monkeypatch
+):
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [3])
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _HeldProcess()},
+        metrics_writer=_FailsOnceAt(tmp_path, "orchestrator", KIND_SPIKE_STOP, "short_write"),
+        spike_games=3,
+    )
+    with pytest.raises(OSError):
+        launched.wait(poll_interval=0.0, shutdown_grace=0.0)
+    launched.wait(poll_interval=0.0, shutdown_grace=0.0)
+    assert _orchestrator_kinds(tmp_path) == [
+        KIND_SPIKE_STOP,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SEGMENT_END,
+    ]
+
+
+class _FsyncFailsOnceAt(EpochMetricsWriter):
+    """A writer whose first append of ``kind`` writes the whole line, then fails to sync it."""
+
+    def __init__(self, run_dir, proc, kind):
+        super().__init__(run_dir, proc)
+        self.kind, self.failed, self.syncs = kind, False, 0
+
+    def append(self, record):
+        if record["kind"] != self.kind or self.failed:
+            return super().append(record)
+        self.failed = True
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+        raise OSError(5, "Input/output error")
+
+    def sync(self):
+        self.syncs += 1
+        super().sync()
+
+
+def test_a_retry_syncs_a_last_record_whose_own_fsync_failed(tmp_path):
+    writer = _FsyncFailsOnceAt(tmp_path, "orchestrator", KIND_SEGMENT_END)
+    launched = ipc.LaunchedRun(
+        ctx=None, learner=_ExitedProcess(), actors={0: _ExitedProcess()}, metrics_writer=writer
+    )
+    with pytest.raises(OSError):
+        launched.shutdown(0.0)
+    launched.shutdown(0.0)
+    assert writer.syncs == 1  # the line was there, unconfirmed: synced, not rewritten
+    assert _orchestrator_kinds(tmp_path) == [KIND_SEGMENT_END]

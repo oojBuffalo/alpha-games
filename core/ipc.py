@@ -736,7 +736,6 @@ class LaunchedRun:
         if self._final_records is not None:
             # A retry after a failed finalization write: the run is already
             # stopped, so the target is not judged again.
-            self._write_spike_stop()
             self.shutdown(shutdown_grace)
             return
         try:
@@ -801,9 +800,11 @@ class LaunchedRun:
         complete, it is gone, and it is not an escalation.
 
         A call after a completed shutdown returns at once and writes nothing.
-        The records are fixed when the children are gone; a call retried
-        after a write failed signals nothing and writes those records not
-        yet in the epoch file, so each lands exactly once.
+        The records are fixed when the children are gone -- led by a
+        ``spike_stop`` that :meth:`wait` decided but failed to write -- and
+        the run counts as shut down only once all are written and synced. A call
+        retried after a write failed signals nothing and writes those
+        records not yet in the epoch file, so each lands exactly once.
 
         Args:
             timeout: The grace period, in seconds, shared by every process:
@@ -819,10 +820,19 @@ class LaunchedRun:
         if self._ended:
             return
         if self._final_records is None:
-            self._final_records = self._stop_children(timeout)
+            # A decided spike_stop whose write failed stays first in line.
+            unwritten_stop = (
+                [self._spike_stop]
+                if self._spike_stop is not None and not self._spike_stop_written
+                else []
+            )
+            self._final_records = [*unwritten_stop, *self._stop_children(timeout)]
         while self._final_written < len(self._final_records):
-            self._append_once(self._final_records[self._final_written])
+            record = self._final_records[self._final_written]
+            self._append_once(record)
             self._final_written += 1
+            if record is self._spike_stop:
+                self._spike_stop_written = True
         self._ended = True
 
     def _write_spike_stop(self) -> None:
@@ -836,12 +846,14 @@ class LaunchedRun:
 
         Only the record whose append last raised is checked, against the
         file's last complete line: an append that raised after its line was
-        complete (a failed ``fsync``) leaves exactly that line last.
+        complete (a failed ``fsync``) leaves exactly that line last. Such a
+        line is synced before it counts as written.
 
         Args:
             record: One finalization record, built once and reused by retries.
         """
         if self._attempt is record and self.metrics_writer.last_record() == record:
+            self.metrics_writer.sync()  # readable, but its own fsync failed
             self._attempt = None
             return
         self._attempt = record
