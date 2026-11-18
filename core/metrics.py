@@ -221,16 +221,30 @@ class EpochMetricsWriter:
     def append_many(self, records: Iterable[Mapping[str, Any]]) -> None:
         """Append several records in one write, durable before returning.
 
-        One ``write`` and one ``fsync`` for the whole group, so a process
-        killed mid-flush never leaves only some of a group's records behind
-        (records that are only meaningful together, such as one game's
-        counters).
+        The group is written and synced as one unit, so a reader never
+        sees only some of a group's records (records that are only meaningful
+        together, such as one game's counters). If the write fails part-way
+        (a short write on a full disk or a file-size limit), the file is
+        truncated back to its size before the call and the error re-raised,
+        so no partial group or torn line is left behind.
 
         Args:
             records: Flat, JSON-serializable mappings. Copied, not mutated.
+
+        Raises:
+            OSError: If the write or ``fsync`` fails; the file is unchanged.
         """
-        text = "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records)
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
+        data = "".join(json.dumps(dict(record), sort_keys=True) + "\n" for record in records)
+        view = memoryview(data.encode("utf-8"))
+        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
+        try:
+            start = os.lseek(fd, 0, os.SEEK_END)
+            try:
+                while view:
+                    view = view[os.write(fd, view) :]
+                os.fsync(fd)
+            except BaseException:
+                os.ftruncate(fd, start)
+                raise
+        finally:
+            os.close(fd)
