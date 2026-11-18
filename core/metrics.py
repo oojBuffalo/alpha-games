@@ -26,7 +26,7 @@ record as a line; :meth:`EpochMetricsWriter.append_many` writes one
 ``record_group`` line carrying several flat records that must be read
 together (one game's accounting -- :mod:`core.actor`). A raw reader must
 expand group lines; :func:`iter_epoch_records` does, so it always yields
-flat records. Either call ``fsync``\ s before returning -- not the
+flat records. Both methods call ``fsync`` before returning -- not the
 temp-name-then-``os.replace`` whole-file pattern
 ``core.replay_shard``/``core.checkpoint`` use for *replaceable* artifacts,
 because an append-only log is never replaced, only grown by completed
