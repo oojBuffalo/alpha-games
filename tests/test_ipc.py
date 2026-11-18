@@ -915,9 +915,12 @@ class _HeldProcess:
         if self.clock is not None and timeout is not None:
             self.clock[0] += min(timeout, self.join_takes)
 
+    exitcode = None
+
     def kill(self):
         self.calls.append("kill")
         self.alive = False
+        self.exitcode = -signal.SIGKILL
 
 
 def _bound_polls(monkeypatch, limit=20):
@@ -1324,3 +1327,57 @@ def test_a_malformed_complete_metrics_line_still_raises(tmp_path):
     writer.append(delta_record(SERIES_GAMES_COMPLETED, 1, timestamp=1.0))
     with pytest.raises(ValueError):
         list(iter_epoch_records(tmp_path, "actor-0"))
+
+
+class _FlakyWriter(EpochMetricsWriter):
+    """An orchestrator writer whose first ``shutdown_forced`` append fails, then recovers."""
+
+    failed = False
+
+    def append(self, record):
+        if record["kind"] == KIND_SHUTDOWN_FORCED and not self.failed:
+            self.failed = True
+            raise OSError(28, "No space left on device")
+        super().append(record)
+
+
+def test_a_wait_retried_after_a_failed_shutdown_write_keeps_its_evidence(tmp_path, monkeypatch):
+    _bound_polls(monkeypatch)
+    _write_completed_games(tmp_path, [3])
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _HeldProcess()},
+        metrics_writer=_FlakyWriter(tmp_path, "orchestrator"),
+        spike_games=3,
+    )
+    with pytest.raises(OSError, match="No space"):
+        launched.wait(poll_interval=0.0, shutdown_grace=0.0)
+    launched.wait(poll_interval=0.0, shutdown_grace=0.0)  # the disk has recovered
+    assert _orchestrator_kinds(tmp_path) == [
+        KIND_SPIKE_STOP,
+        KIND_SHUTDOWN_FORCED,
+        KIND_SEGMENT_END,
+    ]
+
+
+class _ExitsBeforeTheKill(_HeldProcess):
+    """A child that finishes cleanly just as the kill is sent."""
+
+    def kill(self):
+        self.calls.append("kill")
+        self.alive = False
+        self.exitcode = 0
+
+
+def test_a_child_that_exits_cleanly_before_the_kill_is_not_recorded_as_forced(tmp_path):
+    launched = ipc.LaunchedRun(
+        ctx=None,
+        learner=_ExitedProcess(),
+        actors={0: _ExitsBeforeTheKill(), 1: _HeldProcess()},
+        metrics_writer=EpochMetricsWriter(tmp_path, "orchestrator"),
+    )
+    launched.shutdown(0.0)
+    records = list(iter_epoch_records(tmp_path, "orchestrator"))
+    assert [rec["kind"] for rec in records] == [KIND_SHUTDOWN_FORCED, KIND_SEGMENT_END]
+    assert len([rec for rec in records if rec["kind"] == KIND_SHUTDOWN_FORCED]) == 1

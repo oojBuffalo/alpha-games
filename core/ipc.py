@@ -647,6 +647,8 @@ class LaunchedRun:
     metrics_writer: EpochMetricsWriter
     spike_games: int | None = None
     _ended: bool = field(default=False, init=False, repr=False)
+    _spike_stop_written: bool = field(default=False, init=False, repr=False)
+    _pending_forced: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
@@ -707,7 +709,8 @@ class LaunchedRun:
         says only that something else ended the run.
 
         Once the run has shut down, a further call returns at once and
-        writes nothing: one launch has at most one ``spike_stop``.
+        writes nothing, and a call retried after a failed shutdown write
+        does not append ``spike_stop`` again: one launch has at most one.
 
         With :attr:`spike_games` unset this reads no metrics and writes no
         record of its own.
@@ -731,9 +734,13 @@ class LaunchedRun:
                 if self.spike_games is not None:
                     completed = self.games_completed()
                     if completed >= self.spike_games:
-                        self.metrics_writer.append(
-                            spike_stop_record(target=self.spike_games, games_completed=completed)
-                        )
+                        if not self._spike_stop_written:
+                            self.metrics_writer.append(
+                                spike_stop_record(
+                                    target=self.spike_games, games_completed=completed
+                                )
+                            )
+                            self._spike_stop_written = True
                         break
                     if not (actors_alive and learner_alive):
                         break
@@ -758,9 +765,10 @@ class LaunchedRun:
 
         1. **A child that outlives the grace period is killed, and that is
            recorded.** Every such child gets ``SIGKILL`` and is joined
-           without a timeout before any record is written; then one
-           ``shutdown_forced`` record
-           (``core.observability.shutdown_forced_record``) names each. A killed
+           without a timeout before any record is written; then each one
+           whose exit status is ``SIGKILL`` (not one that exited on its own
+           just before the signal) gets one ``shutdown_forced`` record
+           (``core.observability.shutdown_forced_record``) naming it. A killed
            child ran no clean path, so the record is how the run directory
            says its evidence may be incomplete.
         2. **``segment_end`` is never written while any child is alive.** It
@@ -783,6 +791,8 @@ class LaunchedRun:
         complete, it is gone, and it is not an escalation.
 
         A call after a completed shutdown returns at once and writes nothing.
+        A call retried after a record write failed writes the
+        ``shutdown_forced`` records still pending, then ``segment_end``.
 
         Args:
             timeout: The grace period, in seconds, shared by every process:
@@ -811,10 +821,18 @@ class LaunchedRun:
             process.kill()
         for process in survivors:
             process.join()
-        for process in survivors:
-            self.metrics_writer.append(
-                shutdown_forced_record(process=process.name, pid=process.pid)
-            )
+        # A survivor that exited on its own between the snapshot and the
+        # signal ran its clean path; only a SIGKILL exit is an escalation.
+        # Pending records outlive a failed append, so a retried shutdown
+        # (its children already reaped) still writes them.
+        self._pending_forced.extend(
+            shutdown_forced_record(process=process.name, pid=process.pid)
+            for process in survivors
+            if process.exitcode == -signal.SIGKILL
+        )
+        while self._pending_forced:
+            self.metrics_writer.append(self._pending_forced[0])
+            self._pending_forced.pop(0)
         self.metrics_writer.append(segment_end_record())
         self._ended = True
 
