@@ -75,8 +75,12 @@ backward-compatible, default-``None``-preserving extensions):
    rather than assuming a caller always seeds the window first.
 
 ``LaunchedRun.shutdown`` sends ``SIGTERM`` (``Process.terminate()``) to every
-live process and joins them -- never ``SIGKILL``, so every process always
-runs its own clean path.
+live process and waits for all of them, under one grace period sized for a
+whole in-flight game (:data:`DEFAULT_SHUTDOWN_GRACE_SECONDS`), so every
+process normally runs its own clean path. A child still alive when the grace
+period ends is killed (``SIGKILL``) and a ``shutdown_forced`` record names
+it; ``segment_end`` is written only once no child is alive, so the GPU-hour
+segment never closes over a process that still holds the device.
 
 **GPU memory envelope (documented, not engineered around -- issue #61's own
 constraint).** The D5 trunk is 8 residual blocks × 128 channels; the
@@ -96,11 +100,12 @@ No memory scheduler, cgroup, or MPS configuration is built here; §3's
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import signal
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any
@@ -119,12 +124,16 @@ from core.network import (
 )
 from core.observability import (
     SERIES_ACTOR_AMP_ACTIVE,
+    SERIES_GAMES_COMPLETED,
     InferenceBatchCounter,
     PositionCounter,
     count_positions,
     gauge_record,
+    reduce_run,
     segment_end_record,
     segment_start_record,
+    shutdown_forced_record,
+    spike_stop_record,
 )
 from core.runconfig import RunConfig, SelfPlayConfig
 
@@ -139,6 +148,29 @@ GameFactory = Callable[[], Game]
 # what LaunchedRun.shutdown sends; SIGINT covers Ctrl-C on a single process
 # run directly (e.g. under a future #63 CLI, or by hand in development).
 _DEFAULT_SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)
+
+# How long LaunchedRun.shutdown waits, after signaling, before it kills a
+# child. An actor polls for stop only between games, so the wait has to cover
+# a whole in-flight game: ten minutes is several times the slowest full-game
+# time on record (128.8 s for an evaluation game at 512 sims on CPU,
+# docs/bench/m4-exit-bench.md).
+DEFAULT_SHUTDOWN_GRACE_SECONDS = 600.0
+
+
+def _check_grace_period(seconds: float) -> None:
+    """Refuse a shutdown grace period that is not a finite, non-negative number.
+
+    ``nan`` would compare as already expired and kill every child at once;
+    ``inf`` cannot be handed to ``Process.join``.
+
+    Args:
+        seconds: The grace period.
+
+    Raises:
+        ValueError: If ``seconds`` is negative, ``nan`` or infinite.
+    """
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"shutdown grace period must be finite and >= 0, got {seconds}")
 
 
 def _leaf_count(game: Game, states: Sequence[Any]) -> int:
@@ -605,47 +637,264 @@ class LaunchedRun:
             segment records. :func:`launch_run` already appended this run's
             ``segment_start`` record before returning; :meth:`shutdown`
             appends the matching ``segment_end``.
+        spike_games: The run-wide completed-game target :meth:`wait` stops
+            the run at, or ``None`` (the default) for no run-wide stop.
     """
 
     ctx: BaseContext
     learner: multiprocessing.process.BaseProcess
     actors: dict[int, multiprocessing.process.BaseProcess]
     metrics_writer: EpochMetricsWriter
+    spike_games: int | None = None
+    _ended: bool = field(default=False, init=False, repr=False)
+    _spike_stop: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _spike_stop_written: bool = field(default=False, init=False, repr=False)
+    _final_records: list[dict[str, Any]] | None = field(default=None, init=False, repr=False)
+    _final_written: int = field(default=0, init=False, repr=False)
+    _attempt: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def all_processes(self) -> tuple[multiprocessing.process.BaseProcess, ...]:
         """Return every process handle this run currently tracks."""
         return (self.learner, *self.actors.values())
 
-    def shutdown(self, timeout: float = 30.0) -> None:
-        """Send SIGTERM to every live process, join them, and close the GPU-hour segment.
+    def games_completed(self) -> int:
+        """Return the run-wide completed-game total the run's durable metrics record.
 
-        ``Process.terminate()`` sends ``SIGTERM`` (never ``SIGKILL``) --
-        exactly the signal :class:`ShutdownFlag` catches, so every process
-        runs its own clean-shutdown path (module docstring) rather than
-        being killed mid-write. Every process is signaled before any join,
-        so they shut down concurrently rather than one at a time.
+        Read from the run directory, never from a child: the sum of every
+        actor's ``games_completed`` deltas across every epoch file
+        (``core.observability.reduce_run``, the one sanctioned aggregation
+        point). On a resumed run directory that includes the games of its
+        earlier launches.
 
-        The ``segment_end`` record (issue #62) is appended last, after every
-        process has been joined (or timed out) -- it marks the orchestrator's
-        own single-counted GPU-hour segment as complete, so it should not be
-        written while a process this run started might still be using the
-        device. A run whose ``shutdown`` is never called (or that crashes
-        first) simply never closes its segment -- ``core.observability
+        Returns:
+            The total, as of the records durable when this was called.
+        """
+        # Each call re-reads every metrics record in the run directory. That
+        # is fine for a bounded run of a few hundred games; a long polled run
+        # would want an incremental reader.
+        return int(reduce_run(self.metrics_writer.run_dir).totals[SERIES_GAMES_COMPLETED])
+
+    def wait(
+        self,
+        poll_interval: float = 1.0,
+        shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
+    ) -> None:
+        """Block until the run ends, then shut it down.
+
+        The run ends when every process has exited on its own, or when the
+        caller is interrupted (``KeyboardInterrupt``). With
+        :attr:`spike_games` set it also ends when the run-wide completed-game
+        total reaches that target, or when the total is below it and either
+        every actor or the learner is gone. The target is checked by this,
+        the orchestrating process, against the run's durable metrics
+        (:meth:`games_completed`); no child is told about it. On reaching it
+        one ``spike_stop`` record (``core.observability.spike_stop_record``)
+        is appended before the shutdown it triggers.
+
+        Each poll reads every process's liveness first and the total second.
+        Only actors complete games, so a total read after every actor was
+        seen gone is final: at or above the target the stop is recorded, even
+        if the last game landed as its actor exited. Below the target, two
+        states end the run with **no** ``spike_stop`` -- the record's absence
+        is the durable sign the target did not trigger the shutdown:
+
+        - every actor is gone (each at its own cap, or dead): no game can
+          complete;
+        - the learner is gone (its own cap, or dead): what remains is not
+          the actor-and-learner loop the target bounds, and actors a
+          departed learner left paced at hold would wait forever.
+
+        Nothing else is detected: a run whose processes are all alive but
+        completing no games is polled until interrupted. :meth:`shutdown`
+        always runs. Actors still playing when it starts finish their
+        in-flight games, so a run stopped below the target can still end
+        with a durable total at or above it; the absence of ``spike_stop``
+        says only that something else ended the run.
+
+        Once the run has shut down, a further call returns at once and
+        writes nothing. Once :meth:`shutdown` has begun, a call retried
+        after a failed write does not judge the target again: it writes the
+        ``spike_stop`` already decided, if any, and finishes the shutdown.
+        Each record is built once and skipped on a retry if the failed
+        attempt wrote it in full, so one launch has at most one.
+
+        With :attr:`spike_games` unset this reads no metrics and writes no
+        record of its own.
+
+        Args:
+            poll_interval: Seconds between polls of the target and of process
+                liveness.
+            shutdown_grace: The grace period :meth:`shutdown` is given.
+
+        Raises:
+            ValueError: If ``shutdown_grace`` is negative or not finite.
+                Raised before the first poll.
+        """
+        _check_grace_period(shutdown_grace)
+        if self._ended:
+            return
+        if self._final_records is not None:
+            # A retry after a failed finalization write: the run is already
+            # stopped, so the target is not judged again.
+            self.shutdown(shutdown_grace)
+            return
+        try:
+            while True:
+                actors_alive = any(actor.is_alive() for actor in self.actors.values())
+                learner_alive = self.learner.is_alive()
+                if self.spike_games is not None:
+                    completed = self.games_completed()
+                    if completed >= self.spike_games:
+                        if self._spike_stop is None:
+                            self._spike_stop = spike_stop_record(
+                                target=self.spike_games, games_completed=completed
+                            )
+                        self._write_spike_stop()
+                        break
+                    if not (actors_alive and learner_alive):
+                        break
+                if not (actors_alive or learner_alive):
+                    break
+                time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown(shutdown_grace)
+
+    def shutdown(self, timeout: float = DEFAULT_SHUTDOWN_GRACE_SECONDS) -> None:
+        """Stop every process, wait until all are gone, then close the GPU-hour segment.
+
+        ``Process.terminate()`` sends ``SIGTERM`` -- exactly the signal
+        :class:`ShutdownFlag` catches, so every process runs its own
+        clean-shutdown path (module docstring) rather than being killed
+        mid-write. Every process is signaled before any join, so they shut
+        down concurrently, under one shared grace period.
+
+        Postconditions, in order:
+
+        1. **A child that outlives the grace period is killed, and that is
+           recorded.** Every such child gets ``SIGKILL`` and is joined
+           without a timeout before any record is written; then each one
+           whose exit status is ``SIGKILL`` (not one that exited on its own
+           just before the signal) gets one ``shutdown_forced`` record
+           (``core.observability.shutdown_forced_record``) naming it. A killed
+           child ran no clean path, so the record is how the run directory
+           says its evidence may be incomplete.
+        2. **``segment_end`` is never written while any child is alive.** It
+           is appended last, after every join above, and it marks the
+           orchestrator's single-counted GPU-hour segment (issue #62) as
+           complete -- which it is not while a process this run started
+           still holds the device.
+        3. **This returns only when every child is gone.**
+
+        An exception raised while waiting (a second ``KeyboardInterrupt``)
+        propagates with the segment left open, never closed over a live
+        child. A run whose ``shutdown`` is never called (or that crashes
+        first) likewise never closes its segment -- ``core.observability
         .reduce_run``'s documented, conservative "an unterminated segment
         contributes zero" rule, not a special case here.
 
+        A child signaled while already exiting on its own reports
+        ``-SIGTERM`` as its exit code rather than ``0``: the interpreter
+        restores the default handler early in its teardown. Its work was
+        complete, it is gone, and it is not an escalation.
+
+        A call after a completed shutdown returns at once and writes nothing.
+        The records are fixed when the children are gone -- led by a
+        ``spike_stop`` that :meth:`wait` decided but failed to write -- and
+        the run counts as shut down only once all are written and synced. A call
+        retried after a write failed signals nothing and writes those
+        records not yet in the epoch file, so each lands exactly once.
+
         Args:
-            timeout: Seconds to wait for each process to exit on its own
-                after being signaled. A process that outlives its timeout is
-                left running, not force-killed -- a caller wanting a hard
-                stop calls ``process.kill()`` itself.
+            timeout: The grace period, in seconds, shared by every process:
+                how long after the signal a child may still be finishing
+                before it is killed. An actor finishes its in-flight game
+                first, so this must cover a whole game.
+
+        Raises:
+            ValueError: If ``timeout`` is negative or not finite. Raised
+                before any process is signaled.
         """
-        for process in self.all_processes():
+        _check_grace_period(timeout)
+        if self._ended:
+            return
+        if self._final_records is None:
+            # A decided spike_stop whose write failed stays first in line.
+            unwritten_stop = (
+                [self._spike_stop]
+                if self._spike_stop is not None and not self._spike_stop_written
+                else []
+            )
+            self._final_records = [*unwritten_stop, *self._stop_children(timeout)]
+        while self._final_written < len(self._final_records):
+            record = self._final_records[self._final_written]
+            self._append_once(record)
+            self._final_written += 1
+            if record is self._spike_stop:
+                self._spike_stop_written = True
+            self._attempt = None
+        self._ended = True
+
+    def _write_spike_stop(self) -> None:
+        """Write the decided ``spike_stop`` record, if any and not yet written."""
+        if self._spike_stop is not None and not self._spike_stop_written:
+            self._append_once(self._spike_stop)
+            self._spike_stop_written = True
+            self._attempt = None
+
+    def _append_once(self, record: dict[str, Any]) -> None:
+        """Append ``record``, unless its own failed attempt already wrote it in full.
+
+        Only the record last attempted and not yet marked done by its caller
+        is checked, against the file's last complete line: an append that
+        raised after its line was complete (a failed ``fsync``), or an
+        interrupt between the append and the caller's progress update,
+        leaves exactly that line last. Such a line is synced before it
+        counts as written. The caller clears the attempt once it has
+        recorded the record as written.
+
+        Args:
+            record: One finalization record, built once and reused by retries.
+        """
+        if self._attempt is record and self.metrics_writer.last_record() == record:
+            self.metrics_writer.sync()  # readable, but maybe never synced
+            return
+        self._attempt = record
+        self.metrics_writer.append(record)
+
+    def _stop_children(self, timeout: float) -> list[dict[str, Any]]:
+        """Signal, join and, past the grace period, kill and reap every child.
+
+        Args:
+            timeout: The shared grace period.
+
+        Returns:
+            The records to write, in order: one ``shutdown_forced`` per
+            child that exited from ``SIGKILL``, then ``segment_end``.
+        """
+        processes = self.all_processes()
+        for process in processes:
             if process.is_alive():
                 process.terminate()
-        for process in self.all_processes():
-            process.join(timeout)
-        self.metrics_writer.append(segment_end_record())
+        deadline = time.monotonic() + timeout
+        for process in processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+        # Every survivor is killed and reaped before any record is written, so
+        # a failing append (a full disk) cannot leave a later child alive.
+        survivors = [process for process in processes if process.is_alive()]
+        for process in survivors:
+            process.kill()
+        for process in survivors:
+            process.join()
+        # A survivor that exited on its own between the snapshot and the
+        # signal ran its clean path; only a SIGKILL exit is an escalation.
+        forced = [
+            shutdown_forced_record(process=process.name, pid=process.pid)
+            for process in survivors
+            if process.exitcode == -signal.SIGKILL
+        ]
+        return [*forced, segment_end_record()]
 
 
 def launch_run(
@@ -667,6 +916,7 @@ def launch_run(
     ceiling_poll_interval: float = 1.0,
     max_games_per_actor: int | None = None,
     max_learner_steps: int | None = None,
+    spike_games: int | None = None,
 ) -> LaunchedRun:
     """Start ``num_actors`` actor processes and one learner process.
 
@@ -711,11 +961,21 @@ def launch_run(
         ceiling_poll_interval: Forwarded to the learner.
         max_games_per_actor: Forwarded to every actor (test-facing).
         max_learner_steps: Forwarded to the learner (test-facing).
+        spike_games: Optional run-wide completed-game target, counted over
+            every actor together. A stop condition like the two caps above,
+            not run identity, so it is not a config field. No process is
+            given it: :meth:`LaunchedRun.wait` enforces it from this side.
 
     Returns:
         A :class:`LaunchedRun` with live handles for the learner and every
         started actor.
+
+    Raises:
+        ValueError: If ``spike_games`` is given and is not positive. Raised
+            before the segment is opened or any process is started.
     """
+    if spike_games is not None and spike_games < 1:
+        raise ValueError(f"spike_games must be >= 1, got {spike_games}")
     metrics_writer = EpochMetricsWriter(run_dir, "orchestrator")
     metrics_writer.append(segment_start_record(device=device))
     ctx = new_spawn_context()
@@ -751,4 +1011,10 @@ def launch_run(
         )
         for actor_id in ids
     }
-    return LaunchedRun(ctx=ctx, learner=learner, actors=actors, metrics_writer=metrics_writer)
+    return LaunchedRun(
+        ctx=ctx,
+        learner=learner,
+        actors=actors,
+        metrics_writer=metrics_writer,
+        spike_games=spike_games,
+    )
